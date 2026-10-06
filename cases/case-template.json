@@ -1,0 +1,13 @@
+{
+  "case_id": "case-001",
+  "journal_path": "inbox/case-001/journal.0001.txt",
+  "revit_version": null,
+  "operation": "出问题前正在进行的操作",
+  "observed_problem": "实际出现的现象或提示",
+  "expected_behavior": "预期结果",
+  "approximate_time": null,
+  "encoding_if_known": null,
+  "confirmed_error_lines": [],
+  "confirmed_normal_lines": [],
+  "review_status": "pending"
+}

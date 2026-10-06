@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "id": "example.user_marker",
+      "title": "示例自定义错误标记",
+      "severity": "error",
+      "pattern": "MY_PLUGIN_FAILURE\\s*:",
+      "exclude_patterns": ["MY_PLUGIN_FAILURE\\s*:\\s*expected test"],
+      "basis": "heuristic",
+      "explanation": "演示如何追加规则。请用已确认的案例特征替换此占位标记。"
+    }
+  ]
+}

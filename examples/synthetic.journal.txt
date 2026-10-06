@@ -1,0 +1,14 @@
+' SYNTHETIC FIXTURE: handmade text for parser tests, not a real Revit session.
+' Project: 演示模型.rvt; no real user/model data.
+' 0:< Session started
+' 0:< 0 errors; no exception was raised
+Jrn.Command "Ribbon", "Synthetic open command"
+' 1:< DBG_WARN: Synthetic repeated warning
+' 1:< DBG_WARN: Synthetic repeated warning
+' 0:< Continuing synthetic operation
+' 2:< DBG_ERROR: Synthetic operation failed
+' 2:< System.InvalidOperationException: Synthetic invalid state
+   at Synthetic.Plugin.Execute()
+' 0:< Check the synthetic context above
+' 0:< A fatal error has occurred (synthetic test message)
+' End of fixture; this is not proof of a real crash.

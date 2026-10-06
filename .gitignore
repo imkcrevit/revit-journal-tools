@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.coverage
+.DS_Store
+.env
+.env.*
+.journal-cache/
+
+# Real journals and derived reports stay local. Synthetic fixtures are tracked.
+cases/inbox/*
+!cases/inbox/.gitkeep
+reports/*
+!reports/.gitkeep

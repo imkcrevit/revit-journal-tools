@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Journal / 本地查看器</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark">J/</span><div><strong>Journal</strong><small>REVIT LOG VIEWER</small></div></div>
+    <div class="workspace-label">工作区 <span id="file-count">0个文件</span></div>
+    <label class="file-search"><span>⌕</span><input id="file-search" placeholder="查找日志文件" aria-label="查找日志文件"></label>
+    <div id="files" class="files" aria-label="日志文件列表"></div>
+    <div class="sidebar-foot"><span class="local-dot"></span> 本地读取 · 原文件保留</div>
+  </aside>
+  <main>
+    <header class="topbar"><span>工作区 <span class="slash">/</span> Journal查看器</span><div class="status-pill"><span class="local-dot"></span><span id="index-status">正在连接本地工作区</span></div></header>
+    <section class="overview">
+      <div class="eyebrow">日志工作台</div><h1 id="file-title">选择一个Journal</h1><div id="file-path" class="file-path">在左侧选择文件，按记录类型快速定位。</div>
+      <div class="metrics"><div><span>记录行数</span><strong id="metric-lines">—</strong></div><div><span>错误相关记录</span><strong id="metric-errors" class="red">—</strong></div><div><span>API错误记录</span><strong id="metric-api" class="orange">—</strong></div><div><span>操作记录</span><strong id="metric-operations">—</strong></div></div>
+    </section>
+    <nav id="categories" class="categories" aria-label="记录分类"></nav>
+    <section class="tools">
+      <form id="search-form" class="search"><span>⌕</span><input id="search" placeholder="搜索关键词，如ExceptionCode、GeomStepList" aria-label="搜索当前分类"><button type="submit">搜索</button></form>
+      <form id="jump-form" class="jump"><label for="jump">跳至行</label><input id="jump" type="number" min="1" placeholder="行号"><button type="submit">定位 ↗</button></form>
+    </section>
+    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+    <section class="panels">
+      <div class="records">
+        <div class="panel-heading"><strong id="record-heading">全部记录</strong><span id="query-time"></span></div>
+        <div class="column-head"><span>行号</span><span>分类</span><span>原文记录</span></div>
+        <div id="rows" class="rows" aria-label="分页日志记录"><div class="empty">正在读取文件列表…</div></div>
+        <div class="pagination"><span id="page-info">每页最多100条记录</span><div><button id="previous" disabled>← 上一页</button><button id="next" disabled>下一页 →</button></div></div>
+      </div>
+      <aside class="inspector">
+        <div class="panel-heading"><strong>原文上下文</strong><button id="copy-position" disabled>复制位置</button></div>
+        <div id="detail-meta" class="detail-meta">点击一条记录，查看它前后发生了什么。</div>
+        <div id="context" class="context"><div class="empty"><span class="empty-icon">⌘</span><strong>从记录回到现场</strong><p>选择错误、API事件或操作记录，<br>查看连续原文和命中依据。</p></div></div>
+        <div id="source-meta" class="source-meta">记录分类用于定位；错误候选仍需结合上下文复核。</div>
+      </aside>
+    </section>
+  </main>
+</body></html>
