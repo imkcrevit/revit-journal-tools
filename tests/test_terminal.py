@@ -1,0 +1,181 @@
+import io
+import json
+import os
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+from revit_journal_tools.cli import main
+from revit_journal_tools.terminal import Browser, cell_width, crop, safe_text
+from revit_journal_tools.viewer_index import ViewerIndex
+
+
+class TerminalTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.path = self.root / "synthetic.txt"
+        self.path.write_text("System Information:\nOSLanguage : 1033\nCPU : synthetic\n\n"
+                             "API_ERROR { conflict\n'private_module_keyword\n'last_detail }\n"
+                             "DBG_ERROR: separate\n  at Synthetic.Run()\n"
+                             "Jrn.Command _\n \"Ribbon\", \"Next\"\n", encoding="utf-8")
+        self.db = self.root / "terminal.sqlite3"
+        self.index = ViewerIndex(self.db)
+        queued = self.index.register([self.path], "auto")
+        self.index.build(queued, "auto")
+        self.file_id = queued[0]
+
+    def cli(self, *args):
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            code = main([str(arg) for arg in args])
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_paragraph_index_has_complete_ranges_and_counts(self):
+        blocks = self.index.blocks(self.file_id)["items"]
+        self.assertEqual([(b["start_line"], b["end_line"]) for b in blocks], [(1, 4), (5, 7), (8, 9), (10, 11)])
+        self.assertEqual(self.index.catalog()[0]["block_count"], 4)
+        self.assertEqual(self.index.catalog()[0]["block_counts"]["api_error"], 1)
+        self.assertEqual(self.index.catalog()[0]["counts"]["api_error"], 3)
+
+    def test_initial_selection_skips_empty_dump_text(self):
+        empty = self.root / "dump.0001.txt"
+        empty.write_text("", encoding="utf-8")
+        self.index.build(self.index.register([empty, self.path], "auto"), "auto")
+        browser = Browser(self.index)
+        self.assertEqual(browser.file["name"], self.path.name)
+
+    def test_search_inside_continuation_selects_entire_block_once(self):
+        result = self.index.blocks(self.file_id, query="private_module_key")
+        self.assertEqual([(b["start_line"], b["end_line"]) for b in result["items"]], [(5, 7)])
+        self.assertEqual(self.index.blocks(self.file_id, "system", query="private_module_key")["items"], [])
+        self.assertEqual(len(self.index.blocks(self.file_id, query="synthetic")["items"]), 2)
+
+    def test_block_pagination_and_detail_pagination_keep_every_line(self):
+        numbers, after = [], 0
+        while True:
+            page = self.index.blocks(self.file_id, after=after, limit=1)
+            numbers.extend(b["start_line"] for b in page["items"])
+            if not page["has_more"]:
+                break
+            after = page["next_after"]
+        self.assertEqual(numbers, [1, 5, 8, 10])
+        detail = self.index.block_lines(self.file_id, 5, limit=2)
+        self.assertEqual([line["line_number"] for line in detail["items"]], [5, 6])
+        self.assertTrue(detail["has_more"])
+        self.assertEqual(self.index.block_lines(self.file_id, 5, offset=2)["items"][0]["line_number"], 7)
+        self.assertEqual(self.index.block_at(self.file_id, 6)["start_line"], 5)
+
+    def test_changed_source_rebuild_removes_old_blocks(self):
+        self.path.write_text("normal\n", encoding="utf-8")
+        self.index.build(self.index.register([self.path], "auto"), "auto")
+        self.assertEqual(self.index.catalog()[0]["block_count"], 1)
+        self.assertEqual(self.index.blocks(self.file_id, query="private_module")["items"], [])
+        self.assertEqual(self.index.block_at(self.file_id, 1)["end_line"], 1)
+
+    def test_cli_json_filter_and_resume(self):
+        code, out, err = self.cli("browse", self.path, "--database", self.db, "--format", "json", "--page-size", 1)
+        self.assertEqual(code, 0, err)
+        file = json.loads(out)["files"][0]
+        self.assertEqual(file["items"][0]["end_line"], 4)
+        self.assertTrue(file["has_more"])
+        self.assertEqual(len(file["sha256"]), 64)
+        code, out, err = self.cli("browse", self.path, "--database", self.db, "--format", "json", "--after", 1, "--category", "api_error")
+        self.assertEqual([b["start_line"] for b in json.loads(out)["files"][0]["items"]], [5])
+
+    def test_noninteractive_color_control_and_no_escape_in_plain_output(self):
+        args = ("browse", self.path, "--database", self.db, "--print")
+        code, plain, err = self.cli(*args)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("\x1b", plain)
+        self.assertIn("L5–7", plain)
+        self.assertIn("\x1b[35m", self.cli(*args, "--color", "always")[1])
+
+    def test_browser_expand_filter_goto_search_and_file_switch(self):
+        browser = Browser(self.index)
+        browser.handle("4")
+        self.assertEqual(len(browser.items), 1)
+        browser.handle("\r")
+        self.assertTrue(browser.expanded)
+        self.assertIn("private_module_keyword", browser.frame(100, 25, False))
+        browser.handle("g")
+        browser.handle("9")
+        browser.handle("\r")
+        self.assertEqual(browser.block["start_line"], 8)
+        self.assertEqual(browser.detail_offset, 1)
+        browser.handle("/")
+        for key in "private_module":
+            browser.handle(key)
+        browser.handle("\r")
+        self.assertEqual(browser.block["start_line"], 5)
+        browser.handle("f")
+        self.assertEqual(browser.mode, "files")
+        browser.handle("\r")
+        self.assertEqual(browser.mode, "blocks")
+        self.assertFalse(browser.handle("q"))
+
+    def test_frame_fits_resized_terminal_and_cjk_width(self):
+        browser = Browser(self.index)
+        for width, height in ((100, 30), (50, 14), (25, 5)):
+            for density in (0, 1, 2):
+                browser.density = density
+                frame = browser.frame(width, height, False)
+                self.assertLessEqual(len(frame.splitlines()), height)
+                self.assertTrue(all(cell_width(line) < width for line in frame.splitlines()))
+        self.assertEqual(crop("中文abc", 5), "中文a")
+
+    def test_untrusted_terminal_sequences_are_visible_not_executed(self):
+        unsafe = "message\x1b]52;c;clipboard\x07\r\u202e"
+        shown = safe_text(unsafe)
+        self.assertNotIn("\x1b", shown)
+        self.assertNotIn("\r", shown)
+        self.assertIn("\\u001b", shown)
+        self.assertIn("\\u202e", shown)
+
+    def test_database_and_sidecars_cannot_overwrite_source_aliases(self):
+        original = self.path.read_bytes()
+        code, _, err = self.cli("browse", self.path, "--database", self.path, "--print")
+        self.assertEqual(code, 2)
+        self.assertIn("不能覆盖", err)
+        sidecar = Path(str(self.db) + "-wal")
+        try:
+            os.link(self.path, sidecar)
+        except OSError:
+            return
+        code, _, err = self.cli("browse", self.path, "--database", self.db, "--print")
+        self.assertEqual(code, 2)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_decode_failure_is_not_shown_as_complete(self):
+        self.path.write_bytes(b"API_ERROR {\n\xff")
+        code, out, err = self.cli("browse", self.path, "--database", self.db, "--format", "json")
+        self.assertEqual(code, 2, err)
+        file = json.loads(out)["files"][0]
+        self.assertEqual(file["status"], "error")
+        self.assertNotIn("items", file)
+
+    def test_large_paragraph_crosses_index_batches_without_splitting(self):
+        self.path.write_text("API_ERROR { synthetic\n" + "'repeat detail\n" * 11000 + "'}\n", encoding="utf-8")
+        self.index.build(self.index.register([self.path], "auto"), "auto")
+        blocks = self.index.blocks(self.file_id)["items"]
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["end_line"], 11002)
+        self.assertEqual(len(self.index.block_lines(self.file_id, 1, offset=10990)["items"]), 12)
+
+    def test_common_search_word_skips_duplicate_hits_and_resumes_at_next_block(self):
+        self.path.write_text("common detail\n" * 1100 + "\nDBG_ERROR: common error\n", encoding="utf-8")
+        self.index.build(self.index.register([self.path], "auto"), "auto")
+        first = self.index.blocks(self.file_id, query="common", limit=1)
+        self.assertEqual([b["start_line"] for b in first["items"]], [1])
+        self.assertTrue(first["has_more"])
+        second = self.index.blocks(self.file_id, query="common", after=first["next_after"], limit=1)
+        self.assertEqual([b["start_line"] for b in second["items"]], [1102])
+        self.assertFalse(second["has_more"])
+        errors = self.index.blocks(self.file_id, "error", query="common")
+        self.assertEqual([b["start_line"] for b in errors["items"]], [1102])
+
+
+if __name__ == "__main__":
+    unittest.main()

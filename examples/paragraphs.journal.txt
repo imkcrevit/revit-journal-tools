@@ -1,0 +1,31 @@
+' SYNTHETIC FIXTURE: handwritten, contains no real user or model data.
+'C 01-Oct-2026 10:00:00.001; started recording journal file
+' Build: synthetic
+' Branch: DEMO
+' Release: 2027
+
+' 0:< SystemSettings:
+' 0:<   8=multiCoreCharacteristic
+' 0:<   true=isDotNetInstalled
+' 0:<   synthetic=runtimeVersion
+
+'H 01-Oct-2026 10:00:01.001; 0:<
+Jrn.Command _
+  "Ribbon", _
+  "Synthetic open command"
+'E 01-Oct-2026 10:00:02.001; 0:<
+' 0:< API_ERROR { synthetic module conflict
+'First synthetic module has an incompatible version.
+'Second synthetic module has an incompatible version. }
+' 0:< API_SUCCESS { Registering synthetic event
+'Event registration completed. }
+DBG_ERROR: synthetic operation failed
+System.InvalidOperationException: synthetic detail
+  at Synthetic.Plugin.Execute()
+  at Synthetic.Host.Invoke()
+DBG_ERROR: a separate synthetic error
+  at Synthetic.Other.Run()
+
+' 0:< Delta VM: Avail 1024 MB; RAM: Avail 512 MB
+' 0:< GUI Resource Usage GDI: Avail 9990, Used 10
+'C 01-Oct-2026 10:00:03.001; finished synthetic session

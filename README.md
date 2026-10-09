@@ -1,8 +1,12 @@
 # Revit Journal Tools
 
-本地Revit Journal查看器：按启动、系统数据、错误、API错误、操作内容等分类浏览大型日志，搜索关键词、直接跳转行号，并查看连续原文与命中依据。
+本地Revit Journal查看器：在CLI终端中按完整段落和事件浏览大型日志，用颜色区分启动、系统数据、错误、API错误、操作内容，支持折叠/展开、搜索和原始行号跳转。同一报错的多行内容与堆栈保留在一个块中。
 
-当前版本包含可运行的本地浏览器界面、Python命令行工具和可复用解析模块。使用Python 3.10及以上版本和启用FTS5的SQLite，无运行时第三方依赖。界面和日志数据全部在本机处理，不加载外部脚本或字体。真实案例可以同步放入`cases/inbox/`，逐步校准规则。
+Add-in加载支持Autodesk、第三方和来源待定筛选，按同一事件内的Vendor字段及其后续行判断来源，并保留原始依据行号。加载失败仍可在原有错误分类中查看。
+
+按`i`打开当前日志的Add-in列表，默认只显示名称、来源、错误标记和原始行号。程序从加载事件前缀提取名称和Class；按`v`可输入名称或Class前缀，例如`ATFTranslationServer`。Enter展开后才按页读取原始数据，再按Enter或Esc折叠。
+
+当前优先迭代CLI终端查看器和可复用解析模块，原有Web查看器继续可用。使用Python 3.10及以上版本和启用FTS5的SQLite，无运行时第三方依赖。日志数据全部在本机处理。真实案例可以同步放入`cases/inbox/`，逐步校准规则。
 
 ## 快速开始
 
@@ -12,7 +16,7 @@ Linux/macOS：
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
-revit-journal view examples/synthetic.journal.txt
+revit-journal browse examples/paragraphs.journal.txt
 ```
 
 Windows PowerShell：
@@ -20,16 +24,49 @@ Windows PowerShell：
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\revit-journal.exe view examples\synthetic.journal.txt
+.\.venv\Scripts\revit-journal.exe browse examples\paragraphs.journal.txt
 ```
 
 不安装包也可以运行：
 
 ```bash
-PYTHONPATH=src python3 -m revit_journal_tools scan examples/synthetic.journal.txt
+PYTHONPATH=src python3 -m revit_journal_tools browse examples/paragraphs.journal.txt
 ```
 
-## 本地查看器
+## CLI终端查看器
+
+```bash
+revit-journal browse cases/inbox --recursive --encoding cp1252
+
+# 直接进入API错误分类
+revit-journal browse journal.0001.txt --encoding cp1252 --category api_error
+
+# 筛选第三方Add-in加载，含加载失败事件
+revit-journal browse cases/inbox --recursive --encoding cp1252 --category addin_third_party
+
+# Add-in列表与名称/Class前缀筛选
+revit-journal browse journal.0001.txt --encoding cp1252 --category addin
+revit-journal browse journal.0001.txt --encoding cp1252 --addin-prefix ATFTranslationServer
+
+# 用人工样例检查官方、第三方、来源缺失和加载失败
+revit-journal browse examples/addin-loading.journal.txt
+
+# 非交互摘要和可复用的段落元数据
+revit-journal browse examples/paragraphs.journal.txt --print --color always
+revit-journal browse examples/paragraphs.journal.txt --format json --page-size 20
+```
+
+上下键选择段落，Enter展开/折叠；展开后用上下键或PgUp/PgDn滚动原文，左右键横向滚动长行。按`0`显示全部，`1`至`8`切换分类，`/`搜索，`g`跳到原始行，`f`选择文件，`n`/`p`前后翻页，`q`退出。`+`/`-`调整段落预览行数；字体放大/缩小使用终端自身的缩放功能，窗口调整后自动重排。
+
+按`a`筛选Autodesk加载，`t`筛选第三方加载，`u`筛选来源待定；`c`可循环切换全部分类。Autodesk来源依据为Vendor中的`ADSK`或`autodesk.com`及其子域名；其他明确厂商归入第三方，缺失、冲突或不完整的信息保留为来源待定。名称/Class前缀只用于筛选，不替代Vendor来源判断。来源标签不证明该组件由Revit默认安装，也不代表加载成功。仅有DLL名称或安装路径中的Autodesk字样不作为厂商依据。更新后首次打开旧缓存会自动重建所选文件的索引。
+
+正常段落、系统配置、`Jrn.*`操作及其`_`续行、API花括号段、同一异常及其堆栈均按块显示。新的独立错误另起一块。每个块保留起止行、分类和分段依据；展开不改变源文件。未闭合的API段或操作续行会显式标记。分段是阅读辅助，不代表已确认错误根因。
+
+首次启动在后台建索引，可先切换到已完成的文件。CLI缓存默认位于`.journal-cache/terminal.sqlite3`，全文保留在磁盘，段落再大也按页加载原文。搜索命中续行时返回整个段落，不重复列出同一块；统计“块数”与原有扫描的“命中行数”不同。
+
+详细分段规则、按键和限制见[docs/terminal.md](docs/terminal.md)。
+
+## 原有Web查看器
 
 ```bash
 # 查看第一批已上传的案例；首次在后台建立磁盘索引
@@ -43,7 +80,7 @@ revit-journal view cases/inbox --recursive --encoding cp1252 --port 8766
 
 首次索引逐文件进行，已经就绪的文件可先浏览。索引缓存位于`.journal-cache/viewer.sqlite3`，再次启动会复用未变化文件的索引。缓存包含完整日志文本，不受CLI的500条明细限制，默认不进入Git。文件内容、编码或索引规则变化后会重建相关索引。
 
-当前是本地浏览器应用，还未封装成Windows桌面安装包。详细用法和边界见[docs/viewer.md](docs/viewer.md)。
+Web界面仍使用原有逐行列表；本次段落交互优先在CLI实现。尚未封装成Windows桌面安装包。原有Web用法见[docs/viewer.md](docs/viewer.md)。
 
 ## 扫描与导出
 
@@ -125,6 +162,9 @@ src/revit_journal_tools/
   reporting.py           文本、JSON、JSONL导出
   cli.py                 批量扫描入口
   categories.py          启动、系统、错误、API和操作记录分类
+  blocks.py              流式段落边界、跨行错误与操作分组
+  loading.py             同一Add-in加载事件的厂商依据与来源筛选
+  terminal.py            CLI颜色、折叠展开、文件切换与原文分页
   viewer_index.py        全量磁盘索引、全文检索、分页与上下文查询
   viewer_server.py       仅监听本机的查看器服务
   web/                   本地界面，无外部前端依赖
@@ -146,6 +186,6 @@ PYTHONPATH=src python3 scripts/benchmark_streaming.py --mib 8 64
 
 安装包后，Windows也可使用`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`运行同一套测试。
 
-下一步围绕实际案例增加会话时间线、完整操作阶段、插件/模块关联、堆栈合并和误报排除。当前版本未实现浏览器拖放导入、桌面安装包、AI分析、Journal回放或模型修复。
+下一步围绕实际案例细化会话时间线、完整操作阶段、插件/模块关联、段落边界和误报排除。当前版本未实现浏览器拖放导入、桌面安装包、AI分析、Journal回放或模型修复。
 
 案例提交方式见[cases/README.md](cases/README.md)，规则扩展见[docs/rules.md](docs/rules.md)。Autodesk的[Journal阅读指导](https://www.autodesk.com/support/technical/article/How-to-read-the-journal-file-Revit/)建议结合具体操作、实际现象和近似时间排查；本项目按此保留上下文，其他参考见[docs/sources.md](docs/sources.md)。

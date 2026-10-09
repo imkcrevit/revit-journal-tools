@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -13,6 +14,7 @@ from typing import Any, TextIO
 from . import __version__
 from .analyzer import ScanOptions, analyze
 from .models import SEVERITY_RANK
+from .loading import BLOCK_FILTERS
 from .reporting import write_reports
 from .rules import load_rules
 
@@ -42,7 +44,21 @@ def _parser() -> argparse.ArgumentParser:
     scan.add_argument("--fail-on", choices=SEVERITY_RANK, help="达到指定候选级别时返回退出码1")
     rules = commands.add_parser("rules", help="列出规则及其来源")
     rules.add_argument("--rules", type=Path, help="追加自定义JSON规则")
-    view = commands.add_parser("view", help="启动本地Journal查看器")
+    browse = commands.add_parser("browse", help="打开CLI终端段落查看器（颜色、折叠、搜索）")
+    browse.add_argument("paths", nargs="+", type=Path)
+    browse.add_argument("--recursive", action="store_true")
+    browse.add_argument("--encoding", default="auto")
+    browse.add_argument("--database", type=Path, default=Path(".journal-cache/terminal.sqlite3"))
+    browse.add_argument("--category", choices=("all", *BLOCK_FILTERS), default="all")
+    browse.add_argument("--query", default="", help="搜索段落内任意行；词语/末词前缀")
+    browse.add_argument("--addin-prefix", default="", help="按Add-in名称或Class前缀筛选，如ATFTranslationServer")
+    browse.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    browse.add_argument("--print", dest="print_only", action="store_true", help="输出一页段落摘要，不进入交互界面")
+    browse.add_argument("--format", choices=("text", "json"), default="text", help="JSON始终以非交互方式输出")
+    browse.add_argument("--page-size", type=int, default=100, help="每页1到200个完整段落")
+    browse.add_argument("--after", type=int, default=0, help="从此起始行之后的段落继续分页")
+    browse.set_defaults(rules=None)
+    view = commands.add_parser("view", help="启动原有本地Web查看器")
     view.add_argument("paths", nargs="+", type=Path, help="需要打开的日志文件或目录")
     view.add_argument("--recursive", action="store_true", help="包括子目录中的日志")
     view.add_argument("--encoding", default="auto")
@@ -121,13 +137,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "rules":
             print(json.dumps({"schema_version": 1, "rules": [rule.definition() for rule in rules]}, ensure_ascii=False, indent=2))
             return 0
-        if args.command == "view":
-            from .viewer_server import serve
-
+        if args.command in {"view", "browse"}:
             paths, errors = _discover(args.paths, args.recursive)
             if errors:
                 raise ValueError("；".join(item["error"] for item in errors))
-            _protect_inputs(args.database, [*paths, *args.paths])
+            for target in (args.database, Path(str(args.database) + "-wal"), Path(str(args.database) + "-shm")):
+                _protect_inputs(target, [*paths, *args.paths])
+            if args.command == "browse":
+                from .terminal import run
+
+                return run(paths, args.database, args.encoding, category=args.category, query=args.query,
+                           addin_prefix=args.addin_prefix,
+                           color=args.color, print_only=args.print_only, format_name=args.format,
+                           after=args.after, page_size=args.page_size)
+            from .viewer_server import serve
+
             serve(paths, args.database, args.encoding, args.port)
             return 0
         options = ScanOptions(
@@ -163,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         with _destination(args.output) as stream:
             write_reports(reports(), stream, args.format)
         return exit_code
-    except (OSError, ValueError, LookupError) as error:
+    except (OSError, ValueError, LookupError, sqlite3.Error) as error:
         print(f"错误：{error}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

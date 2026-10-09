@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revit-journal-tools"
-version = "0.1.0"
-description = "Streaming Revit Journal reading and evidence-based error candidate extraction"
+version = "0.2.0"
+description = "Local Revit Journal terminal viewer with paragraph grouping and traceable error analysis"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
