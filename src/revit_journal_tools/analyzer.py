@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .models import Finding, FindingGroup, ScanReport, SEVERITY_RANK, SourceLine
 from .reader import JournalReader
-from .rules import Rule, load_rules, ruleset_digest
+from .rules import Rule, load_rules, match_rules, ruleset_digest
 
 
 @dataclass(frozen=True)
@@ -83,7 +83,7 @@ def analyze(
                 finding.context_after.append(preview)
             while pending and len(pending[0].context_after) >= options.context:
                 pending.popleft()
-            matches = [match for rule in active_rules if (match := rule.match(line.text))]
+            matches = match_rules(active_rules, line.text)
             if matches:
                 matched_count += 1
                 severity = max((match.severity for match in matches), key=SEVERITY_RANK.__getitem__)

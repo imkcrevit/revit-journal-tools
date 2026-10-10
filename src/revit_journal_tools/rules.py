@@ -15,6 +15,22 @@ class RuleConfigError(ValueError):
     pass
 
 
+# Under re.IGNORECASE an ASCII letter also matches these non-ASCII characters
+# (exhaustively checked over all code points, see tests/test_rules.py). str.lower()
+# alone does not map them, so gate folding translates them first. The Kelvin sign
+# U+212A already lowers to "k".
+_IGNORECASE_EXTRA = {0x130: "i", 0x131: "i", 0x17F: "s"}
+_EXTRA_CHARS = tuple(chr(code) for code in _IGNORECASE_EXTRA)
+
+
+def fold(text: str) -> str:
+    """Lowercase text so that a gate term found by ``in`` is a necessary
+    condition for any case-insensitive regex match of that literal."""
+    if not text.isascii() and any(char in text for char in _EXTRA_CHARS):
+        text = text.translate(_IGNORECASE_EXTRA)
+    return text.lower()
+
+
 @dataclass(frozen=True)
 class Rule:
     id: str
@@ -25,6 +41,9 @@ class Rule:
     basis: str = "heuristic"
     source_url: str | None = None
     exclude_patterns: tuple[str, ...] = ()
+    # Literal pre-filter: every line the pattern matches contains at least one
+    # of these (folded) substrings. Empty means "always run the pattern".
+    gate: tuple[str, ...] = ()
     _compiled: re.Pattern[str] = field(init=False, repr=False, compare=False)
     _excludes: tuple[re.Pattern[str], ...] = field(init=False, repr=False, compare=False)
 
@@ -38,8 +57,25 @@ class Rule:
             raise RuleConfigError(f"规则{self.id}的正则无效：{error}") from error
         if self._compiled.search("") is not None:
             raise RuleConfigError(f"规则{self.id}不能匹配空字符串")
+        if any(not isinstance(term, str) or not term for term in self.gate):
+            raise RuleConfigError(f"规则{self.id}的gate必须是非空字符串数组")
+        object.__setattr__(self, "gate", tuple(dict.fromkeys(fold(term) for term in self.gate)))
 
-    def match(self, text: str) -> RuleMatch | None:
+    def passes_gate(self, folded: str) -> bool:
+        if not self.gate:
+            return True
+        for term in self.gate:
+            if term in folded:
+                return True
+        return False
+
+    def match(self, text: str, folded: str | None = None) -> RuleMatch | None:
+        if self.gate and not self.passes_gate(fold(text) if folded is None else folded):
+            return None
+        return self.match_pattern(text)
+
+    def match_pattern(self, text: str) -> RuleMatch | None:
+        """The rule's regex and exclusions only, without the gate."""
         match = self._compiled.search(text)
         if match is None or any(pattern.search(text) for pattern in self._excludes):
             return None
@@ -60,12 +96,32 @@ class Rule:
             "pattern": self.pattern, "explanation": self.explanation,
             "basis": self.basis, "source_url": self.source_url,
             "exclude_patterns": list(self.exclude_patterns),
+            "gate": list(self.gate),
         }
+
+
+def match_rules(rules: tuple[Rule, ...], text: str) -> list[RuleMatch]:
+    """All rule matches for one line; the line is folded once for every gate."""
+    folded = None
+    result = []
+    for rule in rules:
+        if rule.gate:
+            if folded is None:
+                folded = fold(text)
+            for term in rule.gate:
+                if term in folded:
+                    break
+            else:
+                continue
+        match = rule.match_pattern(text)
+        if match is not None:
+            result.append(match)
+    return result
 
 
 def _parse_rule(value: Any) -> Rule:
     required = {"id", "title", "severity", "pattern", "explanation"}
-    allowed = required | {"basis", "source_url", "exclude_patterns"}
+    allowed = required | {"basis", "source_url", "exclude_patterns", "gate"}
     if not isinstance(value, dict):
         raise RuleConfigError("每条规则必须是JSON对象")
     if required - value.keys() or value.keys() - allowed:
@@ -85,7 +141,11 @@ def _parse_rule(value: Any) -> Rule:
     excludes = value.get("exclude_patterns", [])
     if not isinstance(excludes, list) or any(not isinstance(item, str) for item in excludes):
         raise RuleConfigError("exclude_patterns必须是字符串数组")
-    return Rule(**{**value, "exclude_patterns": tuple(excludes)})
+    gate = value.get("gate", [])
+    if "gate" in value and (not isinstance(gate, list) or not gate
+                            or any(not isinstance(item, str) or not item for item in gate)):
+        raise RuleConfigError("gate必须是非空的字符串数组（每项为该规则任何命中行都必然包含的字面子串之一）")
+    return Rule(**{**value, "exclude_patterns": tuple(excludes), "gate": tuple(gate)})
 
 
 def _parse_document(content: str) -> list[Rule]:

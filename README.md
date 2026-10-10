@@ -196,6 +196,19 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 PYTHONPATH=src python3 scripts/benchmark_streaming.py --mib 8 64
 ```
 
+Windows下可用本机真实Journal做只读基准与等价性核对（结果只打印，不入库，不复制Journal）：
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 scripts/benchmark_real.py all --revit 2024          # 扫描、分类分段、单文件建索引、整目录browse
+# 修改解析/规则后：与改动前的源码树逐行比对（旧树用git archive解压到仓库外）
+py -3 scripts/verify_equivalence.py gates
+py -3 scripts/verify_equivalence.py blocks --old-src <旧src目录>
+py -3 scripts/verify_equivalence.py blocks --together --old-src <旧src目录>
+```
+
+本机实测（Windows 10、Python 3.12，2026-10-10）：6.47MB/85,387行真实Journal扫描约0.5s（约13MB/s），建索引约2.2s（约3.8万行/秒）；Revit 2024目录21个文本文件11MB的`browse --print`约2.6s。
+
 安装包后，Windows也可使用`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`运行同一套测试。
 
 下一步围绕实际案例细化会话时间线、完整操作阶段、插件/模块关联、段落边界和误报排除。当前版本未实现浏览器拖放导入、桌面安装包、AI分析、Journal回放或模型修复。

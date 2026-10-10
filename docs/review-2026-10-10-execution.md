@@ -90,3 +90,68 @@ py -3 scripts/benchmark_real.py dir --revit 2024 --encoding gb18030   # browse -
 预检使gb18030文件多一次约30ms的整文件解码；建索引比阶段0慢约0.3s，在多次运行的波动范围内（阶段0中位数5.47s、阶段1中位数5.63s），另有`lines.degraded`列的写入开销。
 
 未完成项：无。
+
+## 阶段2：速度
+
+按计划顺序J5→J6→J7→J8实施，每步跑全部测试与基准。等价性用新增的`scripts/verify_equivalence.py`核对（纯ASCII，不含真实数据，只打印计数、文件标签、行号与字段名）：旧源码树用`git archive 4ac90a4 src`（阶段1提交）解压到仓库外，新旧两棵树分别在子进程中处理本机全部106个文本Journal（约45.5万行），逐行比对。测量期间本机有用户自己运行的Revit 2027在写入新Journal（`Autodesk Revit 2027/journal.0037.txt`），总行数在两次核对之间从455,249增至455,252；同一次核对中新旧两棵树读取一致，无差异。
+
+### J5 规则字面量门控
+
+- `rules.py`：`Rule`新增可选`gate`（加载时校验为非空字符串数组并折叠），`definition()`包含`gate`（规则集哈希因此变化，旧缓存会重建）；新增`fold()`与`match_rules()`，每行只折叠一次，门控子串都不在时跳过该规则正则；`Rule.match_pattern()`为不带门控的原始匹配。`analyzer`与`Categorizer`改用`match_rules`。
+- 内置12条规则按附录B逐条核对正则后补齐`gate`（每个可选分支都含其中一个字面片段；`generic.file_access`的`access`同时覆盖`access denied`与`access is denied`）。
+- 偏差：计划写“`lower()`后`in`检查”。穷举全部码位发现`re.IGNORECASE`还会把`İ`(U+0130)、`ı`(U+0131)匹配为i，`ſ`(U+017F)匹配为s（`K`(U+212A)的`lower()`已是k），单纯`lower()`会让“`Aſſertion failed:`”这类行在有门控时漏掉。因此`fold()`先替换这三个字符再`lower()`（纯ASCII行零开销）。测试中把`fold`换成`str.lower`，门控等价测试会失败，说明测试能发现该问题。
+- 测试：`GateEquivalenceTests`在固定种子生成的6000行随机组合（含大小写变化与上述相似字符）、全部测试与示例文本上，证明有门控与无门控（`dataclasses.replace(rule, gate=())`）的命中列表逐项相同，且每条规则都被正向覆盖；另有门控校验与“自定义规则可不写gate”的测试。
+- 真实数据：`verify_equivalence.py gates`在106个文件上0行差异，正则调用5,462,988次→6,485次；`verify_equivalence.py scan`（不设明细上限）新旧两棵树的全部候选、匹配列、上下文行号、分组、计数完全一致。
+
+### J6 分类/分段/加载的Python侧重复工作
+
+- 全部正则预编译（含原来每次调用才编译的`ExceptionCode`、`^\d+:<`、缩进判断和`API_ERROR`）。
+- 每个忽略大小写的正则前加按`fold`检查的模块级字面量门控：`categories`的`_JOURNAL/_STARTUP/_SYSTEM`，`blocks`的`_API/_METRIC/_SECTION/_STRONG_ERROR/_NATIVE_*`，`loading`的`_START`（`application/addin/add-in`；计划写的区分大小写`"Application" in text`会漏掉小写写法，已改为折叠后检查）；区分大小写的`_EXCEPTION`用区分大小写的门控。
+- `BlockBuilder.feed`每行只算一次形状判断（原来`is_addin_start`每行最多算两次、`loading_payload`每行至少一次），`payload`与`fold`结果传给`_add`和`LoadingEvidence.feed`；`LoadingEvidence`未激活时只检查加载前缀门控。`_POSSIBLE_ERROR`预筛选保留（它是分类语义的一部分），只把生成器换成`any(map(...))`。
+- 偏差：没有新建跨三个类共享的“行形状结构体”，以免改动`classify(text)`、`feed(line, classification)`等被测试直接使用的接口；`Categorizer`自己的`lower()`在85k行上只占约24ms。目标已达到。
+- 测试：新增`tests/test_categories_gates.py`，(1)每个正则在语料中的每次命中都含其门控；(2)把全部门控打补丁为`("",)`（等于总是运行正则）后，示例、测试文本和3份各4000行随机Journal的分类结果与块（起止、类别、级别、规则、标题、边界、闭合、Add-in字段）完全相同。删掉一个门控词、或把`fold`换成`str.lower`，测试都会失败。
+- 真实数据：`verify_equivalence.py blocks`新旧两棵树0差异——106个文件记录、455,249行、179,523块。另与原始基线`60499be`比对，唯一差异是空文件`Autodesk Revit 2024/dump.0001.txt`（原来以0行文件入索引，J4后为旁注），其余行与块全部一致。
+
+### J7 SQLite写入
+
+- 每个文件一个事务：短事务清理旧行并标记`indexing`；`parse_into`按2万行一批写入不提交；文件读完后在同一事务内`INSERT INTO line_search(rowid, body) SELECT id, body FROM lines WHERE file_id=?`批量建立全文索引，再写统计、置`ready`。失败/停止整体回滚。
+- 删除逐行触发器`lines_insert`与`lines_delete`（打开旧库时`DROP TRIGGER IF EXISTS`）；重建时用`INSERT INTO line_search(line_search, rowid, body) SELECT 'delete', ...`按文件删除FTS条目。“每一行都有FTS条目”的不变式在新旧库中都成立（旧库触发器与行同事务），因此迁移安全；`integrity-check`测试通过。
+- 构建连接`cache_size`提到64MB；建立中的进度改为内存中的`ViewerIndex.progress`，`catalog()`合并显示。
+- 隔离实验（同一文件85k行，只测写入）：逐行触发器＋每5000行提交1.996s；单事务＋批量FTS 0.404s（OFF）/0.493s（NORMAL）。
+- 偏差：`synchronous`保持NORMAL，没有改为OFF。完整流程实测OFF只快0.15s（2.20s→2.05s，约7%），而WAL＋OFF在断电/系统崩溃时可能损坏整个数据库文件；计划所说的“失败即重建”只覆盖未完成文件，数据库文件损坏时程序打开即报错，需要用户手动删除缓存。目标在NORMAL下已达到。
+
+### J8 按文件并行
+
+- 至少2个文件且总量不小于2MB时，用`multiprocessing.get_context("spawn")`进程池（默认`min(8, 逻辑核数-1)`，`ViewerIndex(workers=...)`可调，1为顺序）。子进程把整个文件解析进系统临时目录中的私有临时库（无索引、`journal_mode=OFF`）并返回元数据；主进程按完成顺序`ATTACH`后`INSERT ... SELECT`复制，FTS与状态在同一事务。只有主进程写共享索引，子进程不使用主进程的连接。任务按文件大小降序分配以缩短总耗时，小文件仍会较早完成并先可用。子进程忽略Ctrl+C，停止时终止进程池，未复制的文件保持`queued`；无法启动进程池（`OSError`）时退回顺序构建。`__main__.py`加了`if __name__ == "__main__"`保护与`multiprocessing.freeze_support()`（为以后J21打包准备，未打包时无作用）。
+- 偏差：计划写“子进程产出行批与块批、主进程串行写库”。改为子进程写临时库：226MB级文件不必把全部行对象经管道序列化、内存有界，主进程只做C层面的`INSERT ... SELECT`。
+- 进程数（2024目录，仅建索引）：1个4.93s、2个2.89s、4个2.32s、8个2.16s、12个2.18s；8个以上收益消失，下限由最大文件（3.7MB）的解析决定。
+- 测试：并行与顺序构建的`lines`/`blocks`/统计完全相同且无法解码的文件单独失败；并行构建后重建单个文件FTS一致；停止事件使文件保持`queued`。真实数据：`verify_equivalence.py blocks --together`（全部文件一次注册，新代码走进程池）与旧树0差异，104个可索引文件旧树35.4s、新代码7.1s。
+
+### J9 偏移模式（可选）：未实施
+
+原因：(1)当前读取器基于`TextIOWrapper`的通用换行，逐行拿字节偏移需要改为二进制分行读取（还要兼容独立CR与退化解码），等于重写读取层；(2)正文按需从源文件解码要求源文件不变，而J3（正在写入的Journal、快照模式）尚未实施，本机测量期间就有一个正在增长的Journal；(3)contentless FTS无法再用`substr(body)`做预览，查询层需要同步改。建议在J3快照模式完成后，与临时副本一起实施。
+
+### 测试与基准
+
+测试：140项全部通过（阶段1为130项；新增J5规则5项、J6门控2项、J8并行3项）。
+
+| 场景（同一文件/目录） | 阶段0基线 | 阶段1 | J5后 | J6后 | J7后 | J8后（最终） |
+| --- | --- | --- | --- | --- | --- | --- |
+| scan 6.47MB，`auto` | 失败 | 2.696s | 0.527s | 0.497s | — | 0.558s（11.6MB/s） |
+| scan 6.47MB，`gb18030` | 2.781s（2.32MB/s） | 2.657s | 0.463s | — | — | 0.488s（13.3MB/s） |
+| 分类＋分块（feed+classify） | 2.747s | — | 2.624s | 1.023s | — | 1.047s |
+| 建索引6.47MB | 5.283s，16,163行/秒 | 5.569s | 5.536s | 3.796s，22,494行/秒 | 2.222s，38,427行/秒 | 2.224s，38,401行/秒 |
+| 单文件索引体积 | 3.44倍 | 3.45倍 | 3.45倍 | 3.45倍 | 3.28倍 | 3.28倍 |
+| `browse --print` 2024目录，`auto` | 失败 | 11.09s | — | — | 5.27s | 2.58s（4.28MB/s；加入串行回退后复测2.79s） |
+| `browse --print` 2024目录，`gb18030` | 10.54s | — | — | — | — | 2.61s |
+| 目录缓存体积 | 3.48倍 | 3.50倍 | — | — | 3.60倍 | 3.57倍 |
+| 合成32MiB扫描 | 10.35s | — | — | — | — | 1.385s（24.2MB/s） |
+
+阶段2目标核对：J5 scan≤0.7s（0.49–0.56s）达成；J6 feed+classify≤1.5s（1.02–1.05s）达成；J7建索引≤2.5s且≥35,000行/秒（2.22s，38,401行/秒）达成；J8目录≤5s（2.58–2.79s）、相对基线10.54s为3.8–4.1倍，达成；总目标“单文件扫描≥8MB/s、建索引≥35,000行/秒、目录并行≥3倍”全部达成。
+
+其他观察：
+- 已建索引后的查询延迟与原始基线相同：分类1.5ms、FTS 3–5ms、按行定位1.4ms（同一6.47MB文件）。
+- 建索引峰值内存45MB→59MB（构建连接64MB页缓存与单事务）；扫描峰值21–23MB不变。
+- 目录缓存体积略增（3.48→3.57倍），单文件减小（3.44→3.28倍）：每个文件批量建FTS会各自产生段，小文件多时段数多。可在批量建立后执行FTS5 `optimize`合并，但会重写整个FTS索引，本次未做。
+
+未完成项与遗留：J9未实施（见上）；CLI未增加`--jobs`参数（只有`ViewerIndex(workers=)`）；正在写入的Journal在建索引时仍会因“源文件发生变化”进入失败状态，需J3处理。

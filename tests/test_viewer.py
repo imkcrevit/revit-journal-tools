@@ -7,6 +7,7 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
+from revit_journal_tools import viewer_index
 from revit_journal_tools.categories import Categorizer
 from revit_journal_tools.rules import load_rules
 from revit_journal_tools.viewer_index import ViewerIndex
@@ -156,6 +157,77 @@ class IndexTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+@patch.object(viewer_index, "PARALLEL_MIN_BYTES", 0)
+class ParallelBuildTests(unittest.TestCase):
+    """J8: child processes parse, the parent alone writes; results equal the serial build."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        examples = Path(__file__).resolve().parent.parent / "examples"
+        self.paths = []
+        for number, source in enumerate(sorted(examples.glob("*.journal.txt")), 1):
+            path = self.root / f"journal.{number:04d}.txt"
+            path.write_bytes(source.read_bytes() * (number + 2))
+            self.paths.append(path)
+        self.bad = self.root / "journal.0099.txt"
+        self.bad.write_bytes(b"normal\n\xff\n")
+        self.paths.append(self.bad)
+
+    def snapshot(self, index):
+        result = {}
+        with index.connect() as connection:
+            for item in index.catalog():
+                rows = connection.execute("SELECT line_number,body,category,severity,rules,degraded FROM lines "
+                                          "WHERE file_id=? ORDER BY line_number", (item["id"],)).fetchall()
+                blocks = connection.execute("SELECT * FROM blocks WHERE file_id=? ORDER BY start_line",
+                                            (item["id"],)).fetchall()
+                result[item["name"]] = (item["status"], item["error"], item["sha256"], item["line_count"],
+                                        item["counts"], item["block_counts"], [tuple(row) for row in rows],
+                                        [tuple(row)[1:] for row in blocks])
+        return result
+
+    def build(self, workers, name):
+        index = ViewerIndex(self.root / name, workers=workers)
+        index.build(index.register(self.paths, "utf-8"), "utf-8")
+        return index
+
+    def test_parallel_build_equals_serial_and_isolates_failures(self):
+        serial = self.build(1, "serial.sqlite3")
+        with patch.object(ViewerIndex, "_copy_scratch", autospec=True,
+                          side_effect=ViewerIndex._copy_scratch) as copied:
+            parallel = self.build(3, "parallel.sqlite3")
+        self.assertEqual(copied.call_count, len(self.paths) - 1)  # The undecodable file never gets copied.
+        self.assertEqual(self.snapshot(serial), self.snapshot(parallel))
+        statuses = {item["name"]: item["status"] for item in parallel.catalog()}
+        self.assertEqual(statuses.pop("journal.0099.txt"), "error")
+        self.assertEqual(set(statuses.values()), {"ready"})
+        # Full-text rows were built for the copied files.
+        file_id = next(item["id"] for item in parallel.catalog() if item["name"] == "journal.0001.txt")
+        self.assertTrue(parallel.blocks(file_id, query="Vendor")["items"])
+        with parallel.connect() as connection:
+            connection.execute("INSERT INTO line_search(line_search, rank) VALUES('integrity-check',1)")
+
+    def test_rebuild_after_parallel_build_keeps_fts_consistent(self):
+        index = self.build(3, "rebuild.sqlite3")
+        self.paths[0].write_text("DBG_ERROR: replaced_marker\n", encoding="utf-8")
+        index.build(index.register(self.paths, "utf-8"), "utf-8")
+        file_id = next(item["id"] for item in index.catalog() if item["name"] == "journal.0001.txt")
+        self.assertEqual(index.events(file_id, query="replaced_marker")["items"][0]["line_number"], 1)
+        self.assertEqual(index.events(file_id, query="Vendor")["items"], [])
+        with index.connect() as connection:
+            connection.execute("INSERT INTO line_search(line_search, rank) VALUES('integrity-check',1)")
+
+    def test_stop_leaves_unfinished_files_queued(self):
+        index = ViewerIndex(self.root / "stop.sqlite3", workers=3)
+        queued = index.register(self.paths, "utf-8")
+        stop = threading.Event()
+        stop.set()
+        index.build(queued, "utf-8", stop)
+        self.assertEqual({item["status"] for item in index.catalog()}, {"queued"})
 
 
 @patch("revit_journal_tools.reader.system_fallback_encoding", return_value="gb18030")

@@ -16,7 +16,9 @@ Journal文件 → 严格解码与逐行读取 → 规则匹配 → 候选、上�
 
 `sessions.py`只按文件名和所在目录把输入归为Revit会话（`journal.NNNN`前缀），角色为主Journal、Worker、精简、副本、dmp或未识别命名。大小相同的文本输入会计算SHA-256，字节相同者只保留一个（优先主Journal），其余作为`duplicate`旁注；0字节文件为`empty`，`.dmp`为`binary`，两者都不进入索引队列，但在会话中列出。
 
-`Rule`是声明式JSON规则。每条规则在每行最多产生一次命中，所有匹配位置均使用解码后的字符索引，不是原始字节偏移。规则不执行Journal内容、不运行Python代码，不访问网络。规则正则应由项目维护者审核，当前没有正则执行超时隔离。
+`Rule`是声明式JSON规则。每条规则在每行最多产生一次命中，所有匹配位置均使用解码后的字符索引，不是原始字节偏移。规则不执行Journal内容、不运行Python代码，不访问网络。规则正则应由项目维护者审核，当前没有正则执行超时隔离。规则可声明字面量门控`gate`：`match_rules`每行只折叠一次（`rules.fold`：小写，并把正则忽略大小写时等同于i/s的`İ ı ſ`先换掉），门控子串都不在行内时跳过该规则的正则。门控是必要条件，不改变命中；内置规则全部声明了门控，测试与`scripts/verify_equivalence.py gates`逐行证明有无门控命中相同。
+
+分类与分段沿用同一思路：`Categorizer`、`BlockBuilder`、`LoadingEvidence`中每个忽略大小写的正则前都有按`fold`检查的字面量门控（模块级`*_GATE`元组），每行的形状判断（时间戳、API头、资源采样、强错误、加载前缀、原生异常）只计算一次；`LoadingEvidence`未激活时只检查加载前缀门控。`tests/test_categories_gates.py`把全部门控替换为空串（即总是运行正则）后比对分类与块，结果必须完全相同。
 
 `analyze`只持有当前行、有限长度的前文、正在补齐后文的候选，以及有容量上限的明细和重复组。总计数不受明细上限影响。同一行多个规则合为一个候选，级别取最大值；分组只对完全相同的行内容和命中规则集合生效。
 
@@ -33,6 +35,10 @@ CLI在扫描前发现文件，对单个文件失败进行隔离。输出先写�
 `LoadingEvidence`在明确的Add-in加载事件中累计Vendor依据，直到整个块结束才确定来源。跨行字段缓冲最多4096字符，依据最多8条、每条400字符；不根据DLL路径推断厂商，不继承上一个事件的Vendor。`blocks.addin_origin/addin_evidence`保存独立来源属性，原有错误分类与级别保持有效。CLI用`BLOCK_FILTERS`将来源筛选映射到独立索引字段，FTS仍先找命中行，再映射为完整块。分类统计包含可重叠的来源计数，总块数只累计原有互斥类别。旧数据库自动补充字段，`BLOCK_VERSION`变化触发已选文件重建。
 
 加载事件正文先剥离时间戳、Journal层级和API包装，再检查正文开头的固定加载前缀。`addin_name/addin_class`各保留最多512字符，超限由`addin_identity_truncated`标记；字段可跨行，但不跨事件继承。名称/Class前缀通过带转义的SQL前缀查询筛选，支持与来源及FTS组合，并保留原始起始行分页游标。CLI折叠列表只使用这些元数据；Add-in条目忽略普通段落预览级别，仅在展开时调用`block_lines`读取原文。
+
+`ViewerIndex`写入：每个文件一个事务。先在短事务中删除旧行（同时用`'delete'`命令删除其FTS条目）并标记`indexing`；随后`parse_into`按2万行一批`executemany`写`lines`与`blocks`，文件读完后在同一事务内用`INSERT INTO line_search(rowid, body) SELECT ...`一次性建立该文件的全文索引，再写统计并置`ready`。失败或停止时整个事务回滚，不会留下半个文件。旧版本逐行维护FTS的触发器在打开数据库时删除；“`lines`中每一行都有FTS条目”的不变式由同事务插入/删除保证。连接保持`synchronous=NORMAL`（WAL模式下提交不刷盘，只在检查点刷盘）。
+
+多文件时（至少2个文件、总量不小于`PARALLEL_MIN_BYTES`=2MB），`ViewerIndex`用`multiprocessing`的`spawn`上下文启动进程池：子进程各自加载内置规则，把一个文件解析进系统临时目录中的私有临时库（无索引、无日志），返回元数据；主进程按完成顺序`ATTACH`临时库并以`INSERT ... SELECT`复制，FTS与状态更新同上。只有主进程写共享索引，子进程不持有任何主进程连接。停止时终止进程池，未复制的文件保持`queued`。
 
 CLI的`browse`命令调用同一索引，提供颜色和折叠交互，不启动HTTP服务。`scan`继续提供逐行错误候选报告，原有`view`保留Web列表。三种入口共享原始行号和解码规则；块数、命中行数和实际事故数不能混为一谈。
 

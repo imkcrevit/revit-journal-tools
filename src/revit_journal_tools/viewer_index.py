@@ -1,7 +1,12 @@
 """Persistent full-line index. Pagination never depends on retained scan findings."""
 
 import json
+import multiprocessing
+import os
+import shutil
+import signal
 import sqlite3
+import tempfile
 import threading
 from collections import Counter
 from contextlib import contextmanager
@@ -46,18 +51,127 @@ CREATE TABLE IF NOT EXISTS block_stats (
 CREATE VIRTUAL TABLE IF NOT EXISTS line_search USING fts5(
  body, content='lines', content_rowid='id', columnsize=0
 );
-CREATE TRIGGER IF NOT EXISTS lines_insert AFTER INSERT ON lines BEGIN
- INSERT INTO line_search(rowid, body) VALUES (new.id, new.body);
-END;
-CREATE TRIGGER IF NOT EXISTS lines_delete AFTER DELETE ON lines BEGIN
- INSERT INTO line_search(line_search, rowid, body) VALUES ('delete', old.id, old.body);
-END;
+DROP TRIGGER IF EXISTS lines_insert;
+DROP TRIGGER IF EXISTS lines_delete;
 """
+# Full-text rows are maintained per file, not per line: a file's lines and its
+# FTS rows are inserted in the same transaction (one per file) and deleted
+# together, so every row in `lines` always has its FTS entry. Earlier versions
+# kept the same invariant with per-row triggers, which cost ~80% of the
+# SQLite time; they are dropped on open.
+_BATCH = 20_000
 
 
 def _stamp(path: Path) -> str:
     info = path.stat()
     return json.dumps([info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns])
+
+
+_INSERT_LINES = ("INSERT INTO lines(file_id,line_number,body,category,severity,rules,degraded) "
+                 "VALUES(?,?,?,?,?,?,?)")
+_INSERT_BLOCKS = (
+    "INSERT INTO blocks(file_id,start_line,end_line,category,severity,rules,title,title_line,boundary,complete,"
+    "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+
+
+def _insert_batch(connection, file_id, lines, blocks, block_counts) -> None:
+    connection.executemany(_INSERT_LINES, lines)
+    for block in blocks:
+        block_counts[block.category] += 1
+        if block.addin_origin:
+            block_counts["addin_" + block.addin_origin] += 1
+            block_counts["addin"] += 1
+    connection.executemany(_INSERT_BLOCKS, [
+        (file_id, b.start_line, b.end_line, b.category, b.severity, ",".join(sorted(b.rules)),
+         b.title, b.title_line, b.boundary, int(b.complete), b.addin_origin,
+         json.dumps(b.addin_evidence, ensure_ascii=False), b.addin_name, b.addin_class,
+         int(b.addin_identity_truncated)) for b in blocks])
+
+
+def parse_into(connection, file_id, path, encoding, rules, stop=None, progress=None) -> dict | None:
+    """Read, classify and group one file into `lines`/`blocks` of an open
+    transaction (no commit). Returns the file metadata, or None when stopped."""
+    counts: Counter[str] = Counter()
+    block_counts: Counter[str] = Counter()
+    categorizer, builder = Categorizer(rules), BlockBuilder()
+    classify, feed = categorizer.classify, builder.feed
+    batch: list[tuple] = []
+    block_batch: list = []
+    with JournalReader(path, encoding) as reader:
+        for line in reader:
+            classification = classify(line.text)
+            counts[classification[0]] += 1
+            batch.append((file_id, line.number, line.text, *classification, int(line.degraded)))
+            block_batch.extend(feed(line, classification))
+            if len(batch) >= _BATCH:
+                _insert_batch(connection, file_id, batch, block_batch, block_counts)
+                batch.clear()
+                block_batch.clear()
+                if progress:
+                    progress(reader.byte_count, reader.line_count)
+                if stop and stop.is_set():
+                    return None
+        block_batch.extend(builder.finish())
+        _insert_batch(connection, file_id, batch, block_batch, block_counts)
+        return {**reader.decoding_summary(), "sha256": reader.sha256, "line_count": reader.line_count,
+                "byte_count": reader.byte_count, "counts": dict(counts), "block_counts": dict(block_counts)}
+
+
+# Child processes parse into a private scratch database (same columns, no
+# indexes, no journal); the parent copies it with one INSERT ... SELECT. Only the
+# parent writes the shared index, and children never touch its connection.
+_SCRATCH_SCHEMA = """
+CREATE TABLE lines (
+ id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, line_number INTEGER NOT NULL,
+ body TEXT NOT NULL, category TEXT NOT NULL, severity TEXT NOT NULL, rules TEXT NOT NULL,
+ degraded INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE blocks (
+ file_id INTEGER NOT NULL, start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+ category TEXT NOT NULL, severity TEXT NOT NULL, rules TEXT NOT NULL,
+ title TEXT NOT NULL, title_line INTEGER NOT NULL, boundary TEXT NOT NULL,
+ complete INTEGER NOT NULL, addin_origin TEXT NOT NULL, addin_evidence TEXT NOT NULL,
+ addin_name TEXT NOT NULL, addin_class TEXT NOT NULL, addin_identity_truncated INTEGER NOT NULL
+);
+"""
+_BLOCK_COLUMNS = ("start_line,end_line,category,severity,rules,title,title_line,boundary,complete,"
+                  "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated")
+# Below this much work, starting processes costs more than it saves.
+PARALLEL_MIN_BYTES = 2 * 1024 * 1024
+_worker_rules = None
+
+
+def _parse_to_scratch(task: tuple) -> tuple[int, dict | None, str | None]:
+    """Runs in a child process. Returns (file_id, metadata or None, error or None)."""
+    global _worker_rules
+    file_id, path, encoding, stamp, scratch = task
+    try:
+        if _worker_rules is None:
+            _worker_rules = load_rules()
+        connection = sqlite3.connect(scratch)
+        try:
+            connection.execute("PRAGMA journal_mode=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.executescript(_SCRATCH_SCHEMA)
+            meta = parse_into(connection, file_id, Path(path), encoding, _worker_rules)
+            connection.commit()
+        finally:
+            connection.close()
+        if _stamp(Path(path)) != stamp:
+            return file_id, None, "源文件自任务创建后发生变化，请重新索引"
+        return file_id, meta, None
+    except (OSError, ValueError, LookupError, sqlite3.Error) as error:
+        return file_id, None, str(error)
+
+
+def _ignore_interrupts() -> None:
+    """Child processes leave Ctrl+C to the parent, which terminates the pool."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def default_workers() -> int:
+    return max(1, min(8, (os.cpu_count() or 2) - 1))
 
 
 def _kind(path: Path) -> str:
@@ -76,13 +190,17 @@ _FILE_COLUMNS = {
 
 
 class ViewerIndex:
-    def __init__(self, database: str | Path):
+    def __init__(self, database: str | Path, workers: int | None = None):
+        """workers: processes for multi-file builds (default: cores-1, at most 8; 1 = serial)."""
+        self.workers = default_workers() if workers is None else max(1, workers)
         self.database = Path(database).resolve()
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.rules = load_rules()
         self.signature = INDEX_VERSION + ":" + ruleset_digest(self.rules)
         self.file_ids: list[int] = []
         self.sidecars: list[dict] = []
+        # file id -> (bytes read, lines read) while its single transaction is open.
+        self.progress: dict[int, tuple[int, int]] = {}
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
@@ -166,86 +284,143 @@ class ViewerIndex:
         return queued
 
     def build(self, file_ids: list[int], encoding: str, stop: threading.Event | None = None) -> None:
+        if self._parallel(file_ids):
+            self._build_parallel(file_ids, encoding, stop)
+        else:
+            self._build_serial(file_ids, encoding, stop)
+
+    def _build_serial(self, file_ids: list[int], encoding: str, stop: threading.Event | None) -> None:
         for file_id in file_ids:
             if stop and stop.is_set():
                 return
             try:
                 self._build_file(file_id, encoding, stop)
             except (OSError, ValueError, LookupError, sqlite3.Error) as error:
-                with self.connect() as connection:
-                    connection.execute("UPDATE files SET status='error',error=? WHERE id=?", (str(error), file_id))
+                self._fail(file_id, error)
+            finally:
+                self.progress.pop(file_id, None)
+
+    def _parallel(self, file_ids: list[int]) -> bool:
+        if self.workers < 2 or len(file_ids) < 2:
+            return False
+        with self.connect() as connection:
+            total = sum(row[0] for row in connection.execute(
+                f"SELECT size FROM files WHERE id IN ({','.join('?' * len(file_ids))})", file_ids))
+        return total >= PARALLEL_MIN_BYTES
+
+    def _build_parallel(self, file_ids: list[int], encoding: str, stop: threading.Event | None) -> None:
+        """Children parse whole files into scratch databases; this process copies
+        each finished file in one transaction, so finished files are usable first."""
+        with self.connect() as connection:
+            rows = {row["id"]: row for row in connection.execute(
+                f"SELECT * FROM files WHERE id IN ({','.join('?' * len(file_ids))})", file_ids)}
+        # Largest first keeps every worker busy until the end (shortest makespan).
+        order = sorted(file_ids, key=lambda file_id: -rows[file_id]["size"])
+        scratch_dir = Path(tempfile.mkdtemp(prefix="revit-journal-build-"))
+        tasks = [(file_id, rows[file_id]["path"], encoding, rows[file_id]["stamp"],
+                  str(scratch_dir / f"{file_id}.sqlite3")) for file_id in order]
+        context = multiprocessing.get_context("spawn")  # Windows-safe; no inherited connections
+        try:
+            try:
+                pool = context.Pool(min(self.workers, len(tasks)), initializer=_ignore_interrupts)
+            except OSError:
+                self._build_serial(order, encoding, stop)  # Processes unavailable: same result, slower.
+                return
+            with pool:
+                results = pool.imap_unordered(_parse_to_scratch, tasks)
+                pending = len(tasks)
+                while pending:
+                    if stop and stop.is_set():
+                        pool.terminate()  # Unfinished files stay queued.
+                        return
+                    try:
+                        file_id, meta, error = results.next(timeout=0.2)
+                    except multiprocessing.TimeoutError:
+                        continue
+                    pending -= 1
+                    scratch = scratch_dir / f"{file_id}.sqlite3"
+                    try:
+                        if error is not None:
+                            raise ValueError(error)
+                        self._copy_scratch(file_id, scratch, meta)
+                    except (OSError, ValueError, LookupError, sqlite3.Error) as failure:
+                        self._fail(file_id, failure)
+                    finally:
+                        self.progress.pop(file_id, None)
+                        scratch.unlink(missing_ok=True)
+        finally:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    def _copy_scratch(self, file_id: int, scratch: Path, meta: dict) -> None:
+        with self.connect() as connection:
+            connection.execute("PRAGMA cache_size=-65536")
+            self._start_file(connection, file_id)
+            connection.execute("ATTACH DATABASE ? AS scratch", (str(scratch),))
+            try:
+                connection.execute(
+                    "INSERT INTO lines(file_id,line_number,body,category,severity,rules,degraded) "
+                    "SELECT ?,line_number,body,category,severity,rules,degraded FROM scratch.lines ORDER BY id",
+                    (file_id,))
+                connection.execute(f"INSERT INTO blocks(file_id,{_BLOCK_COLUMNS}) "
+                                   f"SELECT ?,{_BLOCK_COLUMNS} FROM scratch.blocks ORDER BY rowid", (file_id,))
+                self._finish_file(connection, file_id, meta)
+                connection.commit()
+            finally:
+                connection.rollback()
+                connection.execute("DETACH DATABASE scratch")
+
+    def _fail(self, file_id: int, error: BaseException) -> None:
+        with self.connect() as connection:
+            connection.execute("UPDATE files SET status='error',error=? WHERE id=?", (str(error), file_id))
+
+    def _start_file(self, connection, file_id: int):
+        """Short committed transaction: drop the old rows (with their FTS entries)."""
+        row = connection.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        connection.execute("INSERT INTO line_search(line_search, rowid, body) "
+                           "SELECT 'delete', id, body FROM lines WHERE file_id=?", (file_id,))
+        connection.execute("DELETE FROM lines WHERE file_id=?", (file_id,))
+        connection.execute("DELETE FROM blocks WHERE file_id=?", (file_id,))
+        connection.execute("DELETE FROM block_stats WHERE file_id=?", (file_id,))
+        connection.execute("UPDATE files SET status='indexing',line_count=0,indexed_bytes=0,counts='{}',error=NULL,"
+                           "encoding=NULL,encoding_fallback=0,degraded_lines=0,degraded_sample='[]' WHERE id=?", (file_id,))
+        connection.commit()
+        self.progress[file_id] = (0, 0)
+        return row
+
+    @staticmethod
+    def _finish_file(connection, file_id: int, meta: dict) -> None:
+        """Same transaction as the rows: full-text rows, statistics, ready state."""
+        connection.execute("INSERT INTO line_search(rowid, body) SELECT id, body FROM lines WHERE file_id=?", (file_id,))
+        block_counts = meta["block_counts"]
+        connection.execute("INSERT OR REPLACE INTO block_stats VALUES(?,?,?)",
+                           (file_id, sum(block_counts.get(key, 0) for key in CATEGORIES), json.dumps(block_counts)))
+        connection.execute(
+            "UPDATE files SET status='ready',encoding=?,sha256=?,line_count=?,indexed_bytes=?,counts=?,"
+            "encoding_fallback=?,degraded_lines=?,degraded_sample=? WHERE id=?",
+            (meta["encoding"], meta["sha256"], meta["line_count"], meta["byte_count"], json.dumps(meta["counts"]),
+             int(meta["encoding_fallback"]), meta["decode_degraded_line_count"],
+             json.dumps(meta["decode_degraded_lines"]), file_id),
+        )
 
     def _build_file(self, file_id: int, encoding: str, stop: threading.Event | None) -> None:
         with self.connect() as connection:
-            row = connection.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+            connection.execute("PRAGMA cache_size=-65536")
+            row = self._start_file(connection, file_id)
             path = Path(row["path"])
-            connection.execute("DELETE FROM lines WHERE file_id=?", (file_id,))
-            connection.execute("DELETE FROM blocks WHERE file_id=?", (file_id,))
-            connection.execute("DELETE FROM block_stats WHERE file_id=?", (file_id,))
-            connection.execute("UPDATE files SET status='indexing',line_count=0,indexed_bytes=0,counts='{}',error=NULL,"
-                               "encoding=NULL,encoding_fallback=0,degraded_lines=0,degraded_sample='[]' WHERE id=?", (file_id,))
-            connection.commit()
-            counts: Counter[str] = Counter()
-            categorizer = Categorizer(self.rules)
-            builder = BlockBuilder()
-            block_counts: Counter[str] = Counter()
-            block_batch = []
-            batch = []
-            with JournalReader(path, encoding) as reader:
-                for line in reader:
-                    category, severity, rules = categorizer.classify(line.text)
-                    counts[category] += 1
-                    batch.append((file_id, line.number, line.text, category, severity, rules, int(line.degraded)))
-                    block_batch.extend(builder.feed(line, (category, severity, rules)))
-                    if len(batch) >= 5000:
-                        self._write_blocks(connection, file_id, block_batch, block_counts)
-                        self._write_batch(connection, file_id, batch, counts, reader)
-                        batch.clear()
-                        block_batch.clear()
-                        if stop and stop.is_set():
-                            connection.execute("UPDATE files SET status='queued' WHERE id=?", (file_id,))
-                            return
-                block_batch.extend(builder.finish())
-                self._write_blocks(connection, file_id, block_batch, block_counts)
-                self._write_batch(connection, file_id, batch, counts, reader)
-                if _stamp(path) != row["stamp"]:
-                    raise ValueError("源文件自任务创建后发生变化，请重新索引")
-                connection.execute(
-                    "UPDATE files SET status='ready',encoding=?,sha256=?,line_count=?,indexed_bytes=?,counts=?,"
-                    "encoding_fallback=?,degraded_lines=?,degraded_sample=? WHERE id=?",
-                    (reader.encoding, reader.sha256, reader.line_count, reader.byte_count, json.dumps(counts),
-                     int(reader.encoding_fallback), reader.degraded_line_count, json.dumps(reader.degraded_lines),
-                     file_id),
-                )
 
-    @staticmethod
-    def _write_blocks(connection, file_id, batch, counts):
-        for block in batch:
-            counts[block.category] += 1
-            if block.addin_origin:
-                counts["addin_" + block.addin_origin] += 1
-                counts["addin"] += 1
-        connection.executemany(
-            "INSERT INTO blocks(file_id,start_line,end_line,category,severity,rules,title,title_line,boundary,complete,addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            [(file_id, b.start_line, b.end_line, b.category, b.severity, ",".join(sorted(b.rules)),
-              b.title, b.title_line, b.boundary, int(b.complete), b.addin_origin,
-              json.dumps(b.addin_evidence, ensure_ascii=False), b.addin_name, b.addin_class,
-              int(b.addin_identity_truncated)) for b in batch],
-        )
-        connection.execute(
-            "INSERT OR REPLACE INTO block_stats VALUES(?,?,?)",
-            (file_id, sum(counts[key] for key in CATEGORIES), json.dumps(counts)),
-        )
+            def progress(byte_count, line_count):
+                self.progress[file_id] = (byte_count, line_count)
 
-    @staticmethod
-    def _write_batch(connection, file_id, batch, counts, reader):
-        connection.executemany("INSERT INTO lines(file_id,line_number,body,category,severity,rules,degraded) VALUES(?,?,?,?,?,?,?)", batch)
-        connection.execute(
-            "UPDATE files SET line_count=?,indexed_bytes=?,counts=? WHERE id=?",
-            (reader.line_count, reader.byte_count, json.dumps(counts), file_id),
-        )
-        connection.commit()
+            # One transaction for the whole file: a failure or stop rolls back
+            # every row, so a file is either complete and ready or absent.
+            meta = parse_into(connection, file_id, path, encoding, self.rules, stop, progress)
+            if meta is None:
+                connection.rollback()
+                connection.execute("UPDATE files SET status='queued' WHERE id=?", (file_id,))
+                return
+            if _stamp(path) != row["stamp"]:
+                raise ValueError("源文件自任务创建后发生变化，请重新索引")
+            self._finish_file(connection, file_id, meta)
 
     def catalog(self) -> list[dict]:
         with self.connect() as connection:
@@ -259,6 +434,9 @@ class ViewerIndex:
             if row["id"] not in allowed:
                 continue
             item = dict(row)
+            if item["status"] == "indexing" and item["id"] in self.progress:
+                # Rows become visible only at commit; report in-process progress.
+                item["indexed_bytes"], item["line_count"] = self.progress[item["id"]]
             item["counts"] = json.loads(item["counts"])
             item["block_counts"] = json.loads(item["block_counts"])
             item["degraded_sample"] = json.loads(item["degraded_sample"] or "[]")

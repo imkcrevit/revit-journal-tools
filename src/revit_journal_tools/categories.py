@@ -3,7 +3,7 @@
 import re
 
 from .models import SEVERITY_RANK
-from .rules import Rule
+from .rules import Rule, fold, match_rules
 
 CATEGORIES = {
     "startup": "启动", "system": "系统数据", "error": "错误",
@@ -20,6 +20,20 @@ _POSSIBLE_ERROR = (
     "failed to synchron", "cannot reconcile", "file not saved", "missing esschema",
     "access violation", "e_outofmemory", "错误", "异常", "访问冲突", "内存不足", "拒绝访问", "找不到", "无法同步", "同步失败",
 )
+_API_ERROR = re.compile(r"\bAPI_ERROR\s*[:{]", re.I)
+# Literal gates (checked against rules.fold(text)): every match of the regex
+# contains at least one of these, so skipping the regex never changes a result.
+# tests/test_categories_gates.py checks each gate against its regex.
+_JOURNAL_GATE = ("jrn.",)
+_STARTUP_GATE = (
+    "started recording journal", "initapplication", "initnativeinstance", "starting ",
+    "applicationinitialized", "build:", "branch:", "release:", "set jrn =",
+)
+_SYSTEM_GATE = (
+    "vm:", "ram:", "gui resource usage", "osversion", "oslanguage", "osbuild", "processor", "cpu", "gpu",
+    "display adapter", "physical memory", "license mode", "actual language code", "autodesk revit ",
+    "options::loadoptions", "system information", "systemsettings", "log summary", "computername", "username",
+)
 
 
 class Categorizer:
@@ -30,22 +44,25 @@ class Categorizer:
 
     def classify(self, text: str) -> tuple[str, str, str]:
         lower = text.lower()
-        is_api_error = "api_error" in lower and bool(re.search(r"\bAPI_ERROR\s*[:{]", text, re.I))
+        is_api_error = "api_error" in lower and bool(_API_ERROR.search(text))
         if is_api_error:
             self._api_depth = max(0, text.count("{") - text.count("}"))
             self._operation_continuation = False
             return "api_error", "error", "revit.api_error"
+        folded = lower if text.isascii() else fold(text)
+        # Pure function of the text; evaluated once instead of up to twice.
+        journal = any(map(folded.__contains__, _JOURNAL_GATE)) and _JOURNAL.search(text) is not None
         if self._api_depth:
             if ("api_success" in lower or "api_info" in lower or "dbg_error:" in lower
-                    or "exceptioncode=" in lower or _JOURNAL.search(text) or _RECORD.match(text)):
+                    or "exceptioncode=" in lower or journal or _RECORD.match(text)):
                 self._api_depth = 0
             else:
                 self._api_depth = max(0, self._api_depth + text.count("{") - text.count("}"))
                 return "api_error", "error", "revit.api_error:continuation"
         if _RECORD.match(text) or not text.strip():
             self._operation_continuation = False
-        if any(term in lower for term in _POSSIBLE_ERROR):
-            matches = [match for rule in self.rules if (match := rule.match(text))]
+        if any(map(lower.__contains__, _POSSIBLE_ERROR)):
+            matches = match_rules(self.rules, text)
             errors = [match for match in matches if match.severity != "warning"]
             if errors:
                 self._operation_continuation = False
@@ -53,12 +70,12 @@ class Categorizer:
                 return "error", severity, ",".join(match.rule_id for match in errors)
         if "dbg_warn" in lower:
             return "warning", "warning", "revit.dbg_warn"
-        if _JOURNAL.search(text) or self._operation_continuation:
+        if journal or self._operation_continuation:
             self._operation_continuation = text.rstrip().endswith("_")
             return "operation", "", ""
-        if _STARTUP.search(text):
+        if any(map(folded.__contains__, _STARTUP_GATE)) and _STARTUP.search(text):
             return "startup", "", ""
-        if _SYSTEM.search(text):
+        if any(map(folded.__contains__, _SYSTEM_GATE)) and _SYSTEM.search(text):
             return "system", "", ""
         if "api_success" in lower or "api_info" in lower:
             return "api", "", ""

@@ -19,7 +19,24 @@
 }
 ```
 
-必填字段为`id`、`title`、`severity`、`pattern`和`explanation`。可选字段为`basis`、`source_url`、`exclude_patterns`。未知字段、错误级别、无效正则、空匹配与重复ID会在扫描前报错。
+必填字段为`id`、`title`、`severity`、`pattern`和`explanation`。可选字段为`basis`、`source_url`、`exclude_patterns`、`gate`。未知字段、错误级别、无效正则、空匹配、空`gate`与重复ID会在扫描前报错。
+
+## 字面量门控`gate`
+
+`gate`是字符串数组，语义是“该规则任何命中行都必然包含其中至少一个子串”。扫描时每行只做一次折叠（`str.lower()`，并把正则忽略大小写时会等同于i/s的`İ`、`ı`、`ſ`先换成i/s），然后对每条规则先用`in`检查门控子串，至少一个存在才运行该规则的正则；没有`gate`的规则照旧对每行运行正则。门控只是预筛选，不改变命中结果：有门控与无门控的命中集合必须完全相同。
+
+```json
+{"id": "custom.connection_failure", "pattern": "CONNECTION_FAILED\\s*:", "gate": ["connection_failed"], "...": "..."}
+```
+
+编写要求：
+
+- 从正则中每个可选分支各取一个必然出现的字面片段，写成小写（加载时也会按同样方式折叠）；分支里有`\s+`、`[sz]`、`(?:...)?`等可变部分时，只取可变部分之前或之后的固定文字，例如`failed to synchroni[sz]e`取`failed to synchroni`。
+- 门控子串只用ASCII或中文等无大小写的文字；不要把正则中的`\s`写成门控里的空格之外的空白。
+- 修改正则时必须同步复核`gate`。内置规则由`tests/test_rules.py`的`GateEquivalenceTests`在样例与随机生成的6000行上证明有门控与无门控命中完全一致；`scripts/verify_equivalence.py gates`在本机真实Journal上做同样的逐行比对。
+- 自定义规则可以不写`gate`，代价是该规则对每行都运行正则。
+
+本机6.47MB/85,387行真实文件上，内置12条规则的正则调用从1,024,644次降到约600次，`scan`从2.7s降到约0.5s。
 
 `pattern`和排除表达式使用Python正则，并统一忽略大小写。排除表达式只排除当前规则在这一行的命中，不会阻止同一行被其他规则识别。每条规则每行只记录第一次匹配，报告中的规则计数是命中行数，不是关键字出现次数。复杂或不受信任的正则不应直接装载；规则引擎尚无独立超时沙箱。
 

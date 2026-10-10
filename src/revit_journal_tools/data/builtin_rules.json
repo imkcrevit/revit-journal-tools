@@ -6,6 +6,7 @@
       "title": "Revit调试错误标记",
       "severity": "error",
       "pattern": "\\bDBG_ERROR\\s*:",
+      "gate": ["dbg_error"],
       "basis": "documented_marker",
       "source_url": "https://www.autodesk.com/akn-aknsite-article-attachments/ea657414-ceec-4517-b029-99c43a7d4b69.pdf",
       "explanation": "命中DBG_ERROR标记；需要结合上下文确认影响范围与原因。"
@@ -15,6 +16,7 @@
       "title": "Revit调试警告标记",
       "severity": "warning",
       "pattern": "\\bDBG_WARN\\s*:",
+      "gate": ["dbg_warn"],
       "basis": "documented_marker",
       "source_url": "https://www.autodesk.com/akn-aknsite-article-attachments/ea657414-ceec-4517-b029-99c43a7d4b69.pdf",
       "explanation": "调试警告可能出现在正常会话中，单独命中不代表模型损坏或发生崩溃。"
@@ -24,6 +26,7 @@
       "title": "严重错误或未处理异常文字",
       "severity": "fatal",
       "pattern": "\\b(?:unrecoverable error|fatal error|unhandled exception|access violation)\\b|无法恢复的错误|致命错误|未处理的异常|访问冲突",
+      "gate": ["unrecoverable error", "fatal error", "unhandled exception", "access violation", "无法恢复", "致命", "未处理", "访问冲突"],
       "basis": "heuristic",
       "explanation": "文字表明需要优先检查；不能仅凭文字确认进程已崩溃或确定根因。"
     },
@@ -32,6 +35,7 @@
       "title": "显式错误标记",
       "severity": "error",
       "pattern": "(?:^|[\\s>:\\]])(?:ERROR|错误)\\s*[:：]",
+      "gate": ["error", "错误"],
       "basis": "heuristic",
       "explanation": "匹配带冒号的错误标记，避免只因出现error单词就判定错误。"
     },
@@ -40,6 +44,7 @@
       "title": "Revit API错误标记",
       "severity": "error",
       "pattern": "\\bAPI_ERROR\\s*(?::|\\{)",
+      "gate": ["api_error"],
       "basis": "case_verified",
       "explanation": "已在首批上传Journal中核对花括号格式的API_ERROR标记；标记可涉及加载冲突或调用失败，不直接等同于崩溃原因。"
     },
@@ -48,6 +53,7 @@
       "title": "异常类型与消息",
       "severity": "error",
       "pattern": "(?<![\\w.])(?:[A-Za-z_][A-Za-z0-9_]*\\.)*(?:[A-Za-z_][A-Za-z0-9_]*)?Exception\\s*:",
+      "gate": ["exception"],
       "basis": "heuristic",
       "explanation": "发现异常类型和消息分隔符；已捕获异常也可能命中，需要人工判断。"
     },
@@ -56,6 +62,7 @@
       "title": "原生异常事件或异常代码",
       "severity": "error",
       "pattern": "\\b(?:ExceptionCode\\s*=\\s*0x(?!0+\\b)[0-9a-f]+|Exception occurred|System exception in)\\b",
+      "gate": ["exceptioncode", "exception occurred", "system exception in"],
       "basis": "documented_marker",
       "source_url": "https://www.autodesk.com/akn-aknsite-article-attachments/ea657414-ceec-4517-b029-99c43a7d4b69.pdf",
       "explanation": "发现原生异常事件或非零异常代码；代码本身不说明具体故障原因。"
@@ -65,6 +72,7 @@
       "title": "断言失败标记",
       "severity": "error",
       "pattern": "\\bAssertion failed\\s*:",
+      "gate": ["assertion failed"],
       "basis": "documented_marker",
       "source_url": "https://www.autodesk.com/akn-aknsite-article-attachments/ea657414-ceec-4517-b029-99c43a7d4b69.pdf",
       "explanation": "发现断言失败文字；保留附近的源代码位置与操作上下文以便复核。"
@@ -74,6 +82,7 @@
       "title": "内存不足线索",
       "severity": "error",
       "pattern": "\\b(?:out of memory|OutOfMemoryException|E_OUTOFMEMORY)\\b|内存不足",
+      "gate": ["out of memory", "outofmemoryexception", "e_outofmemory", "内存不足"],
       "basis": "heuristic",
       "explanation": "发现内存不足相关文字；未据此判断硬件容量或模型问题。"
     },
@@ -82,6 +91,7 @@
       "title": "文件或权限访问失败线索",
       "severity": "error",
       "pattern": "\\b(?:access (?:is )?denied|UnauthorizedAccessException|file not found|FileNotFoundException|could not (?:find|load) (?:the )?file)\\b|拒绝访问|找不到(?:指定的)?文件",
+      "gate": ["access", "unauthorizedaccessexception", "file not found", "filenotfoundexception", "could not", "拒绝访问", "找不到"],
       "basis": "heuristic",
       "explanation": "发现访问失败文字；具体文件、插件或权限关系需要查看上下文。"
     },
@@ -90,6 +100,7 @@
       "title": "保存或同步失败线索",
       "severity": "error",
       "pattern": "\\b(?:failed to synchroni[sz]e|cannot reconcile the differences|merge exception|file not saved)\\b|无法同步|同步失败",
+      "gate": ["failed to synchroni", "cannot reconcile", "merge exception", "file not saved", "无法同步", "同步失败"],
       "basis": "heuristic",
       "source_url": "https://www.autodesk.com/support/technical/article/caas/sfdcarticles/sfdcarticles/File-not-saved-during-synchronize-with-central.html",
       "explanation": "发现保存或同步失败文字；同类表现可能有多种原因。"
@@ -99,6 +110,7 @@
       "title": "Extensible Storage Schema缺失线索",
       "severity": "error",
       "pattern": "\\bMissing ESSchema\\b",
+      "gate": ["missing esschema"],
       "basis": "documented_marker",
       "source_url": "https://www.autodesk.com/support/technical/article/caas/sfdcarticles/sfdcarticles/A-serious-error-has-occurred-Please-open-the-model-with-Audit-error-with-Revit-2024-3.html",
       "explanation": "Autodesk有相关问题记录，但版本与现场条件仍需核对；此规则不自动给出修复结论。"

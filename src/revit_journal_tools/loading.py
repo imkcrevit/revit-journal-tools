@@ -4,6 +4,7 @@ import re
 from urllib.parse import urlsplit
 
 from .categories import CATEGORIES
+from .rules import fold
 
 ADDIN_FILTERS = {
     "addin": "Add-in列表",
@@ -33,12 +34,18 @@ _MAX_EVIDENCE = 8
 _MAX_IDENTITY = 512
 
 
+# Every _START match contains one of these (checked against rules.fold(text)).
+START_GATE = ("application", "addin", "add-in")
+
+
 def loading_payload(text: str) -> str:
     text = _TIMESTAMP.sub("", text, count=1)
     return _API_PREFIX.sub("", _PREFIX.sub("", text, count=1).strip(), count=1)
 
 
-def is_addin_start(text: str) -> bool:
+def is_addin_start(text: str, folded: str | None = None) -> bool:
+    if not any(map((fold(text) if folded is None else folded).__contains__, START_GATE)):
+        return False
     return bool(_START.match(loading_payload(text)))
 
 
@@ -122,10 +129,12 @@ class LoadingEvidence:
             self.evidence.append({"line_number": self.vendor_line, "value": self.vendor[:400], "basis": reason})
         self.vendor, self.pending, self.truncated = "", False, False
 
-    def feed(self, number: int, text: str) -> None:
+    def feed(self, number: int, text: str, folded: str | None = None) -> None:
         if number == self.last_line:
             return
         self.last_line = number
+        if not self.active and not any(map((fold(text) if folded is None else folded).__contains__, START_GATE)):
+            return  # Inactive and no loading prefix possible: nothing to record.
         content = loading_payload(text)
         start = _START.match(content)
         if start and not self.active:
