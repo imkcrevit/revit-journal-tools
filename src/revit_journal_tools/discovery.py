@@ -38,3 +38,27 @@ def parse_years(values: list[str] | None) -> list[int]:
                 raise ValueError(f"--revit需要四位年份，例如2024：{part}")
             years.append(int(part))
     return years
+
+
+CACHE_ENV = "REVIT_JOURNAL_CACHE"
+CACHE_FILES = ("terminal.sqlite3", "viewer.sqlite3")
+
+
+def cache_dir(environ=None, os_name: str | None = None) -> Path:
+    r"""Default index cache (J19), never the current directory: REVIT_JOURNAL_CACHE,
+    else %LOCALAPPDATA%\revit-journal-tools\cache on Windows and
+    $XDG_CACHE_HOME (or ~/.cache)/revit-journal-tools elsewhere."""
+    environ = os.environ if environ is None else environ
+    if environ.get(CACHE_ENV):
+        return Path(environ[CACHE_ENV])
+    if (os_name or os.name) == "nt":
+        base = environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "revit-journal-tools" / "cache"
+    base = environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "revit-journal-tools"
+
+
+def cache_files(folder: Path) -> list[Path]:
+    """Index databases of this tool in folder, with their SQLite -wal/-shm files."""
+    return [path for name in CACHE_FILES for suffix in ("", "-wal", "-shm")
+            if (path := folder / (name + suffix)).is_file()]

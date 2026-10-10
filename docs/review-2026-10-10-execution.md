@@ -1,6 +1,6 @@
 # 审查修改计划执行记录（2026-10-10）
 
-依据：`docs/review-2026-10-10.md`第4节修改计划，本次执行阶段0、阶段1、阶段2（J18、J10、J1、J2、J4、J5、J6、J7、J8，J9可选）。
+依据：`docs/review-2026-10-10.md`第4节修改计划，已执行阶段0至阶段4（J1–J8、J10–J21、J25）；J22随J6处理（分类正则已预编译）；J23只靠门控降低规则正则的暴露面，未加载入时的复杂度检查；J9（可选的偏移模式）与J24（Web会话视图）未实施，见各阶段末“未完成与未验证”。
 
 环境：Windows 10 19045、Python 3.12.10、SQLite 3.49.1、系统代码页cp936、16个逻辑核。所有真实Journal只读使用，路径为`%LOCALAPPDATA%\Autodesk\Revit\Autodesk Revit <year>\Journals`，没有复制进仓库、测试或`cases/`。
 
@@ -237,3 +237,46 @@ py -3 scripts/benchmark_real.py dir --revit 2024 --encoding gb18030   # browse -
 - 真实Revit持有的Journal未测（见J3）。
 - Web查看器只显示“正在写入/实时快照”和最新优先的默认选择，没有会话摘要与阶段视图（J24）。
 - 阶段4（J17报告、J19缓存位置、J20、J21、J25）与J9未实施。J3已完成，J9的前提条件已具备。
+
+## 阶段4：交付
+
+### J17 支持工单报告（`report`，`ticket.py`）
+
+- `revit-journal report [路径…]`输出UTF-8 Markdown（`--format json`输出同内容的结构化版本）；不传路径时为本机最新会话（`--latest 1`），可与`--revit`、`--latest N`组合；`-o`以原子替换写出，不能覆盖输入或索引。
+- 结构对齐RevitLocalDbFix的`ReportBuilder`：顶部要点列表（生成时间、工具版本与规则集SHA-256、系统、个人信息处理、范围），每个会话一节：两列事实表（目录、主Journal、版本、进程号、起止、时长、结束状态、会话级发现数）、文件表（SHA-256、实际编码、行数、字节、读取状态）、会话摘要代码块（与`summary`同一渲染）、规则候选；末尾“未验证声明”。
+- 规则候选取自对会话内主Journal、精简Journal、worker日志的完整扫描：按严重级别、相同行（精确重复组）只列一次并注明次数与末次行号；同一规则组合最多3例并注明其余行数（真实2024会话中33条不同的程序集冲突原本占满30条名额）；`revit.ui_warning`只计数不列明细。每例带原始行号、前后文、规则ID、依据和说明；代码块围栏长于原文中最长的反引号串。
+- 个人信息：默认把Windows用户名、域名、计算机名替换为`<user>`、`<domain>`、`<machine>`，规则移植自RevitLocalDbFix的`ReportRedactor`（整词、`DOMAIN\user`与`\Users\name`上下文、JSON双反斜杠、与报告常用词同名时只在限定上下文替换）；`--include-personal-info`保留。本机2024全部会话报告中用户名出现0次（保留时89次）。SHA-256始终针对原始字节，报告中注明替换处摘录与原文不同。
+- 只有侧车文件的会话（如空`dump.0001.txt`）单列为“只有未读取的侧车文件”，不再显示误导的“主Journal尚未完成索引”。
+- 实测：本机2024最新会话（2个文件、29,655行）报告2.2s（全新索引数据库，含建索引）；2024目录全部11个会话1,791行Markdown，`journal.0011`一节列出钢连接错误日志、关联依据与`session.steel_localdb`候选。
+
+### J19 缓存位置
+
+- 默认索引数据库移出当前目录：Windows为`%LOCALAPPDATA%\revit-journal-tools\cache\`，其他系统为`$XDG_CACHE_HOME/revit-journal-tools`（缺省`~/.cache`）；环境变量`REVIT_JOURNAL_CACHE`或`--database`可改。`browse`/`summary`/`report`共用`terminal.sqlite3`，`view`用`viewer.sqlite3`。
+- 新增`revit-journal cache`显示位置、文件数和大小；`--clear`只删除本工具的两个数据库及其`-wal/-shm`，目录中其他文件不动。旧的`.journal-cache/`不自动删除（`.gitignore`保留该项）。
+
+### J20 原生Windows控制台验收
+
+- 新增`scripts/windows_console_probe.py`：在新的conhost窗口或Windows Terminal窗口中启动`browse`，附加到该控制台，用`WriteConsoleInputW`按键、`ReadConsoleOutputCharacterW`读取屏幕，逐键检查可见效果，再检查退出码、控制台模式恢复和备用屏退出。
+- 本机结果（Windows 10 19045 conhost、Windows Terminal Preview，2024 `journal.0014`真实Journal，120×30）：`s`摘要、`e`结束前操作、`P`阶段、`z`折叠切换、↓与Enter展开、Esc、`f`文件列表、`g`行号跳转、`/`搜索全部通过；`q`退出码0，Ctrl+C退出码130；conhost中VT标志在运行时开启、退出后恢复为原值`0x3`，两种宿主都离开了备用屏。中文与全角宽度显示正常。
+- 控制台无法进入交互模式时（不是控制台，或`SetConsoleMode`无法开启VT处理的旧版conhost）不再报错退出：stderr提示原因，等待建索引完成后输出一页段落摘要（等同`--print`，不带颜色），退出码0。该回退路径由单元测试模拟；本机没有不支持VT的旧控制台，未实测。
+- 探针运行时发现：从本工具外壳启动的进程继承了“忽略Ctrl+C”，探针在子进程中先恢复Ctrl+C处理；用户自己打开的控制台不受影响。
+
+### J21 分发形态
+
+- `scripts/build_zipapp.py`生成`dist/revit-journal.pyz`（约90KB），只含本包代码、内置规则和Web文件，目标机器只需Python 3.10+，`py dist\revit-journal.pyz <命令>`。入口与包的`__main__`一样受`__name__`保护，Windows spawn的建索引工作进程可以从zip中导入：2024目录`summary --jobs 4`为3.45s，`--jobs 1`为6.6s，说明并行确实生效而不是回退。
+- 没有做PyInstaller（带运行时的单文件exe）：会引入构建依赖和较大的二进制，且需要另外处理杀毒软件误报；有需要时再加。
+
+### J25 文档
+
+- README快速开始改为Windows优先：zipapp与虚拟环境两种方式、自动发现的Journals路径、中文系统无需`--encoding`、Windows Terminal与conhost说明；CLI示例去掉`--encoding cp1252`（只在英/德文首批案例和混合目录示例中保留）；新增“支持工单报告”一节；缓存位置与清理；项目结构补齐阶段3、4的模块。
+- `docs/terminal.md`补充缓存目录、`cache`命令、报告和Windows控制台说明；`docs/validation.md`记录本阶段验收。
+
+### 测试
+
+177项全部通过（阶段3为167项；新增`tests/test_delivery.py`10项：报告的哈希/行号/规则/声明/界面提示计数/围栏、个人信息替换与保留、JSON与输出保护、同规则组合限例、`Redactor`整词与JSON、围栏长度、各平台缓存目录、命令默认使用缓存目录与`cache --clear`只删本工具文件、控制台回退、zipapp在无源码树时运行并加载内置规则）。
+
+### 未完成与未验证
+
+- 不支持VT的旧版控制台（Windows 10 1511之前）只由单元测试模拟回退路径。
+- Web查看器仍没有段落与会话视图（J24）；J9偏移模式未实施。
+- 报告中的规则候选与会话级发现仍是候选；报告未与RevitLocalDbFix合并为单个文件，只是格式对齐。

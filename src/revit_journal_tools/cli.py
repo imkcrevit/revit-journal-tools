@@ -6,6 +6,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+from datetime import datetime
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Any, TextIO
 from . import __version__
 from .analyzer import ScanOptions, analyze
 from .blocks import PHASES
-from .discovery import journal_folders, parse_years
+from .discovery import cache_dir, cache_files, journal_folders, parse_years
 from .live import SNAPSHOT_MODES
 from .models import SEVERITY_RANK
 from .loading import BLOCK_FILTERS
@@ -50,6 +51,8 @@ def _workspace_options(command: argparse.ArgumentParser, index: bool) -> None:
     if index:
         command.add_argument("--jobs", type=int, default=None, metavar="N",
                              help="多文件建索引的进程数；默认逻辑核数减1、最多8，1为顺序")
+        command.add_argument("--database", type=Path, default=None,
+                             help="索引数据库；默认在缓存目录（revit-journal cache查看位置）")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -71,7 +74,6 @@ def _parser() -> argparse.ArgumentParser:
     rules.add_argument("--rules", type=Path, help="追加自定义JSON规则")
     browse = commands.add_parser("browse", help="打开CLI终端段落查看器（颜色、折叠、搜索）")
     _workspace_options(browse, index=True)
-    browse.add_argument("--database", type=Path, default=Path(".journal-cache/terminal.sqlite3"))
     browse.add_argument("--category", choices=("all", *BLOCK_FILTERS), default="all")
     browse.add_argument("--phase", choices=("all", *PHASES), default="all", help="只看某个会话阶段的段落")
     browse.add_argument("--query", default="", help="搜索段落内任意行；词语/末词前缀")
@@ -85,15 +87,27 @@ def _parser() -> argparse.ArgumentParser:
     browse.set_defaults(rules=None)
     summary = commands.add_parser("summary", help="会话摘要：怎么结束的、最后在做什么、许可/插件/对话框/侧车日志")
     _workspace_options(summary, index=True)
-    summary.add_argument("--database", type=Path, default=Path(".journal-cache/terminal.sqlite3"))
     summary.add_argument("--format", choices=("text", "json"), default="text")
     summary.add_argument("--tail", type=int, default=10, help="列出结束前最后N个操作与对话框，1到200")
     summary.set_defaults(rules=None)
     view = commands.add_parser("view", help="启动原有本地Web查看器")
     _workspace_options(view, index=True)
     view.add_argument("--port", type=int, default=8765)
-    view.add_argument("--database", type=Path, default=Path(".journal-cache/viewer.sqlite3"))
     view.set_defaults(rules=None)
+    report = commands.add_parser("report", help="生成可贴进支持工单的Markdown报告（SHA-256、编码、会话摘要、规则候选、侧车、声明）")
+    _workspace_options(report, index=True)
+    report.add_argument("--format", choices=("markdown", "json"), default="markdown")
+    report.add_argument("-o", "--output", type=Path, help="输出UTF-8报告；省略则写到标准输出")
+    report.add_argument("--min-severity", choices=SEVERITY_RANK, default="warning")
+    report.add_argument("--max-findings", type=int, default=30, help="每个文件最多列出多少条规则候选（相同行只算一条）")
+    report.add_argument("--context", type=int, default=2, help="候选前后各附几行原文，0到20")
+    report.add_argument("--tail", type=int, default=10, help="列出结束前最后N个操作与对话框，1到200")
+    report.add_argument("--include-personal-info", action="store_true",
+                        help="保留Windows用户名、域名和计算机名；默认替换为<user>、<domain>、<machine>")
+    report.add_argument("--rules", type=Path, help="追加自定义JSON规则")
+    cache = commands.add_parser("cache", help="显示索引缓存位置与大小；--clear删除本工具的索引数据库")
+    cache.add_argument("--clear", action="store_true", help="删除缓存目录中本工具的索引数据库（不动其他文件）")
+    cache.set_defaults(rules=None)
     return parser
 
 
@@ -193,6 +207,50 @@ def _destination(output: Path | None) -> Iterator[TextIO]:
             temporary.unlink(missing_ok=True)
 
 
+def _cache(clear: bool) -> int:
+    folder = cache_dir()
+    found = cache_files(folder)
+    size = sum(path.stat().st_size for path in found)
+    print(f"缓存目录：{folder}")
+    print(f"索引数据库：{len(found)}个文件，共{size / 1024 / 1024:.1f}MB（含完整Journal文本）")
+    if clear:
+        for path in found:
+            path.unlink()
+        print(f"已删除{len(found)}个文件；目录中的其他文件未改动。")
+    elif found:
+        print("删除：revit-journal cache --clear；也可设置REVIT_JOURNAL_CACHE或用--database改变位置。")
+    return 0
+
+
+def _report(args, years: list[int], rules) -> int:
+    from .ticket import Redactor, collect, to_json, to_markdown
+    from .viewer_index import ViewerIndex
+
+    if not 0 <= args.context <= 20 or not 1 <= args.tail <= 200 or args.max_findings < 1:
+        raise ValueError("--context需要0到20，--tail需要1到200，--max-findings需要大于0")
+    if not args.paths and not args.latest:
+        args.latest = 1  # Without paths: the newest session on this machine.
+    planned, errors, inputs = _workspace(args, years, attach=True)
+    if errors:
+        raise ValueError("；".join(item["error"] for item in errors))
+    protected = [*inputs, *([args.rules] if args.rules is not None else [])]
+    for target in (args.database, Path(str(args.database) + "-wal"), Path(str(args.database) + "-shm"), args.output):
+        _protect_inputs(target, protected)
+    index = ViewerIndex(args.database, workers=args.jobs, snapshot=args.snapshot)
+    index.build(index.register(planned, args.encoding), args.encoding)
+    # Keep enough candidates to pick one per repeat group after UI prompts are set aside.
+    options = ScanOptions(encoding=args.encoding, context=args.context, min_severity=args.min_severity,
+                          max_findings=max(500, args.max_findings * 20))
+    data = collect(index, rules, options, args.snapshot, args.tail, args.max_findings)
+    render = to_json if args.format == "json" else to_markdown
+    text = render(data, generated=datetime.now(), redact=None if args.include_personal_info else Redactor.current())
+    with _destination(args.output) as stream:
+        stream.write(text)
+    if args.output is not None:
+        print(f"报告已写入：{args.output.resolve()}", file=sys.stderr)
+    return 2 if data["failed"] else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # Keep redirected reports readable on Windows code pages as well as terminals.
     for stream in (sys.stdout, sys.stderr):
@@ -204,10 +262,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "rules":
             print(json.dumps({"schema_version": 1, "rules": [rule.definition() for rule in rules]}, ensure_ascii=False, indent=2))
             return 0
+        if args.command == "cache":
+            return _cache(args.clear)
         resolve_encoding(args.encoding)  # Reject unknown codecs before any work.
         years = parse_years(args.revit)
         if getattr(args, "jobs", None) is not None and args.jobs < 1:
             raise ValueError("--jobs必须大于0")
+        if getattr(args, "database", "") is None:
+            args.database = cache_dir() / ("viewer.sqlite3" if args.command == "view" else "terminal.sqlite3")
+        if args.command == "report":
+            return _report(args, years, rules)
         if args.command in {"view", "browse", "summary"}:
             planned, errors, inputs = _workspace(args, years, attach=True)
             if errors:

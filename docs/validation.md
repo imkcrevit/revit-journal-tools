@@ -1,5 +1,15 @@
 # 当前验证记录
 
+## 支持工单报告、缓存位置、原生Windows控制台与单文件分发（2026-10-10，Windows，阶段4）
+
+- 177项自动化测试全部通过；新增`tests/test_delivery.py`10项，只用构造的Journal片段。
+- 原生控制台（`scripts/windows_console_probe.py`，2024 `journal.0014`，120×30）：Windows 10 19045的conhost与Windows Terminal Preview中，`s`、`e`、`P`、`z`、↓/Enter展开、Esc、`f`、`g`、`/`的可见效果全部通过；`q`退出码0、Ctrl+C退出码130；conhost退出后输出模式恢复为`0x3`（运行时`0x7`），两种宿主都离开了备用屏。旧版不支持VT的控制台只由单元测试模拟回退路径。
+- `report`：本机2024全部11个会话生成1,791行Markdown，退出码0；默认报告中用户名出现0次，`--include-personal-info`时保留；2024 `journal.0011`一节列出钢连接错误日志、关联依据与`session.steel_localdb`候选。
+- `dist/revit-journal.pyz`（约90KB）在仓库外运行：2024目录`summary --jobs 4`为3.45s、`--jobs 1`为6.6s，即并行工作进程可从zip导入；`rules`与`cache`正常。
+- 默认索引位置为`%LOCALAPPDATA%\revit-journal-tools\cache`，不再写到当前目录。
+
+本次没有启动Revit；正在写入的Journal仍只用模拟验证。
+
 ## 会话摘要、阶段、Revit规则与侧车日志（2026-10-10，Windows，阶段3）
 
 - 167项自动化测试全部通过；新增测试只用构造的Journal片段（`tests/test_revit_logic.py`）。
@@ -68,4 +78,4 @@ CLI段落版本验证日期：2026-10-07。环境为Linux、Python 3.12.3、SQLi
 
 ## 尚未验证或实现
 
-没有执行Revit、修改模型或确认每条候选的实际影响。Windows原生终端适配与桌面安装包尚未验收；本次优先交付CLI终端查看器，原有Web仍使用逐行列表。尚无准确率/召回率标注集，分类规则和段落边界仍需要继续由案例校准。
+没有执行Revit、修改模型或确认每条候选的实际影响。原生Windows控制台已验收（见阶段4）；不提供带Python运行时的安装包，单文件`revit-journal.pyz`需要本机Python 3.10+。原有Web仍使用逐行列表，没有会话视图。尚无准确率/召回率标注集，分类规则和段落边界仍需要继续由案例校准。

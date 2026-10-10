@@ -10,6 +10,23 @@ Add-in加载支持Autodesk、第三方和来源待定筛选，按同一事件内
 
 ## 快速开始
 
+Windows（中文系统也无需指定编码）：
+
+```powershell
+# 方式一：单文件，只需Python 3.10+；在仓库中构建一次，复制dist\revit-journal.pyz即可分发
+py -3 scripts\build_zipapp.py
+py dist\revit-journal.pyz summary          # 本机各版本Revit最新会话的摘要
+py dist\revit-journal.pyz browse           # 打开最新会话的终端查看器
+py dist\revit-journal.pyz report -o Journal报告.md
+
+# 方式二：安装到虚拟环境，得到revit-journal命令
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\revit-journal.exe browse --revit 2024
+```
+
+不传路径时自动查找`%LOCALAPPDATA%\Autodesk\Revit\Autodesk Revit <year>\Journals`；也可以直接传文件或目录，例如`browse "$env:LOCALAPPDATA\Autodesk\Revit\Autodesk Revit 2024\Journals\journal.0011.txt"`。编码默认`auto`逐文件判定（中文Windows的cp936文件按gb18030读取），一般不需要`--encoding`。交互界面建议在Windows Terminal中使用；Windows 10自带控制台（conhost）已实测可用，不支持VT控制序列的旧控制台会提示并改为输出一页摘要（等同`--print`）。
+
 Linux/macOS：
 
 ```bash
@@ -19,19 +36,7 @@ python -m pip install -e .
 revit-journal browse examples/paragraphs.journal.txt
 ```
 
-Windows PowerShell：
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\revit-journal.exe browse examples\paragraphs.journal.txt
-```
-
-不安装包也可以运行：
-
-```bash
-PYTHONPATH=src python3 -m revit_journal_tools browse examples/paragraphs.journal.txt
-```
+不安装包也可以运行：`PYTHONPATH=src python3 -m revit_journal_tools browse examples/paragraphs.journal.txt`（Windows：`$env:PYTHONPATH='src'; py -3 -m revit_journal_tools browse ...`）。
 
 ## CLI终端查看器
 
@@ -47,14 +52,17 @@ revit-journal summary --revit 2024 --format json
 revit-journal browse cases/inbox --recursive
 
 # 直接进入API错误分类
-revit-journal browse journal.0001.txt --encoding cp1252 --category api_error
+revit-journal browse journal.0001.txt --category api_error
 
 # 筛选第三方Add-in加载，含加载失败事件
-revit-journal browse cases/inbox --recursive --encoding cp1252 --category addin_third_party
+revit-journal browse cases/inbox --recursive --category addin_third_party
 
 # Add-in列表与名称/Class前缀筛选
-revit-journal browse journal.0001.txt --encoding cp1252 --category addin
-revit-journal browse journal.0001.txt --encoding cp1252 --addin-prefix ATFTranslationServer
+revit-journal browse journal.0001.txt --category addin
+revit-journal browse journal.0001.txt --addin-prefix ATFTranslationServer
+
+# 英文系统产生的cp1252文件与本机文件混在一起时，按顺序尝试候选编码
+revit-journal browse cases/inbox --recursive --encoding utf-8,gb18030,cp1252
 
 # 用人工样例检查官方、第三方、来源缺失和加载失败
 revit-journal browse examples/addin-loading.journal.txt
@@ -72,7 +80,7 @@ revit-journal browse examples/paragraphs.journal.txt --format json --page-size 2
 
 按`f`打开的文件列表以Revit会话为单位：同一目录下`journal.NNNN.txt`、`journal.NNNN.workerN.log`、`journal.NNNN.txt.copy.txt`和`journal.NNNN.NNNN.dmp`归入同一会话。字节相同的副本只索引一次并在会话下注明，`.dmp`只计数和显示大小，0字节文件（如`dump.0001.txt`）列出但不索引；不符合上述命名的文件作为“未识别命名”单独成组，仍正常读取。`--print`与`--format json`同样按会话输出，JSON新增`sessions`节。
 
-首次启动在后台建索引，可先切换到已完成的文件。CLI缓存默认位于`.journal-cache/terminal.sqlite3`，全文保留在磁盘，段落再大也按页加载原文。搜索命中续行时返回整个段落，不重复列出同一块；统计“块数”与原有扫描的“命中行数”不同。
+首次启动在后台建索引，可先切换到已完成的文件。索引缓存默认在用户缓存目录（Windows：`%LOCALAPPDATA%\revit-journal-tools\cache\terminal.sqlite3`；Linux：`$XDG_CACHE_HOME`或`~/.cache`下的`revit-journal-tools`），不再写到当前目录；`revit-journal cache`显示位置与大小，`revit-journal cache --clear`删除本工具的索引数据库，也可用环境变量`REVIT_JOURNAL_CACHE`或`--database`改变位置。缓存含完整Journal文本，全文保留在磁盘，段落再大也按页加载原文。搜索命中续行时返回整个段落，不重复列出同一块；统计“块数”与原有扫描的“命中行数”不同。
 
 按`s`看当前会话摘要，`e`看结束前最后的操作与对话框，`P`按阶段（启动、许可、Add-in加载、打开文档、交互操作、退出）筛选，`9`看对话框，`z`切换“相同内容段落折叠为×N”。Revit仍在写入的Journal默认读取完整行的快照（`--snapshot`），并在界面中标注。
 
@@ -81,18 +89,30 @@ revit-journal browse examples/paragraphs.journal.txt --format json --page-size 2
 ## 原有Web查看器
 
 ```bash
-# 查看第一批已上传的案例；首次在后台建立磁盘索引
+# 查看第一批已上传的英/德文案例（cp1252）；首次在后台建立磁盘索引
 revit-journal view cases/inbox --recursive --encoding cp1252
 
 # 默认地址为http://127.0.0.1:8765；端口被占用时可调整
-revit-journal view cases/inbox --recursive --encoding cp1252 --port 8766
+revit-journal view --revit 2024 --port 8766
 ```
 
 浏览器打开命令显示的本地地址即可。左侧切换文件，上方切换分类；关键词搜索支持词语/词语前缀，列表每页最多100条，点击一条记录查看前后文，也可以直接跳到任意有效行号。分类包含启动、系统数据、错误、API错误、操作内容、警告、API活动和其他记录。
 
-首次索引逐文件进行，已经就绪的文件可先浏览。索引缓存位于`.journal-cache/viewer.sqlite3`，再次启动会复用未变化文件的索引。缓存包含完整日志文本，不受CLI的500条明细限制，默认不进入Git。文件内容、编码或索引规则变化后会重建相关索引。
+首次索引逐文件进行，已经就绪的文件可先浏览。索引缓存位于缓存目录的`viewer.sqlite3`，再次启动会复用未变化文件的索引。缓存包含完整日志文本，不受CLI的500条明细限制，默认不进入Git。文件内容、编码或索引规则变化后会重建相关索引。
 
-Web界面仍使用原有逐行列表；本次段落交互优先在CLI实现。尚未封装成Windows桌面安装包。原有Web用法见[docs/viewer.md](docs/viewer.md)。
+Web界面仍使用原有逐行列表，没有段落与会话视图；段落交互与会话摘要在CLI实现。原有Web用法见[docs/viewer.md](docs/viewer.md)。
+
+## 支持工单报告
+
+```powershell
+# 本机最新会话（不传路径时默认--latest 1）；写出UTF-8 Markdown
+revit-journal report -o reports\journal-report.md
+# 指定Journal或目录；JSON格式；保留个人信息（默认替换）
+revit-journal report "$env:LOCALAPPDATA\Autodesk\Revit\Autodesk Revit 2024\Journals" --revit 2024 --latest 3
+revit-journal report journal.0011.txt --format json --include-personal-info
+```
+
+报告按会话组织，便于直接贴进Autodesk支持工单，结构与RevitLocalDbFix报告一致（顶部要点列表、两列事实表、原文代码块）：每个文件的SHA-256、实际编码、行数与字节；会话摘要（结束状态、阶段、许可、文档、Add-in、对话框、结束前操作、最后几行、侧车日志及关联依据）；规则候选按严重级别列出，带原始行号、前后文、规则ID和依据，相同行只列一次，同一规则组合最多3例并注明其余行数，Revit界面提示只计数；末尾是未验证声明。默认把Windows用户名、域名和计算机名替换为`<user>`、`<domain>`、`<machine>`（只作用于报告文字，SHA-256仍针对原始文件）。退出码：`0`成功，`2`有文件读取失败（报告中显式列出）或参数错误。
 
 ## 扫描与导出
 
@@ -182,7 +202,13 @@ src/revit_journal_tools/
   analyzer.py            上下文、计数、有限容量的明细与分组
   models.py              结构化报告
   reporting.py           文本、JSON、JSONL导出
+  ticket.py              支持工单报告（Markdown/JSON）与个人信息替换
   cli.py                 批量扫描入口
+  discovery.py           本机Revit Journals目录与索引缓存目录
+  live.py                正在写入的Journal的快照读取
+  summary.py             会话摘要、结束状态与会话级候选
+  session_view.py        会话摘要的文本呈现
+  sidecars.py            钢连接错误日志、CER日志与会话的关联
   categories.py          启动、系统、错误、API和操作记录分类
   blocks.py              流式段落边界、跨行错误与操作分组
   loading.py             同一Add-in加载事件的厂商依据与来源筛选
@@ -215,12 +241,14 @@ py -3 scripts/benchmark_real.py all --revit 2024          # 扫描、分类分�
 py -3 scripts/verify_equivalence.py gates
 py -3 scripts/verify_equivalence.py blocks --old-src <旧src目录>
 py -3 scripts/verify_equivalence.py blocks --together --old-src <旧src目录>
+# 交互界面在原生控制台中的验收（会弹出一个窗口几秒钟）：conhost或Windows Terminal，逐键检查与退出恢复
+py -3 scripts/windows_console_probe.py <journal.txt> [--host wt] [--ctrl-c]
 ```
 
 本机实测（Windows 10、Python 3.12，2026-10-10）：6.47MB/85,387行真实Journal扫描约0.5s（约13MB/s），建索引约2.2s（约3.8万行/秒）；Revit 2024目录21个文本文件11MB的`browse --print`约2.6s。
 
 安装包后，Windows也可使用`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`运行同一套测试。
 
-下一步围绕实际案例细化会话时间线、完整操作阶段、插件/模块关联、段落边界和误报排除。当前版本未实现浏览器拖放导入、桌面安装包、AI分析、Journal回放或模型修复。
+单文件分发：`py -3 scripts/build_zipapp.py`生成`dist/revit-journal.pyz`（约90KB，只含本包代码、内置规则和Web文件），目标机器只需Python 3.10+。当前版本未实现浏览器拖放导入、带Python运行时的安装包、AI分析、Journal回放或模型修复。
 
 案例提交方式见[cases/README.md](cases/README.md)，规则扩展见[docs/rules.md](docs/rules.md)。Autodesk的[Journal阅读指导](https://www.autodesk.com/support/technical/article/How-to-read-the-journal-file-Revit/)建议结合具体操作、实际现象和近似时间排查；本项目按此保留上下文，其他参考见[docs/sources.md](docs/sources.md)。

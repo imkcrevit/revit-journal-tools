@@ -98,6 +98,10 @@ Revit运行时持续追加当前会话的Journal。`--snapshot auto`（默认）
 
 多文件建索引默认使用`min(8, 逻辑核数-1)`个进程，`--jobs N`调整，`--jobs 1`为顺序。工作进程无法启动或中途退出（例如嵌入式环境或从标准输入运行的脚本，spawn无法重新导入主模块）时，剩余文件自动改为在主进程中顺序建立，不会一直等待。
 
+## 支持工单报告
+
+`revit-journal report`把会话摘要与规则候选整理成可贴进Autodesk支持工单的Markdown（`--format json`为结构化版本），格式与RevitLocalDbFix报告对齐。不传路径时为本机最新会话；默认替换Windows用户名、域名和计算机名，`--include-personal-info`保留。每个文件有SHA-256与实际编码；规则候选带原始行号、前后文和规则ID，相同行只列一次，同一规则组合最多3例，Revit界面提示只计数；末尾为未验证声明。用法与字段见README“支持工单报告”。
+
 ## Add-in加载来源筛选
 
 ```bash
@@ -149,7 +153,7 @@ JSON中的`addin_origin`为`autodesk`、`third_party`、`unknown`，非加载事
 
 ## 索引与边界
 
-CLI数据库默认`.journal-cache/terminal.sqlite3`，通过`--database`调整。旧Web数据库默认位于另一个文件。首次建立磁盘索引需要时间与空间；在交互模式下可先查看已完成的文件，再切换到后续文件。输入发生变化时提示退出重开；下次启动按文件状态、编码和索引版本重建相关文件。
+索引数据库默认在用户缓存目录：Windows为`%LOCALAPPDATA%\revit-journal-tools\cache\`，其他系统为`$XDG_CACHE_HOME/revit-journal-tools`（缺省`~/.cache`）。`browse`、`summary`、`report`共用`terminal.sqlite3`，Web查看器用`viewer.sqlite3`；环境变量`REVIT_JOURNAL_CACHE`或`--database`可改变位置。缓存含完整Journal文本：`revit-journal cache`显示位置与大小，`revit-journal cache --clear`只删除这两个数据库及其`-wal/-shm`文件。早期版本写在当前目录的`.journal-cache/`不会自动删除，可手工删除。首次建立磁盘索引需要时间与空间；在交互模式下可先查看已完成的文件，再切换到后续文件。输入发生变化时提示退出重开；下次启动按文件状态、编码和索引版本重建相关文件。
 
 Add-in来源筛选升级了索引版本。重新打开时会自动为本次选择的旧缓存文件重建索引，大目录可能需要较长时间；无需手动删除缓存或修改原始Journal。
 
@@ -161,6 +165,6 @@ Add-in来源筛选升级了索引版本。重新打开时会自动为本次选�
 
 分组器只持有当前块的行号、有限标题和规则集合；完整内容在原文表中。展开只读取当前可见页，大段落不整体加载到内存。无法完整解码或索引失败的文件显示失败状态，不能作为完整结果打开。
 
-Linux终端已通过真实PTY验证。代码包含Windows控制台适配，尚未在原生Windows机器验收；推荐使用支持UTF-8与ANSI的终端。终端中的控制字符会转为可见转义文字，以免日志中的ESC/OSC内容改变终端状态。
+Linux终端已通过真实PTY验证。Windows 10的conhost与Windows Terminal已用`scripts/windows_console_probe.py`验收（按键、Ctrl+C、退出后恢复控制台模式与离开备用屏，见`docs/validation.md`）。控制台无法进入交互模式（不是控制台，或旧版conhost不支持VT控制序列）时，提示原因并改为输出一页段落摘要，等同`--print`。终端中的控制字符会转为可见转义文字，以免日志中的ESC/OSC内容改变终端状态。
 
 目前不调用AI API：已知Journal结构先由本地规则处理。若后续增加AI分类，仅考虑规则无法判定的少量段落，先做重复内容合并、长度限制和结果缓存；不会让AI通读整份日志。本地首次顺序读取用于严格解码、哈希和全文索引，之后复用磁盘缓存。

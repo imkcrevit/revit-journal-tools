@@ -9,7 +9,7 @@ import threading
 import time
 import unicodedata
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .blocks import PHASES
@@ -97,9 +97,9 @@ def keyboard():
         handle = kernel.GetStdHandle(-11)
         mode = ctypes.c_ulong()
         if not kernel.GetConsoleMode(handle, ctypes.byref(mode)):
-            raise ValueError("终端不支持交互模式，请使用--print或Windows Terminal")
+            raise ValueError("当前输出不是Windows控制台，不能进入交互模式")
         if not kernel.SetConsoleMode(handle, mode.value | 4):
-            raise ValueError("无法启用终端颜色，请使用--print")
+            raise ValueError("控制台不支持VT控制序列（旧版conhost），不能进入交互模式；可改用Windows Terminal")
 
         def read_key():
             if not msvcrt.kbhit():
@@ -608,7 +608,19 @@ def run(paths, database, encoding, *, category="all", query="", color="auto", pr
             return _print_pages(index, category, query, after, page_size, use_color, format_name, addin_prefix,
                                 phase, fold)
         browser = Browser(index, category, query, page_size, after, addin_prefix, phase, fold)
-        with keyboard() as read_key:
+        console = ExitStack()
+        try:
+            read_key = console.enter_context(keyboard())
+        except (ValueError, OSError) as error:
+            # Old conhost without VT processing, or no real console (J20): one page instead.
+            print(f"提示：{error}；改为输出一页段落摘要（等同--print）。", file=sys.stderr)
+            while worker.is_alive():
+                worker.join(0.2)
+            if failures:
+                raise ValueError(failures[0])
+            return _print_pages(index, category, query, after, page_size, False, format_name, addin_prefix,
+                                phase, fold)
+        with console:
             sys.stdout.write("\x1b[?1049h\x1b[?25l")
             try:
                 last_frame, last_refresh = "", 0.0
