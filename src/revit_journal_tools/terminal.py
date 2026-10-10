@@ -8,9 +8,12 @@ import sys
 import threading
 import time
 import unicodedata
+from collections import Counter
 from contextlib import contextmanager
+from pathlib import Path
 
 from .loading import ADDIN_FILTERS, ADDIN_KEYS, BLOCK_FILTERS, block_label, block_summary
+from .sessions import ROLE_LABELS, STATUS_LABELS
 from .viewer_index import ViewerIndex
 
 COLORS = {"startup": 34, "system": 36, "error": 31, "api_error": 35,
@@ -46,6 +49,35 @@ def crop(text: str, width: int, offset: int = 0) -> str:
         result.append(char)
         used += size
     return "".join(result)
+
+
+def encoding_label(file: dict) -> str:
+    """Actual per-file encoding plus fallback/degraded state; never hidden."""
+    text = file.get("encoding") or "未知编码"
+    if file.get("degraded_lines"):
+        text += f"（退化解码{file['degraded_lines']}行，字节以\\xNN显示）"
+    elif file.get("encoding_fallback"):
+        text += "（自动回退）"
+    return text
+
+
+def sidecar_label(item: dict) -> str:
+    text = f"· {item['name']} [{ROLE_LABELS[item['role']]}] {STATUS_LABELS[item['status']]}"
+    if item["status"] == "binary":
+        text += f"，{item['size'] / 1024 / 1024:.1f}MB"
+    if item.get("duplicate_of"):
+        text += f"（与{Path(item['duplicate_of']).name}相同）"
+    return text
+
+
+def session_label(session: dict, files: dict) -> str:
+    roles = Counter(files[file_id]["role"] for file_id in session["files"] if file_id in files)
+    roles.update(item["role"] for item in session["sidecars"] if item["status"] != "binary")
+    parts = [f"{ROLE_LABELS[role]}×{count}" for role, count in roles.items()]
+    if session["dump_count"]:
+        parts.append(f"dmp×{session['dump_count']}（{session['dump_bytes'] / 1024 / 1024:.1f}MB）")
+    head = f"会话 {session['label']}" if session["recognized"] else f"未识别命名 {session['label']}"
+    return f"{head} | {session['directory']} | " + "、".join(parts)
 
 
 def colored(text: str, category: str, enabled: bool, selected: bool = False) -> str:
@@ -152,6 +184,21 @@ class Browser:
     @property
     def block(self):
         return self.items[self.selected] if self.items else None
+
+    def file_rows(self) -> list[tuple[str, int | None]]:
+        """Session headers, selectable indexed files and display-only sidecars."""
+        positions = {item["id"]: number for number, item in enumerate(self.catalog)}
+        files = {item["id"]: item for item in self.catalog}
+        rows: list[tuple[str, int | None]] = []
+        for session in self.index.sessions(self.catalog):
+            rows.append((session_label(session, files), None))
+            for file_id in session["files"]:
+                number, item = positions[file_id], files[file_id]
+                marker = ">" if number == self.file_cursor else " "
+                rows.append((f"{marker} {number + 1}. [{item['status']}] {item['name']} [{item['kind']}] "
+                             f"{item['size'] / 1024 / 1024:.1f}MB | {encoding_label(item)}", number))
+            rows.extend(("    " + sidecar_label(side), None) for side in session["sidecars"])
+        return rows
 
     def refresh(self):
         self.catalog = self.index.catalog()
@@ -283,7 +330,7 @@ class Browser:
         if not self.file:
             add("没有可查看的文件")
             return "\r\n".join(rows)
-        add(f"{self.file_position + 1}/{len(self.catalog)} {self.file['name']} | {self.file['line_count']:,}行 / {self.file['block_count']:,}块")
+        add(f"{self.file_position + 1}/{len(self.catalog)} {self.file['name']} | {self.file['line_count']:,}行 / {self.file['block_count']:,}块 | {encoding_label(self.file)}")
         add(self.file["path"])
         add(f"分类: {BLOCK_FILTERS.get(self.category, '全部')} | 搜索: {self.query or '无'} | {'展开原文' if self.expanded else '折叠段落'} | 左右键横向滚动")
         addin_view = self.category in ADDIN_FILTERS or bool(self.addin_prefix)
@@ -293,10 +340,14 @@ class Browser:
             add(f"名称/Class前缀: {self.addin_prefix or '不限'} | v修改前缀 | Enter展开原始数据")
         content_rows = max(1, height - len(rows) - 5)
         if self.mode == "files":
-            start = max(0, self.file_cursor - content_rows + 1)
-            for number in range(start, min(len(self.catalog), start + content_rows)):
-                item = self.catalog[number]
-                add(f"{'>' if number == self.file_cursor else ' '} {number + 1}. [{item['status']}] {item['path']}", selected=number == self.file_cursor)
+            listing = self.file_rows()
+            cursor_row = next((row for row, (_, number) in enumerate(listing) if number == self.file_cursor), 0)
+            start = max(0, cursor_row - content_rows + 1)
+            for text, number in listing[start:start + content_rows]:
+                if number is None:
+                    add(text, "system")
+                else:
+                    add(text, selected=number == self.file_cursor)
         elif self.file["status"] != "ready":
             add(f"{self.file['status']}: {self.file.get('error') or '正在后台建立索引，可按f切换已完成的文件。'}", "warning")
         elif self.expanded and self.block:
@@ -309,6 +360,7 @@ class Browser:
             detail = self.index.block_lines(self.file["id"], block["start_line"], self.detail_offset, min(200, max(1, content_rows - 1 - extra)))
             for line in detail["items"]:
                 text = line["text"] + (" [单行预览截断]" if line["text_length"] > len(line["text"]) else "")
+                text += " [含无法解码字节，以\\xNN显示]" if line.get("degraded") else ""
                 # Keep source line numbers fixed while scrolling the body.
                 prefix = f"{line['line_number']:>8}  "
                 add(prefix + crop(text, width - len(prefix), self.horizontal), block["category"])
@@ -348,22 +400,37 @@ class Browser:
 
 
 def _print_pages(index, category, query, after, limit, color, format_name, addin_prefix=""):
-    files, failed = [], False
-    for file in index.catalog():
+    files, failed = {}, False
+    catalog = index.catalog()
+    for file in catalog:
         result = {"source": file["path"], "status": file["status"], "sha256": file["sha256"],
-                  "encoding": file["encoding"], "line_count": file["line_count"], "block_count": file["block_count"],
+                  "encoding": file["encoding"], "encoding_requested": file["encoding_requested"],
+                  "encoding_fallback": file["encoding_fallback"],
+                  "decode_degraded_line_count": file["degraded_lines"],
+                  "decode_degraded_lines": file["degraded_sample"],
+                  "session": file["session_label"], "role": file["role"],
+                  "line_count": file["line_count"], "block_count": file["block_count"],
                   "addin_count": file["block_counts"].get("addin", 0), "addin_prefix": addin_prefix}
         if file["status"] != "ready":
             result["error"] = file["error"]
             failed = True
         else:
             result.update(index.blocks(file["id"], category, query, after, limit, addin_prefix=addin_prefix))
-        files.append(result)
+        files[file["id"]] = result
+    sessions = index.sessions(catalog)
     if format_name == "json":
-        print(json.dumps({"schema_version": 1, "grouping": "paragraphs", "files": files}, ensure_ascii=False))
-    else:
-        for file in files:
-            print(safe_text(f"{file['source']} | {file['line_count']}行 / {file['block_count']}块"))
+        listing = [{**{key: value for key, value in session.items() if key != "files"},
+                    "files": [files[file_id]["source"] for file_id in session["files"]]} for session in sessions]
+        print(json.dumps({"schema_version": 1, "grouping": "paragraphs", "files": list(files.values()),
+                          "sessions": listing}, ensure_ascii=False))
+        return 2 if failed else 0
+    by_id = {item["id"]: item for item in catalog}
+    for session in sessions:
+        print(safe_text("== " + session_label(session, by_id)))
+        for file_id in session["files"]:
+            file = files[file_id]
+            print(safe_text(f"{file['source']} | {file['line_count']}行 / {file['block_count']}块 | "
+                            f"{encoding_label(by_id[file_id])}"))
             if category in ADDIN_FILTERS or addin_prefix:
                 print(safe_text(f"当前日志Add-in: {file['addin_count']}条加载记录 | 名称/Class前缀: {addin_prefix or '不限'}"))
             if "error" in file:
@@ -374,6 +441,8 @@ def _print_pages(index, category, query, after, limit, color, format_name, addin
                 label += ("[未闭合] " if not block["complete"] else "") + block_summary(block)
                 print(colored(safe_text(label), block["category"], color))
             print(f"本页{len(file['items'])}块；" + (f"仍有结果，续页使用--after {file['next_after']}" if file["has_more"] else "已到末页"))
+        for side in session["sidecars"]:
+            print(safe_text("  " + sidecar_label(side)))
     return 2 if failed else 0
 
 

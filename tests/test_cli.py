@@ -43,11 +43,36 @@ class CliTests(unittest.TestCase):
         bad = self.root / "bad.txt"
         bad.write_bytes(b"bad\xff")
         missing = self.root / "missing.txt"
-        code, stdout, _ = self.run_cli("scan", missing, bad, self.journal, "--format", "jsonl", "--fail-on", "error")
+        code, stdout, _ = self.run_cli("scan", missing, bad, self.journal, "--format", "jsonl",
+                                       "--fail-on", "error", "--encoding", "utf-8")
         self.assertEqual(code, 2)
         reports = [json.loads(line) for line in stdout.splitlines()]
         self.assertEqual(sorted(report["status"] for report in reports), ["error", "error", "ok"])
         self.assertTrue(all(not report["scan_complete"] for report in reports if report["status"] == "error"))
+
+    def test_auto_encoding_degrades_visibly_instead_of_failing(self):
+        bad = self.root / "bad.txt"
+        bad.write_bytes("正常\n".encode("gb18030") + b"DBG_ERROR: bad\xff\n")
+        with patch("revit_journal_tools.reader.system_fallback_encoding", return_value="gb18030"):
+            code, stdout, _ = self.run_cli("scan", bad, "--format", "json")
+            _, text, _ = self.run_cli("scan", bad)
+        self.assertEqual(code, 0)
+        report = json.loads(stdout)["files"][0]
+        self.assertEqual((report["status"], report["encoding"], report["encoding_requested"]), ("ok", "gb18030", "auto"))
+        self.assertTrue(report["encoding_fallback"])
+        self.assertEqual((report["decode_degraded_line_count"], report["decode_degraded_lines"]), (1, [2]))
+        self.assertTrue(any("退化解码" in warning for warning in report["warnings"]))
+        finding = report["findings"][0]
+        self.assertEqual(finding["line"]["text"], "DBG_ERROR: bad\\xff")
+        self.assertTrue(finding["line"]["decode_degraded"])
+        self.assertFalse(finding["context_before"][0]["decode_degraded"])
+        self.assertIn("退化解码，1行", text)
+        self.assertIn("[含无法解码字节", text)
+
+    def test_unknown_encoding_is_an_input_error(self):
+        code, _, stderr = self.run_cli("scan", self.journal, "--encoding", "no-such-codec")
+        self.assertEqual(code, 2)
+        self.assertIn("no-such-codec", stderr)
 
     def test_directory_recursion_and_deduplication(self):
         nested = self.root / "nested"

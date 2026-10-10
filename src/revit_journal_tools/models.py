@@ -12,6 +12,8 @@ class SourceLine:
     text: str
     text_length: int
     text_truncated: bool = False
+    # True when some bytes of this line could not be decoded and are shown as \\xNN.
+    decode_degraded: bool = False
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,12 @@ class ScanReport:
     scan_complete: bool = True
     assessment: str = "rule_candidates_only"
     retention_policy: str = "severity_then_first"
+    # Decoding provenance: what was requested, whether a fallback candidate or
+    # degraded decoding was needed, and which lines contain escaped bytes.
+    encoding_requested: str = "auto"
+    encoding_fallback: bool = False
+    decode_degraded_line_count: int = 0
+    decode_degraded_lines: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

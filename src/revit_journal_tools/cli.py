@@ -15,10 +15,17 @@ from . import __version__
 from .analyzer import ScanOptions, analyze
 from .models import SEVERITY_RANK
 from .loading import BLOCK_FILTERS
+from .reader import resolve_encoding
 from .reporting import write_reports
 from .rules import load_rules
+from .sessions import InputFile, plan_inputs
 
 TEXT_SUFFIXES = {".txt", ".log", ".journal"}
+ENCODING_HELP = (
+    "auto（默认）逐文件判定：BOM→严格UTF-8→系统代码页的超集（cp936用gb18030）；"
+    "全部失败时按该编码读取，无法解码的字节以\\xNN显示并在报告中标记退化行。"
+    "单个编码（如cp1252）为严格模式；逗号分隔的列表（如utf-8,gb18030,cp1252）按顺序尝试"
+)
 
 
 def _is_text_input(path: Path) -> bool:
@@ -32,7 +39,7 @@ def _parser() -> argparse.ArgumentParser:
     scan = commands.add_parser("scan", help="扫描文本文件或目录")
     scan.add_argument("paths", nargs="+", type=Path, help="文件或目录，可传多个")
     scan.add_argument("--recursive", action="store_true", help="递归扫描目录")
-    scan.add_argument("--encoding", default="auto", help="auto识别BOM，否则严格UTF-8；可指定gb18030等")
+    scan.add_argument("--encoding", default="auto", help=ENCODING_HELP)
     scan.add_argument("--context", type=int, default=3, help="命中行前后各保留多少行，0到100")
     scan.add_argument("--min-severity", choices=SEVERITY_RANK, default="warning")
     scan.add_argument("--max-findings", type=int, default=500, help="每文件最多保留多少条候选明细")
@@ -47,7 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     browse = commands.add_parser("browse", help="打开CLI终端段落查看器（颜色、折叠、搜索）")
     browse.add_argument("paths", nargs="+", type=Path)
     browse.add_argument("--recursive", action="store_true")
-    browse.add_argument("--encoding", default="auto")
+    browse.add_argument("--encoding", default="auto", help=ENCODING_HELP)
     browse.add_argument("--database", type=Path, default=Path(".journal-cache/terminal.sqlite3"))
     browse.add_argument("--category", choices=("all", *BLOCK_FILTERS), default="all")
     browse.add_argument("--query", default="", help="搜索段落内任意行；词语/末词前缀")
@@ -61,7 +68,7 @@ def _parser() -> argparse.ArgumentParser:
     view = commands.add_parser("view", help="启动原有本地Web查看器")
     view.add_argument("paths", nargs="+", type=Path, help="需要打开的日志文件或目录")
     view.add_argument("--recursive", action="store_true", help="包括子目录中的日志")
-    view.add_argument("--encoding", default="auto")
+    view.add_argument("--encoding", default="auto", help=ENCODING_HELP)
     view.add_argument("--port", type=int, default=8765)
     view.add_argument("--database", type=Path, default=Path(".journal-cache/viewer.sqlite3"))
     view.set_defaults(rules=None)
@@ -75,8 +82,10 @@ def _error(path: Path, message: str) -> dict[str, Any]:
     }
 
 
-def _discover(paths: list[Path], recursive: bool) -> tuple[list[Path], list[dict[str, Any]]]:
+def _discover(paths: list[Path], recursive: bool) -> tuple[list[Path], list[dict[str, Any]], list[Path]]:
+    """Text inputs, input errors, and binary .dmp sidecars found in directories."""
     found: set[Path] = set()
+    dumps: set[Path] = set()
     errors: list[dict[str, Any]] = []
     for path in paths:
         try:
@@ -84,16 +93,26 @@ def _discover(paths: list[Path], recursive: bool) -> tuple[list[Path], list[dict
                 found.add(path.resolve())
             elif path.is_dir():
                 iterator = path.rglob("*") if recursive else path.iterdir()
-                members = {item.resolve() for item in iterator if item.is_file() and _is_text_input(item)}
+                files = [item for item in iterator if item.is_file()]
+                members = {item.resolve() for item in files if _is_text_input(item)}
                 if members:
                     found.update(members)
+                    dumps.update(item.resolve() for item in files if item.suffix.lower() == ".dmp")
                 else:
                     errors.append(_error(path, "目录内没有.txt、.log、.journal或.txt.abbrev文件；子目录需--recursive"))
             else:
                 errors.append(_error(path, "路径不存在或不是普通文件/目录"))
         except OSError as error:
             errors.append(_error(path, str(error)))
-    return sorted(found), errors
+    return sorted(found), errors, sorted(dumps - found)
+
+
+def _duplicate(item: InputFile) -> dict[str, Any]:
+    return {
+        "schema_version": 1, "source": str(item.path), "status": "duplicate",
+        "scan_complete": False, "duplicate_of": str(item.duplicate_of), "sha256": item.sha256,
+        "byte_count": item.size, "session": item.session.label,
+    }
 
 
 def _protect_inputs(output: Path | None, inputs: list[Path]) -> None:
@@ -137,40 +156,48 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "rules":
             print(json.dumps({"schema_version": 1, "rules": [rule.definition() for rule in rules]}, ensure_ascii=False, indent=2))
             return 0
+        resolve_encoding(args.encoding)  # Reject unknown codecs before any work.
         if args.command in {"view", "browse"}:
-            paths, errors = _discover(args.paths, args.recursive)
+            paths, errors, dumps = _discover(args.paths, args.recursive)
             if errors:
                 raise ValueError("；".join(item["error"] for item in errors))
             for target in (args.database, Path(str(args.database) + "-wal"), Path(str(args.database) + "-shm")):
-                _protect_inputs(target, [*paths, *args.paths])
+                _protect_inputs(target, [*paths, *dumps, *args.paths])
+            planned = plan_inputs([*paths, *dumps])
             if args.command == "browse":
                 from .terminal import run
 
-                return run(paths, args.database, args.encoding, category=args.category, query=args.query,
+                return run(planned, args.database, args.encoding, category=args.category, query=args.query,
                            addin_prefix=args.addin_prefix,
                            color=args.color, print_only=args.print_only, format_name=args.format,
                            after=args.after, page_size=args.page_size)
             from .viewer_server import serve
 
-            serve(paths, args.database, args.encoding, args.port)
+            serve(planned, args.database, args.encoding, args.port)
             return 0
         options = ScanOptions(
             encoding=args.encoding, context=args.context, min_severity=args.min_severity,
             max_findings=args.max_findings, max_groups=args.max_groups,
             max_line_chars=args.max_line_chars,
         )
-        paths, input_errors = _discover(args.paths, args.recursive)
+        paths, input_errors, _ = _discover(args.paths, args.recursive)
         # Also protect the custom rule document, including symlinks and hard links.
         protected = [*paths, *args.paths]
         if args.rules is not None:
             protected.append(args.rules)
         _protect_inputs(args.output, protected)
         exit_code = 2 if input_errors else 0
+        planned = plan_inputs(paths)
 
         def reports() -> Iterator[dict[str, Any]]:
             nonlocal exit_code
             yield from input_errors
-            for path in paths:
+            for item in planned:
+                path = item.path
+                if item.status == "duplicate":
+                    # Byte-identical copy (e.g. journal.NNNN.txt.copy.txt): report once.
+                    yield _duplicate(item)
+                    continue
                 try:
                     report = analyze(path, options=options, rules=rules)
                 except (OSError, ValueError, LookupError) as error:

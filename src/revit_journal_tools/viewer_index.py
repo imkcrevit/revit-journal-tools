@@ -10,10 +10,11 @@ from pathlib import Path
 from .categories import CATEGORIES, Categorizer
 from .blocks import BLOCK_VERSION, BlockBuilder
 from .loading import BLOCK_FILTERS, block_filter, matches_filter
-from .reader import JournalReader
+from .reader import JournalReader, resolve_encoding
 from .rules import load_rules, ruleset_digest
+from .sessions import ROLE_LABELS, InputFile, describe, plan_inputs, sort_key
 
-INDEX_VERSION = "viewer-2:" + BLOCK_VERSION
+INDEX_VERSION = "viewer-3:" + BLOCK_VERSION
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
  id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
@@ -24,7 +25,8 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE TABLE IF NOT EXISTS lines (
  id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, line_number INTEGER NOT NULL,
- body TEXT NOT NULL, category TEXT NOT NULL, severity TEXT NOT NULL, rules TEXT NOT NULL
+ body TEXT NOT NULL, category TEXT NOT NULL, severity TEXT NOT NULL, rules TEXT NOT NULL,
+ degraded INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS lines_position ON lines(file_id, line_number);
 CREATE INDEX IF NOT EXISTS lines_category ON lines(file_id, category, line_number);
@@ -59,11 +61,18 @@ def _stamp(path: Path) -> str:
 
 
 def _kind(path: Path) -> str:
-    if path.name.lower().endswith(".txt.abbrev"):
-        return "精简Journal"
-    if path.suffix.lower() == ".log":
-        return "Worker"
-    return "Journal"
+    role = describe(path).role
+    if role == "unrecognized":
+        return "Worker" if path.suffix.lower() == ".log" else "Journal"
+    return ROLE_LABELS[role]
+
+
+# Added after the first release; existing databases get them via ALTER TABLE.
+_FILE_COLUMNS = {
+    "encoding_request": "TEXT", "encoding_requested": "TEXT",
+    "encoding_fallback": "INTEGER NOT NULL DEFAULT 0",
+    "degraded_lines": "INTEGER NOT NULL DEFAULT 0", "degraded_sample": "TEXT NOT NULL DEFAULT '[]'",
+}
 
 
 class ViewerIndex:
@@ -73,9 +82,16 @@ class ViewerIndex:
         self.rules = load_rules()
         self.signature = INDEX_VERSION + ":" + ruleset_digest(self.rules)
         self.file_ids: list[int] = []
+        self.sidecars: list[dict] = []
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
+            file_columns = {row["name"] for row in connection.execute("PRAGMA table_info(files)")}
+            for name, definition in _FILE_COLUMNS.items():
+                if name not in file_columns:
+                    connection.execute(f"ALTER TABLE files ADD COLUMN {name} {definition}")
+            if "degraded" not in {row["name"] for row in connection.execute("PRAGMA table_info(lines)")}:
+                connection.execute("ALTER TABLE lines ADD COLUMN degraded INTEGER NOT NULL DEFAULT 0")
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(blocks)")}
             if "addin_origin" not in columns:
                 connection.execute("ALTER TABLE blocks ADD COLUMN addin_origin TEXT NOT NULL DEFAULT ''")
@@ -102,31 +118,50 @@ class ViewerIndex:
         finally:
             connection.close()
 
-    def register(self, paths: list[Path], encoding: str) -> list[int]:
+    @staticmethod
+    def _same_decoding(row, policy) -> bool:
+        """The cached rows were decoded exactly as the current request would."""
+        if row["encoding_request"] == policy.key:
+            return True
+        # An explicit codec equal to the encoding actually used before, strictly.
+        return (not policy.detect and row["encoding"] == policy.candidates[0]
+                and not row["degraded_lines"])
+
+    def register(self, paths: list[Path | InputFile], encoding: str) -> list[int]:
+        """Register indexable inputs. Empty, binary and duplicate files become sidecars."""
+        policy = resolve_encoding(encoding)
+        planned = [item if isinstance(item, InputFile) else None for item in paths]
+        if any(item is None for item in planned):
+            planned = plan_inputs([getattr(item, "path", item) for item in paths])
         queued = []
         self.file_ids = []
-        signature = self.signature + ":" + encoding
+        self.sidecars = [item.sidecar() for item in planned if item.status != "index"]
+        indexable = [item.path for item in planned if item.status == "index"]
         with self.connect() as connection:
-            for path in sorted(set(path.resolve() for path in paths), key=lambda item: item.stat().st_size):
+            for path in sorted(indexable, key=lambda item: item.stat().st_size):
                 if path == self.database:
                     raise ValueError("索引数据库不能覆盖输入文件")
                 stamp = _stamp(path)
                 previous = connection.execute("SELECT * FROM files WHERE path=?", (str(path),)).fetchone()
                 if previous is None:
                     cursor = connection.execute(
-                        "INSERT INTO files(path,name,size,stamp,signature) VALUES(?,?,?,?,?)",
-                        (str(path), path.name, path.stat().st_size, stamp, signature),
+                        "INSERT INTO files(path,name,size,stamp,signature,encoding_request,encoding_requested) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (str(path), path.name, path.stat().st_size, stamp, self.signature, policy.key, encoding),
                     )
                     file_id = cursor.lastrowid
                     queued.append(file_id)
                 else:
                     file_id = previous["id"]
-                    if previous["status"] != "ready" or previous["stamp"] != stamp or previous["signature"] != signature:
+                    if (previous["status"] != "ready" or previous["stamp"] != stamp
+                            or previous["signature"] != self.signature or not self._same_decoding(previous, policy)):
                         connection.execute(
-                            "UPDATE files SET status='queued',stamp=?,size=?,signature=?,error=NULL WHERE id=?",
-                            (stamp, path.stat().st_size, signature, file_id),
+                            "UPDATE files SET status='queued',stamp=?,size=?,signature=?,encoding_request=?,"
+                            "encoding_requested=?,error=NULL WHERE id=?",
+                            (stamp, path.stat().st_size, self.signature, policy.key, encoding, file_id),
                         )
                         queued.append(file_id)
+                    # On reuse the row keeps the request it was built with.
                 self.file_ids.append(file_id)
         return queued
 
@@ -147,7 +182,8 @@ class ViewerIndex:
             connection.execute("DELETE FROM lines WHERE file_id=?", (file_id,))
             connection.execute("DELETE FROM blocks WHERE file_id=?", (file_id,))
             connection.execute("DELETE FROM block_stats WHERE file_id=?", (file_id,))
-            connection.execute("UPDATE files SET status='indexing',line_count=0,indexed_bytes=0,counts='{}',error=NULL WHERE id=?", (file_id,))
+            connection.execute("UPDATE files SET status='indexing',line_count=0,indexed_bytes=0,counts='{}',error=NULL,"
+                               "encoding=NULL,encoding_fallback=0,degraded_lines=0,degraded_sample='[]' WHERE id=?", (file_id,))
             connection.commit()
             counts: Counter[str] = Counter()
             categorizer = Categorizer(self.rules)
@@ -159,7 +195,7 @@ class ViewerIndex:
                 for line in reader:
                     category, severity, rules = categorizer.classify(line.text)
                     counts[category] += 1
-                    batch.append((file_id, line.number, line.text, category, severity, rules))
+                    batch.append((file_id, line.number, line.text, category, severity, rules, int(line.degraded)))
                     block_batch.extend(builder.feed(line, (category, severity, rules)))
                     if len(batch) >= 5000:
                         self._write_blocks(connection, file_id, block_batch, block_counts)
@@ -175,8 +211,11 @@ class ViewerIndex:
                 if _stamp(path) != row["stamp"]:
                     raise ValueError("源文件自任务创建后发生变化，请重新索引")
                 connection.execute(
-                    "UPDATE files SET status='ready',encoding=?,sha256=?,line_count=?,indexed_bytes=?,counts=? WHERE id=?",
-                    (reader.encoding, reader.sha256, reader.line_count, reader.byte_count, json.dumps(counts), file_id),
+                    "UPDATE files SET status='ready',encoding=?,sha256=?,line_count=?,indexed_bytes=?,counts=?,"
+                    "encoding_fallback=?,degraded_lines=?,degraded_sample=? WHERE id=?",
+                    (reader.encoding, reader.sha256, reader.line_count, reader.byte_count, json.dumps(counts),
+                     int(reader.encoding_fallback), reader.degraded_line_count, json.dumps(reader.degraded_lines),
+                     file_id),
                 )
 
     @staticmethod
@@ -201,7 +240,7 @@ class ViewerIndex:
 
     @staticmethod
     def _write_batch(connection, file_id, batch, counts, reader):
-        connection.executemany("INSERT INTO lines(file_id,line_number,body,category,severity,rules) VALUES(?,?,?,?,?,?)", batch)
+        connection.executemany("INSERT INTO lines(file_id,line_number,body,category,severity,rules,degraded) VALUES(?,?,?,?,?,?,?)", batch)
         connection.execute(
             "UPDATE files SET line_count=?,indexed_bytes=?,counts=? WHERE id=?",
             (reader.line_count, reader.byte_count, json.dumps(counts), file_id),
@@ -222,13 +261,41 @@ class ViewerIndex:
             item = dict(row)
             item["counts"] = json.loads(item["counts"])
             item["block_counts"] = json.loads(item["block_counts"])
+            item["degraded_sample"] = json.loads(item["degraded_sample"] or "[]")
+            item["encoding_fallback"] = bool(item["encoding_fallback"])
             item["kind"] = _kind(Path(item["path"]))
+            name = describe(Path(item["path"]))
+            item.update(session=name.key, session_label=name.label, session_directory=name.directory,
+                        role=name.role)
             try:
                 item["source_changed"] = _stamp(Path(item["path"])) != item["stamp"]
             except OSError:
                 item["source_changed"] = True
             result.append(item)
+        result.sort(key=lambda item: sort_key(Path(item["path"])))
         return result
+
+    def sessions(self, catalog: list[dict] | None = None) -> list[dict]:
+        """Indexed files and sidecars (empty/binary/duplicate) grouped by Revit session."""
+        catalog = self.catalog() if catalog is None else catalog
+        groups: dict[str, dict] = {}
+        members = [(Path(item["path"]), "file", item) for item in catalog]
+        members += [(Path(item["path"]), "sidecar", item) for item in self.sidecars]
+        for path, kind, item in sorted(members, key=lambda member: sort_key(member[0])):
+            name = describe(path)
+            group = groups.setdefault(name.key, {
+                "session": name.key, "label": name.label, "directory": name.directory,
+                "recognized": name.role != "unrecognized", "files": [], "sidecars": [],
+                "dump_count": 0, "dump_bytes": 0,
+            })
+            if kind == "file":
+                group["files"].append(item["id"])
+            else:
+                group["sidecars"].append(item)
+                if item["status"] == "binary":
+                    group["dump_count"] += 1
+                    group["dump_bytes"] += item["size"]
+        return list(groups.values())
 
     def _ready(self, connection, file_id):
         if file_id not in self.file_ids:
@@ -256,7 +323,7 @@ class ViewerIndex:
         with self.connect() as connection:
             self._ready(connection, file_id)
             rows = connection.execute(
-                "SELECT l.line_number,l.category,l.severity,l.rules,substr(l.body,1,700) AS text,length(l.body) AS text_length FROM lines l WHERE "
+                "SELECT l.line_number,l.category,l.severity,l.rules,substr(l.body,1,700) AS text,length(l.body) AS text_length,l.degraded FROM lines l WHERE "
                 + " AND ".join(where) + " ORDER BY l.line_number LIMIT ?",
                 [*values, limit + 1],
             ).fetchall()
@@ -271,10 +338,13 @@ class ViewerIndex:
             if line > file["line_count"]:
                 raise ValueError("行号超过文件范围")
             rows = connection.execute(
-                "SELECT line_number,category,severity,rules,substr(body,1,16384) AS text,length(body) AS text_length FROM lines WHERE file_id=? AND line_number BETWEEN ? AND ? ORDER BY line_number",
+                "SELECT line_number,category,severity,rules,substr(body,1,16384) AS text,length(body) AS text_length,degraded FROM lines WHERE file_id=? AND line_number BETWEEN ? AND ? ORDER BY line_number",
                 (file_id, max(1, line - radius), line + radius),
             ).fetchall()
-        return {"line": line, "sha256": file["sha256"], "encoding": file["encoding"], "source": file["path"], "items": [dict(row) for row in rows]}
+        return {"line": line, "sha256": file["sha256"], "encoding": file["encoding"],
+                "encoding_fallback": bool(file["encoding_fallback"]),
+                "decode_degraded_line_count": file["degraded_lines"],
+                "source": file["path"], "items": [dict(row) for row in rows]}
 
     @staticmethod
     def _block_conditions(file_id, category, after, addin_prefix):
@@ -392,7 +462,7 @@ class ViewerIndex:
         begin = start_line + offset
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT line_number,substr(body,1,16384) AS text,length(body) AS text_length "
+                "SELECT line_number,substr(body,1,16384) AS text,length(body) AS text_length,degraded "
                 "FROM lines WHERE file_id=? AND line_number BETWEEN ? AND ? ORDER BY line_number",
                 (file_id, begin, min(block["end_line"], begin + limit - 1)),
             ).fetchall()

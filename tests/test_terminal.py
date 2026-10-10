@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from revit_journal_tools.cli import main
 from revit_journal_tools.terminal import Browser, cell_width, crop, safe_text
@@ -150,11 +151,28 @@ class TerminalTests(unittest.TestCase):
 
     def test_decode_failure_is_not_shown_as_complete(self):
         self.path.write_bytes(b"API_ERROR {\n\xff")
-        code, out, err = self.cli("browse", self.path, "--database", self.db, "--format", "json")
+        code, out, err = self.cli("browse", self.path, "--database", self.db, "--format", "json", "--encoding", "utf-8")
         self.assertEqual(code, 2, err)
         file = json.loads(out)["files"][0]
         self.assertEqual(file["status"], "error")
         self.assertNotIn("items", file)
+
+    def test_degraded_lines_are_visible_in_print_json_and_expanded_view(self):
+        self.path.write_bytes(b"API_ERROR {\n'bad \xff byte }\n")
+        with patch("revit_journal_tools.reader.system_fallback_encoding", return_value="gb18030"):
+            code, out, err = self.cli("browse", self.path, "--database", self.db, "--format", "json")
+            self.assertEqual(code, 0, err)
+            file = json.loads(out)["files"][0]
+            self.assertEqual((file["status"], file["encoding"]), ("ready", "gb18030"))
+            self.assertEqual((file["decode_degraded_line_count"], file["decode_degraded_lines"]), (1, [2]))
+            code, printed, err = self.cli("browse", self.path, "--database", self.db, "--print")
+            self.assertIn("退化解码1行", printed)
+            browser = Browser(self.index)
+            browser.handle("\r")
+            frame = browser.frame(160, 25, False)
+        self.assertIn("'bad \\xff byte }", frame)
+        self.assertIn("含无法解码字节", frame)
+        self.assertEqual([item["degraded"] for item in self.index.block_lines(self.file_id, 1)["items"]], [0, 1])
 
     def test_large_paragraph_crosses_index_batches_without_splitting(self):
         self.path.write_text("API_ERROR { synthetic\n" + "'repeat detail\n" * 11000 + "'}\n", encoding="utf-8")

@@ -10,9 +10,17 @@ def _write_text(report: dict[str, Any], stream: TextIO) -> None:
     if report["status"] == "error":
         stream.write(f"读取失败：{report['error']}\n\n")
         return
+    if report["status"] == "duplicate":
+        stream.write(f"未重复扫描：与{report['duplicate_of']}字节相同（SHA-256：{report['sha256']}）\n\n")
+        return
     counts = report["counts_by_severity"]
+    encoding = report["encoding"]
+    if report.get("decode_degraded_line_count"):
+        encoding += f"（退化解码，{report['decode_degraded_line_count']}行含\\xNN字节）"
+    elif report.get("encoding_fallback"):
+        encoding += f"（自动回退，请求{report.get('encoding_requested', 'auto')}）"
     stream.write(
-        f"扫描完成：{report['line_count']}行 / {report['byte_count']}字节 / {report['encoding']}\n"
+        f"扫描完成：{report['line_count']}行 / {report['byte_count']}字节 / {encoding}\n"
         f"SHA-256：{report['sha256']}\n"
         f"错误候选：{report['matched_line_count']}行 "
         f"(fatal={counts['fatal']}, error={counts['error']}, warning={counts['warning']})\n"
@@ -27,6 +35,8 @@ def _write_text(report: dict[str, Any], stream: TextIO) -> None:
         for line in [*finding["context_before"], finding["line"], *finding["context_after"]]:
             prefix = ">" if line["line_number"] == finding["line_number"] else " "
             suffix = " … [显示已截断]" if line["text_truncated"] else ""
+            if line.get("decode_degraded"):
+                suffix += " [含无法解码字节，以\\xNN显示]"
             stream.write(f"{prefix} {line['line_number']:>7} | {line['text']}{suffix}\n")
         for match in finding["matches"]:
             stream.write(

@@ -79,7 +79,7 @@ async function refreshCatalog() {
     const failed = state.files.filter(file => file.status === "error").length;
     $("index-status").textContent = ready === state.files.length ? `本地 · ${ready}个文件已就绪` : `索引中 ${ready}/${state.files.length}` + (failed ? ` · ${failed}个失败` : "");
     if (state.file === null && state.files.length) {
-      const preferred = [...state.files].filter(file => file.kind === "Journal" && file.size > 0).sort((a,b) => a.size - b.size)[0] || state.files[0];
+      const preferred = [...state.files].filter(file => file.role === "main" && file.size > 0).sort((a,b) => a.size - b.size)[0] || state.files[0];
       selectFile(preferred.id);
     } else {
       renderFiles(); renderOverview();
@@ -141,14 +141,15 @@ async function selectLine(line) {
     const fragment = document.createDocumentFragment();
     for (const item of data.items) {
       const row = element("div", "context-line" + (item.line_number === line ? " selected" : ""));
-      row.append(element("span", "line-no", number(item.line_number)), element("pre", "", item.text + (item.text_length > item.text.length ? "\n[显示截断，完整记录仍在索引中]" : "")));
+      row.append(element("span", "line-no", number(item.line_number)), element("pre", "", item.text + (item.text_length > item.text.length ? "\n[显示截断，完整记录仍在索引中]" : "") + (item.degraded ? "\n[含无法解码字节，以\\xNN显示]" : "")));
       fragment.append(row);
     }
     $("context").replaceChildren(fragment);
     const selectedRow = $("context").querySelector(".context-line.selected");
     $("context").scrollTop = 0;
     if (selectedRow) $("context").scrollTop = Math.max(0, selectedRow.getBoundingClientRect().top - $("context").getBoundingClientRect().top - $("context").clientHeight * .35);
-    $("source-meta").textContent = `${data.encoding.toUpperCase()} · SHA-256 ${data.sha256.slice(0,20)}… · 索引完整原文，分类仅用于定位。`;
+    const decoding = data.decode_degraded_line_count ? `（退化解码${data.decode_degraded_line_count}行，字节以\\xNN显示）` : data.encoding_fallback ? "（自动回退）" : "";
+    $("source-meta").textContent = `${data.encoding.toUpperCase()}${decoding} · SHA-256 ${data.sha256.slice(0,20)}… · 索引完整原文，分类仅用于定位。`;
     $("source-meta").title = data.sha256;
     $("copy-position").disabled = false;
   } catch (error) { if (error.name !== "AbortError" && sequence === state.detailSequence) notice(error.message); }

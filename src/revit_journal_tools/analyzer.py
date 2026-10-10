@@ -31,6 +31,25 @@ class ScanOptions:
                 raise ValueError(f"{name}必须大于0")
 
 
+def decoding_warnings(decoding: dict) -> list[str]:
+    """Report-visible notes for fallback and degraded decoding; never silent."""
+    warnings = []
+    count = decoding["decode_degraded_line_count"]
+    if count:
+        lines = "、".join(str(number) for number in decoding["decode_degraded_lines"])
+        more = "等" if count > len(decoding["decode_degraded_lines"]) else ""
+        warnings.append(
+            f"退化解码：所有候选编码都无法完整解码，按{decoding['encoding']}读取；"
+            f"{count}行含无法解码的字节（第{lines}行{more}），这些字节以\\xNN原样显示，"
+            "该行的识别结果可能不完整。可用--encoding指定正确编码后重试。"
+        )
+    elif decoding["encoding_fallback"]:
+        warnings.append(
+            f"编码回退：未按首选编码解码，按{decoding['encoding']}严格解码成功（请求：{decoding['encoding_requested']}）。"
+        )
+    return warnings
+
+
 def analyze(
     path: str | Path, *, options: ScanOptions | None = None,
     rules: tuple[Rule, ...] | None = None,
@@ -58,7 +77,7 @@ def analyze(
         for line in reader:
             preview = SourceLine(
                 line.number, line.text[:options.max_excerpt_chars], len(line.text),
-                len(line.text) > options.max_excerpt_chars,
+                len(line.text) > options.max_excerpt_chars, line.degraded,
             )
             for finding in pending:
                 finding.context_after.append(preview)
@@ -109,6 +128,8 @@ def analyze(
             )
         if ungrouped_count:
             warnings.append(f"分组容量已满，{ungrouped_count}条命中未计入分组；总命中计数仍完整。")
+        decoding = reader.decoding_summary()
+        warnings.extend(decoding_warnings(decoding))
         return ScanReport(
             schema_version=1, tool_version=__version__, source=str(reader.path),
             encoding=reader.encoding, sha256=reader.sha256, byte_count=reader.byte_count,
@@ -118,4 +139,8 @@ def analyze(
             counts_by_rule=dict(sorted(by_rule.items())), findings=findings,
             groups=list(groups.values()), omitted_finding_count=omitted,
             ungrouped_match_count=ungrouped_count, warnings=warnings,
+            encoding_requested=decoding["encoding_requested"],
+            encoding_fallback=decoding["encoding_fallback"],
+            decode_degraded_line_count=decoding["decode_degraded_line_count"],
+            decode_degraded_lines=decoding["decode_degraded_lines"],
         )

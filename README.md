@@ -62,6 +62,8 @@ revit-journal browse examples/paragraphs.journal.txt --format json --page-size 2
 
 正常段落、系统配置、`Jrn.*`操作及其`_`续行、API花括号段、同一异常及其堆栈均按块显示。新的独立错误另起一块。每个块保留起止行、分类和分段依据；展开不改变源文件。未闭合的API段或操作续行会显式标记。分段是阅读辅助，不代表已确认错误根因。
 
+按`f`打开的文件列表以Revit会话为单位：同一目录下`journal.NNNN.txt`、`journal.NNNN.workerN.log`、`journal.NNNN.txt.copy.txt`和`journal.NNNN.NNNN.dmp`归入同一会话。字节相同的副本只索引一次并在会话下注明，`.dmp`只计数和显示大小，0字节文件（如`dump.0001.txt`）列出但不索引；不符合上述命名的文件作为“未识别命名”单独成组，仍正常读取。`--print`与`--format json`同样按会话输出，JSON新增`sessions`节。
+
 首次启动在后台建索引，可先切换到已完成的文件。CLI缓存默认位于`.journal-cache/terminal.sqlite3`，全文保留在磁盘，段落再大也按页加载原文。搜索命中续行时返回整个段落，不重复列出同一块；统计“块数”与原有扫描的“命中行数”不同。
 
 详细分段规则、按键和限制见[docs/terminal.md](docs/terminal.md)。
@@ -91,8 +93,11 @@ revit-journal scan /path/to/journal.0001.txt --context 5
 # 多文件或目录；目录选择.txt、.log、.journal和.txt.abbrev
 revit-journal scan cases/inbox --recursive --format json -o reports/cases.json
 
-# UTF-8以外且没有BOM时，显式指定编码
+# 默认auto逐文件判定编码；需要严格按某个编码读取时显式指定
 revit-journal scan journal.0001.txt --encoding gb18030
+
+# 混合来源目录：按顺序尝试候选编码
+revit-journal scan cases/inbox --recursive --encoding utf-8,gb18030,cp1252
 
 # 仅保留error及fatal规则的候选，增大明细容量
 revit-journal scan journal.0001.txt --min-severity error --max-findings 2000
@@ -107,13 +112,13 @@ revit-journal scan journal.0001.txt --fail-on error
 revit-journal rules
 ```
 
-`python -m revit_journal_tools`与`revit-journal`等价。输出文件以UTF-8原子替换，不能覆盖输入Journal或自定义规则文件。一次批量任务中的单个文件读取失败会单独记为`status: error`，其余文件继续处理。
+`python -m revit_journal_tools`与`revit-journal`等价。输出文件以UTF-8原子替换，不能覆盖输入Journal或自定义规则文件。一次批量任务中的单个文件读取失败会单独记为`status: error`，其余文件继续处理。与另一输入字节完全相同的文件（如`journal.NNNN.txt.copy.txt`）只扫描一次，副本记为`status: duplicate`并给出`duplicate_of`与SHA-256；目录中的`.dmp`不扫描。
 
 退出码：`0`表示扫描成功；`1`表示成功扫描且达到显式指定的`--fail-on`级别；`2`表示参数、规则、输入或输出错误；`130`表示中断。默认发现错误候选不会导致非零退出码。
 
 ## 报告内容
 
-- 来源：文件绝对路径、原始字节SHA-256、实际解码方式、文件大小和行数。
+- 来源：文件绝对路径、原始字节SHA-256、实际解码方式、请求的编码、是否回退、退化行数与行号、文件大小和行数。
 - 定位：从1开始的文本行号与字符列号、命中片段、前后文。CRLF、LF和单独的CR均作为换行；混合换行的文件可能与仅按LF计行的工具不同。
 - 依据：规则ID、候选级别、解释、来源链接以及`heuristic`/`documented_marker`/`case_verified`标签。
 - 统计：各级别的命中行数、各规则命中数、完整原文相同的重复组。
@@ -129,9 +134,15 @@ revit-journal rules
 
 每个展示行最多保存4096个字符，超出时标记`text_truncated`。识别会检查整行，匹配点附近的独立片段与列号仍会保留。默认单行上限为1,048,576字符，超限返回明确错误，可通过`--max-line-chars`调整，不会静默跳过后半行。
 
-`--encoding auto`识别UTF-8/UTF-16/UTF-32的BOM，没有BOM时使用严格UTF-8，不猜测其他代码页。UTF-8以外的旧文件可指定`gb18030`、`cp1252`、`utf-16-le`等。无法解码、疑似二进制或扫描期间变化的文件记为读取失败，防止产生貌似完整的报告。优先提供已停止写入的Journal副本。
+`--encoding auto`（默认）逐文件判定编码：有BOM按BOM；否则先严格UTF-8，再严格尝试系统ANSI代码页的超集（中文Windows的cp936使用gb18030，西文Windows为cp1252）。同一批文件可以各自使用不同编码，报告、`browse --format json`和索引都记录每个文件实际使用的`encoding`、请求值`encoding_requested`以及是否回退`encoding_fallback`。
+
+所有候选编码都无法完整解码时，`auto`不再让整个文件失败，而是按最后一个候选读取：无法解码的字节以`\xNN`原样显示，该行标记为`decode_degraded`，文件级给出退化行数`decode_degraded_line_count`和前20个行号，并在报告注意事项中说明。退化行上的识别结果可能不完整，可改用正确的编码重试。字节不会被静默替换或丢弃，SHA-256仍按原始字节计算。
+
+显式指定单个编码（如`--encoding cp1252`）为严格模式：任何无法解码的字节都会使该文件读取失败，与旧版本一致。也可以给出逗号分隔的候选列表，例如`--encoding utf-8,gb18030,cp1252`，按顺序逐文件尝试，全部失败时同样按最后一个候选退化解码。cp1252与gb18030的字节无法可靠区分：在中文系统上用`auto`打开英文系统产生的cp1252文件时，通常会以gb18030退化解码并显式标记；混合来源的目录建议使用候选列表。疑似二进制（含NUL）、超长行或扫描期间变化的文件仍记为读取失败。优先提供已停止写入的Journal副本。
 
 首批上传的英/德文案例使用CP1252可以严格解码；其中不换行空格、角度符号和德文变音字符不符合UTF-8。扫描这批案例时显式使用`--encoding cp1252`，该选择不代表以后上传的所有文件都使用同一编码。
+
+本机实测（中文Windows，cp936）：113个真实文件不传`--encoding`时全部可处理，其中96个按gb18030回退严格解码、8个为UTF-8，没有退化行；7个`.dmp`只计数，1个字节相同的`.copy.txt`与1个空`dump.0001.txt`不重复索引。
 
 ## Python接口
 
@@ -154,7 +165,8 @@ result = report.to_dict()
 
 ```text
 src/revit_journal_tools/
-  reader.py              严格解码、流式读取、哈希与源文件变化检查
+  reader.py              逐文件编码判定、严格/退化解码、流式读取、哈希与源文件变化检查
+  sessions.py            按文件名把主Journal、Worker、副本、dmp归入会话，副本按字节去重
   rules.py               规则加载、验证与匹配
   data/builtin_rules.json 内置规则
   analyzer.py            上下文、计数、有限容量的明细与分组

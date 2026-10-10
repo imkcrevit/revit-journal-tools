@@ -5,6 +5,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 from revit_journal_tools.categories import Categorizer
 from revit_journal_tools.rules import load_rules
@@ -92,11 +93,24 @@ class IndexTests(unittest.TestCase):
     def test_failed_decode_never_exposes_partial_index_as_complete(self):
         bad = self.root / "bad.txt"
         bad.write_bytes(b"normal\n" * 6000 + b"\xff")
-        queued = self.index.register([bad], "auto")
-        self.index.build(queued, "auto")
+        queued = self.index.register([bad], "utf-8")
+        self.index.build(queued, "utf-8")
         self.assertEqual(self.index.catalog()[0]["status"], "error")
         with self.assertRaises(ValueError):
             self.index.events(queued[0])
+
+    def test_degraded_decode_is_indexed_with_line_flags(self):
+        bad = self.root / "bad.txt"
+        bad.write_bytes(b"normal\n" * 6000 + b"DBG_ERROR: \xff")
+        with patch("revit_journal_tools.reader.system_fallback_encoding", return_value="gb18030"):
+            queued = self.index.register([bad], "auto")
+            self.index.build(queued, "auto")
+        file = self.index.catalog()[0]
+        self.assertEqual((file["status"], file["encoding"], file["encoding_fallback"]), ("ready", "gb18030", True))
+        self.assertEqual((file["degraded_lines"], file["degraded_sample"]), (1, [6001]))
+        last = self.index.events(queued[0], "error")["items"][0]
+        self.assertEqual((last["line_number"], last["text"], last["degraded"]), (6001, "DBG_ERROR: \\xff", 1))
+        self.assertEqual(self.index.context(queued[0], 6001, 0)["decode_degraded_line_count"], 1)
 
     def test_unknown_file_and_invalid_query_parameters(self):
         with self.assertRaises(KeyError):
@@ -108,11 +122,13 @@ class IndexTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.index.context(self.file_id, 999)
 
-    def test_empty_file_is_ready_with_no_events(self):
+    def test_empty_file_is_listed_as_sidecar_not_indexed(self):
         self.path.write_bytes(b"")
-        self.index.build(self.index.register([self.path], "auto"), "auto")
-        self.assertEqual(self.index.events(self.file_id)["items"], [])
-        self.assertEqual(self.index.catalog()[0]["line_count"], 0)
+        self.assertEqual(self.index.register([self.path], "auto"), [])
+        self.assertEqual(self.index.catalog(), [])
+        self.assertEqual([(item["name"], item["status"]) for item in self.index.sidecars], [("journal.txt", "empty")])
+        with self.assertRaises(KeyError):
+            self.index.events(self.file_id)
 
     def test_http_static_and_api_are_local_and_read_only(self):
         server = make_server(self.index, 0)
@@ -140,6 +156,58 @@ class IndexTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+@patch("revit_journal_tools.reader.system_fallback_encoding", return_value="gb18030")
+class MixedEncodingIndexTests(unittest.TestCase):
+    """One workspace, one encoding decision per file (J2)."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.files = {
+            "journal.0001.txt": "' 0:< 错误: 不满足约束\r\n".encode("gb18030"),
+            "journal.0002.txt": "' Name(Cloud Models)\r\n90.00°\r\nDiese Lizenz läuft\r\n".encode("cp1252"),
+            "journal.0003.txt": b"' Build: synthetic\r\n",
+        }
+        for name, data in self.files.items():
+            (self.root / name).write_bytes(data)
+        self.paths = [self.root / name for name in self.files]
+        self.index = ViewerIndex(self.root / "viewer.sqlite3")
+
+    def encodings(self):
+        return {item["name"]: (item["status"], item["encoding"], item["degraded_lines"]) for item in self.index.catalog()}
+
+    def test_chain_indexes_cp1252_and_gb18030_files_together(self, _):
+        self.index.build(self.index.register(self.paths, "utf-8,gb18030,cp1252"), "utf-8,gb18030,cp1252")
+        self.assertEqual(self.encodings(), {"journal.0001.txt": ("ready", "gb18030", 0),
+                                            "journal.0002.txt": ("ready", "cp1252", 0),
+                                            "journal.0003.txt": ("ready", "utf-8", 0)})
+        file = next(item for item in self.index.catalog() if item["name"] == "journal.0002.txt")
+        self.assertEqual(self.index.context(file["id"], 2, 0)["items"][0]["text"], "90.00°")
+
+    def test_auto_records_actual_encoding_and_degraded_state_per_file(self, _):
+        self.index.build(self.index.register(self.paths, "auto"), "auto")
+        result = self.encodings()
+        self.assertEqual(result["journal.0001.txt"], ("ready", "gb18030", 0))
+        self.assertEqual(result["journal.0003.txt"], ("ready", "utf-8", 0))
+        # cp1252 bytes are not valid gb18030: indexed, degraded and visibly marked.
+        self.assertEqual(result["journal.0002.txt"][:2], ("ready", "gb18030"))
+        self.assertGreater(result["journal.0002.txt"][2], 0)
+
+    def test_cache_reuse_follows_the_encoding_actually_used(self, _):
+        self.index.build(self.index.register(self.paths[:1], "auto"), "auto")
+        # Explicit gb18030 equals what auto used strictly: reuse, no rebuild;
+        # the row keeps describing how it was actually built.
+        self.assertEqual(self.index.register(self.paths[:1], "gb18030"), [])
+        self.assertEqual(self.index.catalog()[0]["encoding_requested"], "auto")
+        self.assertEqual(self.index.register(self.paths[:1], "auto"), [])
+        # A different explicit codec or a different auto chain rebuilds.
+        self.assertEqual(len(self.index.register(self.paths[:1], "cp1252")), 1)
+        self.index.build(self.index.register(self.paths[:1], "auto"), "auto")
+        with patch("revit_journal_tools.reader.system_fallback_encoding", return_value="cp1252"):
+            self.assertEqual(len(self.index.register(self.paths[:1], "auto")), 1)
 
 
 if __name__ == "__main__":
