@@ -118,20 +118,24 @@ class IndexTests(unittest.TestCase):
         server = make_server(self.index, 0)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        # Connect directly. A system proxy (common on Windows) would otherwise
+        # rewrite the Host header and hide what the loopback server receives.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
             base = f"http://127.0.0.1:{server.server_port}"
-            with urllib.request.urlopen(base + "/") as response:
+            with opener.open(base + "/") as response:
                 self.assertIn("Journal", response.read().decode("utf-8"))
                 self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
-            with urllib.request.urlopen(base + f"/api/events?file={self.file_id}&category=error") as response:
+            with opener.open(base + f"/api/events?file={self.file_id}&category=error") as response:
                 self.assertEqual(json.load(response)["items"][0]["line_number"], 6)
             for request in (
                 urllib.request.Request(base + "/api/files", headers={"Host": "example.com"}),
                 urllib.request.Request(base + "/api/files", method="POST"),
                 urllib.request.Request(base + "/../../etc/passwd"),
             ):
-                with self.assertRaises(urllib.error.HTTPError):
-                    urllib.request.urlopen(request)
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    opener.open(request)
+                raised.exception.close()
         finally:
             server.shutdown()
             server.server_close()

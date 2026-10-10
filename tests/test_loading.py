@@ -3,7 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 
 from revit_journal_tools.blocks import BlockBuilder
@@ -163,7 +163,9 @@ class LoadingIndexTests(unittest.TestCase):
         self.assertEqual(blocks[0]["addin_evidence"][0]["line_number"], 5102)
 
     def test_legacy_database_rebuilds_with_new_columns_and_version(self):
-        with sqlite3.connect(self.database) as connection:
+        # sqlite3's context manager only commits; close explicitly so Windows
+        # can delete the temporary database afterwards.
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.executescript("""
                 CREATE TABLE old_blocks (
                     file_id INTEGER NOT NULL, start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
