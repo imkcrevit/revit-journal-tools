@@ -31,7 +31,7 @@ function renderFiles() {
     button.setAttribute("aria-pressed", String(file.id === state.file));
     button.append(element("span", "name", file.name));
     const sub = element("span", "sub");
-    sub.append(element("span", "", file.kind + " · " + (file.size / 1024 / 1024).toFixed(1) + " MB"));
+    sub.append(element("span", "", file.kind + " · " + (file.size / 1024 / 1024).toFixed(1) + " MB" + (file.writing ? " · 正在写入" : file.live ? " · 实时快照" : "")));
     const label = file.status === "ready" ? "就绪" : file.status === "indexing" ? Math.min(100, Math.round(file.indexed_bytes / Math.max(file.size, 1) * 100)) + "%" : file.status === "error" ? "读取失败" : "待索引";
     sub.append(element("span", file.status, label)); button.append(sub);
     const parts = file.path.replaceAll("\\", "/").split("/");
@@ -79,7 +79,8 @@ async function refreshCatalog() {
     const failed = state.files.filter(file => file.status === "error").length;
     $("index-status").textContent = ready === state.files.length ? `本地 · ${ready}个文件已就绪` : `索引中 ${ready}/${state.files.length}` + (failed ? ` · ${failed}个失败` : "");
     if (state.file === null && state.files.length) {
-      const preferred = [...state.files].filter(file => file.role === "main" && file.size > 0).sort((a,b) => a.size - b.size)[0] || state.files[0];
+      // Newest main journal first: the server lists sessions newest first.
+      const preferred = state.files.find(file => file.role === "main" && file.size > 0) || state.files[0];
       selectFile(preferred.id);
     } else {
       renderFiles(); renderOverview();

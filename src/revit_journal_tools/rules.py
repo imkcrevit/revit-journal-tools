@@ -44,6 +44,8 @@ class Rule:
     # Literal pre-filter: every line the pattern matches contains at least one
     # of these (folded) substrings. Empty means "always run the pattern".
     gate: tuple[str, ...] = ()
+    # Free labels copied into every match (lowercase identifiers).
+    tags: tuple[str, ...] = ()
     _compiled: re.Pattern[str] = field(init=False, repr=False, compare=False)
     _excludes: tuple[re.Pattern[str], ...] = field(init=False, repr=False, compare=False)
 
@@ -87,7 +89,7 @@ class Rule:
             column=match.start() + 1, matched_text=match.group()[:240],
             match_length=match.end() - match.start(),
             match_truncated=len(match.group()) > 240,
-            excerpt=text[start:end], excerpt_start_column=start + 1,
+            excerpt=text[start:end], excerpt_start_column=start + 1, tags=self.tags,
         )
 
     def definition(self) -> dict[str, Any]:
@@ -96,13 +98,43 @@ class Rule:
             "pattern": self.pattern, "explanation": self.explanation,
             "basis": self.basis, "source_url": self.source_url,
             "exclude_patterns": list(self.exclude_patterns),
+            "tags": list(self.tags),
             "gate": list(self.gate),
         }
 
 
-def match_rules(rules: tuple[Rule, ...], text: str) -> list[RuleMatch]:
-    """All rule matches for one line; the line is folded once for every gate."""
-    folded = None
+_UNION_CACHE: dict[int, tuple] = {}
+
+
+def _gate_union(rules: tuple[Rule, ...]) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """(all terms, ASCII terms) of the union of the rules' gates, or None when a
+    rule has no gate. A line containing none of them matches no rule. Terms that
+    contain a shorter term are redundant; non-ASCII terms never occur in an
+    ASCII line."""
+    cached = _UNION_CACHE.get(id(rules))
+    if cached is not None and cached[0] is rules:
+        return cached[1]
+    union = None
+    if rules and all(rule.gate for rule in rules):
+        terms = {term for rule in rules for term in rule.gate}
+        minimal = tuple(sorted(term for term in terms if not any(other != term and other in term for other in terms)))
+        union = (minimal, tuple(term for term in minimal if term.isascii()))
+    if len(_UNION_CACHE) > 32:
+        _UNION_CACHE.clear()
+    _UNION_CACHE[id(rules)] = (rules, union)  # holds the tuple, so its id stays unique
+    return union
+
+
+def match_rules(rules: tuple[Rule, ...], text: str, folded: str | None = None) -> list[RuleMatch]:
+    """All rule matches for one line; the line is folded once for every gate.
+    folded: fold(text) when the caller already has it."""
+    union = _gate_union(rules)
+    if union is not None:
+        ascii_line = text.isascii()
+        if folded is None:
+            folded = text.lower() if ascii_line else fold(text)
+        if not any(map(folded.__contains__, union[1] if ascii_line else union[0])):
+            return []
     result = []
     for rule in rules:
         if rule.gate:
@@ -121,7 +153,7 @@ def match_rules(rules: tuple[Rule, ...], text: str) -> list[RuleMatch]:
 
 def _parse_rule(value: Any) -> Rule:
     required = {"id", "title", "severity", "pattern", "explanation"}
-    allowed = required | {"basis", "source_url", "exclude_patterns", "gate"}
+    allowed = required | {"basis", "source_url", "exclude_patterns", "gate", "tags"}
     if not isinstance(value, dict):
         raise RuleConfigError("每条规则必须是JSON对象")
     if required - value.keys() or value.keys() - allowed:
@@ -145,7 +177,11 @@ def _parse_rule(value: Any) -> Rule:
     if "gate" in value and (not isinstance(gate, list) or not gate
                             or any(not isinstance(item, str) or not item for item in gate)):
         raise RuleConfigError("gate必须是非空的字符串数组（每项为该规则任何命中行都必然包含的字面子串之一）")
-    return Rule(**{**value, "exclude_patterns": tuple(excludes), "gate": tuple(gate)})
+    tags = value.get("tags", [])
+    if not isinstance(tags, list) or any(not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", item)
+                                         for item in tags):
+        raise RuleConfigError("tags必须是小写标识符数组，例如[\"ui_warning\"]")
+    return Rule(**{**value, "exclude_patterns": tuple(excludes), "gate": tuple(gate), "tags": tuple(tags)})
 
 
 def _parse_document(content: str) -> list[Rule]:

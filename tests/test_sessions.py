@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -50,8 +51,15 @@ class PlanTests(unittest.TestCase):
             "dump.0001.txt": b"",
             "notes.txt": b"' unrelated\n",
         }
+        # Session 0012 is the newest, 0011 older (its dump written last), then the rest.
+        times = {"journal.0011": 100, "journal.0011.0001.dmp": 110, "journal.0012": 200, "dump.0001.txt": 50,
+                 "notes.txt": 10}
+        base = 1_790_000_000
         for name, data in files.items():
-            (self.root / name).write_bytes(data)
+            path = self.root / name
+            path.write_bytes(data)
+            offset = times.get(name) or times[name[:12]]
+            os.utime(path, (base + offset, base + offset))
 
     def test_copies_are_deduplicated_by_bytes_and_sidecars_are_classified(self):
         planned = {item.path.name: item for item in plan_inputs(list(self.root.iterdir()))}
@@ -65,11 +73,11 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(planned["dump.0001.txt"].status, "empty")
         self.assertEqual(planned["notes.txt"].status, "index")
 
-    def test_order_is_by_session_with_main_first_and_unrecognized_last(self):
+    def test_order_is_newest_session_first_with_main_journal_first(self):
         names = [item.path.name for item in plan_inputs(list(self.root.iterdir()))]
-        self.assertEqual(names[:4], ["journal.0011.txt", "journal.0011.worker1.log",
-                                     "journal.0011.txt.copy.txt", "journal.0011.0001.dmp"])
-        self.assertLess(names.index("journal.0012.txt"), names.index("dump.0001.txt"))
+        self.assertEqual(names, ["journal.0012.txt", "journal.0012.txt.copy.txt",
+                                 "journal.0011.txt", "journal.0011.worker1.log", "journal.0011.txt.copy.txt",
+                                 "journal.0011.0001.dmp", "dump.0001.txt", "notes.txt"])
 
     def cli(self, *args):
         output, errors = io.StringIO(), io.StringIO()
@@ -114,15 +122,17 @@ class PlanTests(unittest.TestCase):
         index = ViewerIndex(Path(self.temporary.name) / "cache.sqlite3")
         index.build(index.register(list(self.root.iterdir()), "auto"), "auto")
         browser = Browser(index)
-        self.assertEqual(browser.file["name"], "journal.0011.txt")
+        self.assertEqual(browser.file["name"], "journal.0012.txt")  # newest main journal opens first
+        self.assertEqual(index.preferred_id, browser.file["id"])
         browser.handle("f")
         rows = browser.file_rows()
-        self.assertTrue(rows[0][0].startswith("会话 journal.0011"))
+        self.assertTrue(rows[0][0].startswith("会话 journal.0012"))
         self.assertIsNone(rows[0][1])
         self.assertEqual(sum(number is not None for _, number in rows), len(browser.catalog))
-        browser.handle("DOWN")
+        for _ in range(2):
+            browser.handle("DOWN")  # skips the session header of journal.0011
         browser.handle("\r")
-        self.assertEqual(browser.file["name"], "journal.0011.worker1.log")
+        self.assertEqual(browser.file["name"], "journal.0011.txt")
         browser.handle("f")
         for width, height in ((100, 25), (40, 12)):
             frame = browser.frame(width, height, False)

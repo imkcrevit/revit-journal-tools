@@ -34,7 +34,8 @@ class BlockTests(unittest.TestCase):
                           ' "Ribbon", _', ' "Synthetic command"',
                           "'H 01-Oct-2026 10:00:01.001; 0:<", 'Jrn.Data "Next"'])
         self.assertEqual([(b.start_line, b.end_line, b.category) for b in blocks], [(1, 4, "operation"), (5, 6, "operation")])
-        self.assertEqual(blocks[0].title, "Jrn.Command _")
+        self.assertEqual(blocks[0].title, 'Jrn.Command "Ribbon", "Synthetic command"')
+        self.assertEqual(blocks[0].title_line, 2)
 
     def test_api_error_is_one_block_and_next_error_is_separate(self):
         blocks = grouped(["'E 01-Oct-2026 10:00:00.001; 0:<", "API_ERROR { module conflict",

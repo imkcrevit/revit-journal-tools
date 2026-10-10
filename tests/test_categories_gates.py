@@ -25,9 +25,11 @@ REGEX_GATES = [
     (blocks._NATIVE_DETAIL, blocks._NATIVE_GATE, "text", "search"),
     (blocks._NATIVE_CODE, blocks._NATIVE_CODE_GATE, "text", "search"),
     (loading._START, loading.START_GATE, "loading", "match"),
+    (categories._TASK_DIALOG, categories._DIALOG_GATE, "text", "search"),
+    (categories._DIALOG_RESULT, categories._DIALOG_GATE, "text", "search"),
 ]
 UNGATED = {
-    "revit_journal_tools.categories": ["_JOURNAL_GATE", "_STARTUP_GATE", "_SYSTEM_GATE"],
+    "revit_journal_tools.categories": ["_JOURNAL_GATE", "_STARTUP_GATE", "_SYSTEM_GATE", "_DIALOG_GATE"],
     "revit_journal_tools.blocks": ["_API_GATE", "_METRIC_GATE", "_SECTION_GATE", "_STRONG_GATE", "_NATIVE_GATE",
                                    "_NATIVE_CODE_GATE", "_EXCEPTION_GATE", "START_GATE"],
     "revit_journal_tools.loading": ["START_GATE"],
@@ -48,7 +50,7 @@ STRUCTURE = [
     "' Build: 24.0", "' Branch: RELEASE", "' Release: 2024", "started recording journal file",
     "finished recording journal file", "InitApplication", "InitNativeInstance", "Starting Revit",
     "ApplicationInitialized", "Set Jrn = CrsJournalScript", "Assembly version conflict", "normal text",
-    "x", "_", ": ", "= ", "123",
+    "x", "_", ": ", "= ", "123", 'TaskDialog "', '"TaskDialogResult"', "taskdialog", ' , "Close" _',
 ]
 LOOKALIKES = {"i": ["ı", "İ"], "s": ["ſ"], "k": ["K"]}
 

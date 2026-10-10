@@ -30,6 +30,10 @@ class JournalReadError(ValueError):
     """The file could not be read completely and faithfully."""
 
 
+class SourceChangedError(JournalReadError):
+    """The file grew or changed while it was read (typically a live journal)."""
+
+
 @dataclass(frozen=True)
 class JournalLine:
     number: int
@@ -260,7 +264,7 @@ class JournalReader:
             or _signature(self.path.stat()) != _signature(self._initial_stat)
             or self._reader.byte_count != self._initial_stat.st_size
         ):
-            raise JournalReadError("扫描期间源文件发生变化，请复制已停止写入的Journal后重试")
+            raise SourceChangedError("扫描期间源文件发生变化；正在写入的Journal请使用默认的--snapshot auto或--snapshot always")
         self.complete = True
 
     def decoding_summary(self) -> dict:

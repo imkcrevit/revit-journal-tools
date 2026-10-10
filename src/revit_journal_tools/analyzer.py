@@ -6,8 +6,9 @@ from collections import Counter, deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .live import Snapshot, wants_snapshot
 from .models import Finding, FindingGroup, ScanReport, SEVERITY_RANK, SourceLine
-from .reader import JournalReader
+from .reader import JournalReader, SourceChangedError
 from .rules import Rule, load_rules, match_rules, ruleset_digest
 
 
@@ -41,7 +42,8 @@ def decoding_warnings(decoding: dict) -> list[str]:
         warnings.append(
             f"退化解码：所有候选编码都无法完整解码，按{decoding['encoding']}读取；"
             f"{count}行含无法解码的字节（第{lines}行{more}），这些字节以\\xNN原样显示，"
-            "该行的识别结果可能不完整。可用--encoding指定正确编码后重试。"
+            "该行的识别结果可能不完整。可用--encoding指定正确编码后重试；"
+            "来源混合（如英文系统产生的cp1252文件）时可用--encoding utf-8,gb18030,cp1252。"
         )
     elif decoding["encoding_fallback"]:
         warnings.append(
@@ -52,14 +54,35 @@ def decoding_warnings(decoding: dict) -> list[str]:
 
 def analyze(
     path: str | Path, *, options: ScanOptions | None = None,
-    rules: tuple[Rule, ...] | None = None,
+    rules: tuple[Rule, ...] | None = None, snapshot: str = "auto",
 ) -> ScanReport:
-    from . import __version__
-
+    """snapshot: auto (snapshot files Revit is writing, or that change while
+    read), always, or never (a changing file is a read error)."""
     options = options or ScanOptions()
     rules = load_rules() if rules is None else rules
     if not rules or len({rule.id for rule in rules}) != len(rules):
         raise ValueError("规则不能为空，且id必须唯一")
+    if not wants_snapshot(path, snapshot):
+        try:
+            return _analyze(path, options, rules)
+        except SourceChangedError:
+            if snapshot == "never":
+                raise
+    with Snapshot(path) as info:
+        report = _analyze(info["path"], options, rules)
+    report.source = str(Path(path).resolve())
+    report.live = True
+    report.snapshot = {key: info[key] for key in ("bytes", "source_size", "trimmed_bytes", "taken_at")}
+    report.warnings.append(
+        f"实时Journal：Revit仍在写入该文件，本报告读取的是{info['taken_at']}的快照"
+        f"（前{info['bytes']}字节的完整行，当时文件{info['source_size']}字节）；SHA-256针对快照字节，之后写入的内容不在报告中。"
+    )
+    return report
+
+
+def _analyze(path: str | Path, options: ScanOptions, rules: tuple[Rule, ...]) -> ScanReport:
+    from . import __version__
+
     active_rules = tuple(
         rule for rule in rules
         if SEVERITY_RANK[rule.severity] >= SEVERITY_RANK[options.min_severity]

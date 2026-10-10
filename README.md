@@ -36,7 +36,15 @@ PYTHONPATH=src python3 -m revit_journal_tools browse examples/paragraphs.journal
 ## CLI终端查看器
 
 ```bash
-revit-journal browse cases/inbox --recursive --encoding cp1252
+# 不传路径：自动查找本机各版本Revit的Journals目录，打开最新的会话
+revit-journal browse
+revit-journal browse --revit 2024 --latest 3
+
+# 会话摘要：是否正常结束、阶段、许可、打开的文档、Add-in、对话框、侧车日志、结束前操作
+revit-journal summary --latest
+revit-journal summary --revit 2024 --format json
+
+revit-journal browse cases/inbox --recursive
 
 # 直接进入API错误分类
 revit-journal browse journal.0001.txt --encoding cp1252 --category api_error
@@ -65,6 +73,8 @@ revit-journal browse examples/paragraphs.journal.txt --format json --page-size 2
 按`f`打开的文件列表以Revit会话为单位：同一目录下`journal.NNNN.txt`、`journal.NNNN.workerN.log`、`journal.NNNN.txt.copy.txt`和`journal.NNNN.NNNN.dmp`归入同一会话。字节相同的副本只索引一次并在会话下注明，`.dmp`只计数和显示大小，0字节文件（如`dump.0001.txt`）列出但不索引；不符合上述命名的文件作为“未识别命名”单独成组，仍正常读取。`--print`与`--format json`同样按会话输出，JSON新增`sessions`节。
 
 首次启动在后台建索引，可先切换到已完成的文件。CLI缓存默认位于`.journal-cache/terminal.sqlite3`，全文保留在磁盘，段落再大也按页加载原文。搜索命中续行时返回整个段落，不重复列出同一块；统计“块数”与原有扫描的“命中行数”不同。
+
+按`s`看当前会话摘要，`e`看结束前最后的操作与对话框，`P`按阶段（启动、许可、Add-in加载、打开文档、交互操作、退出）筛选，`9`看对话框，`z`切换“相同内容段落折叠为×N”。Revit仍在写入的Journal默认读取完整行的快照（`--snapshot`），并在界面中标注。
 
 详细分段规则、按键和限制见[docs/terminal.md](docs/terminal.md)。
 

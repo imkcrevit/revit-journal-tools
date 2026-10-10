@@ -155,3 +155,85 @@ py -3 scripts/benchmark_real.py dir --revit 2024 --encoding gb18030   # browse -
 - 目录缓存体积略增（3.48→3.57倍），单文件减小（3.44→3.28倍）：每个文件批量建FTS会各自产生段，小文件多时段数多。可在批量建立后执行FTS5 `optimize`合并，但会重写整个FTS索引，本次未做。
 
 未完成项与遗留：J9未实施（见上）；CLI未增加`--jobs`参数（只有`ViewerIndex(workers=)`）；正在写入的Journal在建索引时仍会因“源文件发生变化”进入失败状态，需J3处理。
+
+## 阶段3：Revit工作逻辑（含J3）
+
+范围：J3、J11、J12、J13、J14、J15、J16。J3原在阶段1的发现清单中（P1），实时Journal是“Revit正在卡，看它在做什么”场景的前提，因此与阶段3一起实施。环境与基准命令同上；测量期间本机没有运行Revit。
+
+### J3 正在写入的Journal（`live.py`）
+
+- 探测：Windows上用`CreateFileW(GENERIC_READ, FILE_SHARE_READ)`只读打开，被其他进程以写方式打开时返回共享冲突（32），即“正在写入”；不加锁、不修改，句柄立即关闭。非Windows恒为否。
+- 快照：读取当时的文件长度，截到最后一个完整换行（UTF-16/32按BOM与码元对齐），写入私有临时目录后再读取、哈希和建索引，结束即删除。`--snapshot auto`（默认）对正在写入或读取中变化（`SourceChangedError`）的文件读快照；`always`总是；`never`保持原行为。
+- 报告/索引：`ScanReport.live/snapshot`、`files.live/snapshot`；警告写明快照时间、字节数与“SHA-256针对快照字节”；列表与TUI标注“正在写入/实时快照”。正在写入的会话结束状态为`live`，不生成`session.no_clean_exit`。
+- 验证：单元测试覆盖截断半行、UTF-16对齐、`always/never`、临时目录清理；Windows上用Python以追加方式持有文件模拟Revit，确认探测为真、扫描与索引走快照、会话为`live`。真实Revit持有的Journal本次未测（测量时未运行Revit）。
+
+### J11 自动发现与“最新优先”
+
+- `discovery.py`：枚举`%LOCALAPPDATA%\Autodesk\Revit\Autodesk Revit [LT ]<year>\Journals`，新版本在前。`scan/browse/summary/view`不传路径时使用；`--revit YEAR`（可重复、逗号分隔）、`--latest [N]`；显式路径加`--revit`时按所在年份目录过滤。新增`--jobs`。
+- 排序：会话按其最新成员的修改时间倒序，会话内主Journal→精简→worker→钢连接日志→未识别→副本→dmp。`ViewerIndex.preferred_id`为最新主Journal：TUI与Web默认打开它，顺序构建时第一个处理，并行构建时第一个提交。
+- 真实数据：不带参数的`summary`列出本机7个版本56个会话，首项为`Autodesk Revit 2027/journal.0037`（最新）。112个输入冷启动7.45s（8进程），缓存命中0.67s。
+
+### J12 会话层与摘要
+
+- `summary.py`的`SessionCollector`在建索引的同一遍读取中收集：Build/Branch/Release、`Session<pid>_P0MainQueue`进程号、起止时间与时长（`started recording`起算）、`finished recording journal file`行号、`ExitManagedInstance/Journal Exit`、许可记录与`revit.license_error`、`openFromModelPath [路径]`与打开失败、Add-in加载来源计数与第三方名称、按程序集聚合的版本冲突、对话框、阶段首行、最后20行、最后10个操作/对话框块。全部有上限，存为`files.summary`（JSON）。
+- `session_findings`：`session.no_clean_exit/license_error/model_open_failed/addin_conflict/steel_localdb/crash_dump`，`status: candidate`，每项带证据行号。
+- 输出：新命令`summary`（文本/JSON，`--tail`）、TUI`s`面板、`browse --format json`的`sessions`节。
+- 验收：本机55个主Journal中18个没有结束标记；独立对原始字节`grep "finished recording journal file"`得到相同的18个文件，工具全部标为“未正常结束”。审查文档写的“19/56”与“11个”不一致，按本次复核为准：56个会话＝55个主Journal＋空文件`dump.0001.txt`（无结束状态）。其余37个“正常结束”。会话级发现：`addin_conflict`47、`no_clean_exit`18、`license_error`7、`model_open_failed`7、`crash_dump`4、`steel_localdb`2。抽查2024 `journal.0011`：Build、进程号124036、1分55秒、结束标记第1639行、打开失败3条（第1340/1341/1343行）与原文一致。
+
+### J13 阶段模型
+
+- 块新增`phase`（startup/licensing/addin_loading/document_open/interactive/shutdown），由标记推进；空的`'H/'E`时间戳头随其引出的命令取命令所在阶段。`--phase`、TUI`P`键；`e`视图与`tail_blocks()`给出结束前最后N个操作与对话框（排除`Jrn.Directive`设置记录）。
+- 偏差（实测后修正）：最初以任意`Jrn.*`命令作为“交互操作”开始，真实文件中启动阶段的`'H`头记录`Jrn.Data "JournalDefaultTemplate"`（第101行）和自动的`Jrn.RibbonEvent "TabActivated:Architecture"`都会把阶段提前推进到交互，导致Add-in加载阶段消失。改为`Jrn.Data`、`Jrn.Directive`、`Jrn.AddInEvent`和`TabActivated`不算用户动作。修正后本机分布：30个会话为启动→许可→Add-in加载→交互→打开文档→退出，7个无打开文档，7个无退出（未正常结束），8个停在启动/许可（启动即中断的会话）。
+- 以`_`续行的`Jrn.*`块，标题接上续行内容（最多300字符），原来的标题只有`Jrn.Data  _`，在“结束前操作”中没有信息量。`BLOCK_VERSION`升为`blocks-5-phase-fold`，`INDEX_VERSION`为`viewer-4`。
+
+### J14 规则与分类
+
+- 新规则：`revit.license_error`、`revit.model_open_failed`、`revit.steel_localdb`、`revit.addin_conflict`、`revit.ui_warning`（`tags: ["ui_warning"]`）；规则新增可选字段`tags`。`generic.error_marker`排除层级前缀后的界面提示与`Adlsdk Error`。每条规则在`tests/test_revit_logic.py`有构造的正负样例，并加入门控等价性语料。
+- 新分类“对话框”：`TaskDialog "..."`与`Jrn.Data "TaskDialogResult"`（含续行；续行才出现标记时整块改为对话框）。分类门控`_DIALOG_GATE`加入`test_categories_gates.py`。
+- 同一`API_ERROR`记录上的其他规则（Add-in冲突、钢连接）与`revit.api_error`一起保留。
+- 验收：本机全部Journal中带层级前缀的`ERROR:`/`错误:`行（“Can't create Railings”“不满足约束”“无法创建栏杆扶手”等）全部是建模提示，“错误”分类中此类行为0，`revit.ui_warning`94行；`addin_conflict`549行、`model_open_failed`23行、`license_error`7行、`steel_localdb`2行；对话框块519个。
+- 偏差：计划写“`generic.error_marker`对UI提示降为warning”。规则级别是规则属性，不能按行变化，因此拆为独立规则`revit.ui_warning`并在通用规则中排除，效果相同且可单独统计。
+
+### J15 侧车文件
+
+- `sidecars.py`：钢连接`DatabaseConnectionErrors.log`（UTF-16 BOM，`[n][HH:MM:SS]`条目）按同一年份与时间挂到会话并作为可打开的文件索引；CER`cer.log`按产品RVT、release与进程号（无进程号时按时间重叠）列出；worker/dmp/副本按文件名归组。摘要中每个侧车文件写明关联依据。
+- 偏差（实测后修正）：本机日志条目时间为15:51:10，文件修改时间却是前一天21:51:10，原实现用修改日期拼出条目时间，2024 `journal.0011`（10-05 15:49:53–15:51:48）无法关联。改为三级依据：条目时刻按修改日期落在会话内 > 修改时间落在会话内 > 仅条目时刻落在会话日期范围内（标注“关联较弱”）；多个候选时取依据最强、再取离修改时间最近的会话。修正后该日志只关联到2024 `journal.0011`，摘要列出两条LocalDB错误并生成`session.steel_localdb`。本机3个CER日志按进程号关联。
+- 另修：钢连接日志总按`auto`（BOM）读取，不受Journal的`--encoding`影响。最初显式`--encoding gb18030`时该日志严格解码失败，2024目录退出码变为2；修正后为0，并有测试覆盖。
+
+### J16 折叠
+
+- 每块计算指纹：类别＋去掉时间戳、层级前缀、耗时前缀与`- N times`后的逐行内容（blake2b 8字节）。建完文件时汇总重复指纹到`block_folds`。列表默认在首次出现处显示`×N`，`--print`另注末次行号；阶段筛选下用窗口函数在筛选内折叠；搜索不折叠；`fold_members()`列出各处起始行；`g`跳行时关闭折叠。`z`/`--no-fold`切换。
+- 真实数据：本机177,002块默认列为126,581项（减少28%），最大折叠为`[Jrn.ESSchemaOpenRoster]`2,349次。Add-in冲突块因程序集名不同，单文件最大折叠20次；按程序集的聚合计数由会话摘要给出（如2024 `journal.0011`为28个程序集28条）。
+
+### 其他修正
+
+- 并行建索引的挂起（J8遗留）：工作进程在启动时退出（例如spawn无法重新导入主模块：从标准输入运行的脚本）时，`multiprocessing.Pool`会不断重建进程，构建一直等待（本次测量中挂起超过600s）。改用`ProcessPoolExecutor`，出现`BrokenProcessPool`时终止进程池，剩余文件在主进程中顺序建立；停止请求同样终止工作进程。测试用`os._exit`作为工作进程初始化函数模拟，结果与顺序构建逐行相同。
+- 规则预筛选移入`match_rules`：全部规则都有`gate`时，先把门控并集（去掉含更短门控的冗余项，ASCII行不查中文项，18项）作为一次预筛选，扫描与分类共用；任一规则无门控时停用。原分类器的`_POSSIBLE_ERROR`预筛选随之删除。
+- 指纹归一化在行内容不可能以时间戳、耗时或多余`<`开头时直接复用已剥离的内容，跳过一次正则；与完整归一化的等价性有4000行随机语料测试。
+
+### 测试与基准
+
+测试：167项全部通过（阶段2为140项；新增`tests/test_revit_logic.py`26项、并行回退1项；`test_blocks`中续行标题的断言随J13更新）。
+
+| 场景（同一文件/目录） | 阶段2最终 | 阶段3 |
+| --- | --- | --- |
+| scan 6.47MB，`gb18030` | 0.488s（13.3MB/s） | 0.390s（16.6MB/s） |
+| scan 6.47MB，`auto` | 0.558s | 0.412s |
+| 分类＋分块（feed+classify） | 1.047s | 1.459s |
+| 建索引6.47MB | 2.224s，38,401行/秒 | 2.869s，29,763行/秒 |
+| 单文件索引体积 | 3.28倍 | 3.63倍 |
+| 建索引峰值内存 | 59MB | 68MB |
+| `browse --print` 2024目录，`auto` | 2.58–2.79s | 3.31s（含钢连接日志共22个文件） |
+| `browse --print` 2024目录，`gb18030` | 2.61s | 3.36s |
+| 目录缓存体积 | 3.57倍 | 3.90倍 |
+
+同日用`git archive`取阶段2提交复测：建索引2.065s（41,342行/秒），feed+classify 1.02s。
+
+偏差：单文件建索引不再满足阶段2的“≥35,000行/秒”（现29,763行/秒）。逐项关闭测得每项约0.07–0.1s：会话收集、指纹、阶段推进、折叠与统计汇总；分类约+0.1s（对话框判定，规则在门控命中的所有行上运行而不只在“可能错误”行上）。体积增加来自续行标题（+1.4MB）与`phase/fingerprint`列（+0.8MB）。扫描反而更快；目录建索引仍≤5s。若需要找回速度，候选方向是把指纹改为整数列、会话收集只在时间戳/特定前缀行上运行，未在本次实施。
+
+### 未完成与未验证
+
+- 交互式TUI的新按键（`s/e/P/z/9`）只在`Browser`单元测试中驱动并渲染，仍未在原生Windows终端人工验收（J20）。
+- 真实Revit持有的Journal未测（见J3）。
+- Web查看器只显示“正在写入/实时快照”和最新优先的默认选择，没有会话摘要与阶段视图（J24）。
+- 阶段4（J17报告、J19缓存位置、J20、J21、J25）与J9未实施。J3已完成，J9的前提条件已具备。

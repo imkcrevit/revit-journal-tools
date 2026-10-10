@@ -77,10 +77,11 @@ def make_server(index: ViewerIndex, port: int = 8765) -> ThreadingHTTPServer:
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
-def serve(paths: list[Path], database: Path, encoding: str, port: int) -> None:
+def serve(paths: list[Path], database: Path, encoding: str, port: int, jobs: int | None = None,
+          snapshot: str = "auto") -> None:
     if not 1 <= port <= 65535:
         raise ValueError("端口必须在1到65535之间")
-    index = ViewerIndex(database)
+    index = ViewerIndex(database, workers=jobs, snapshot=snapshot)
     queued = index.register(paths, encoding)
     server = make_server(index, port)
     stop = threading.Event()

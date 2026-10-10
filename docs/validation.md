@@ -1,5 +1,13 @@
 # 当前验证记录
 
+## 会话摘要、阶段、Revit规则与侧车日志（2026-10-10，Windows，阶段3）
+
+- 167项自动化测试全部通过；新增测试只用构造的Journal片段（`tests/test_revit_logic.py`）。
+- 不带路径运行`summary`：本机7个版本56个会话，最新在前；55个主Journal中18个没有`finished recording journal file`，与对原始字节的独立检索一致，全部标为“未正常结束”。
+- 带层级前缀的`ERROR:`/`错误:`界面提示不再进入“错误”分类（0行）；2024 `journal.0011`会话关联并列出`DatabaseConnectionErrors.log`（关联依据标为较弱：仅条目时刻）。
+- 正在写入的Journal用Python追加句柄模拟验证快照路径；测量时未运行Revit。交互式TUI新按键只在单元测试中驱动，未在原生Windows终端人工验收。
+- 性能变化与偏差见`docs/review-2026-10-10-execution.md`阶段3。
+
 ## 编码、会话与读取速度（2026-10-10，Windows）
 
 - 环境：Windows 10 19045、Python 3.12.10、SQLite 3.49.1、系统代码页cp936。140项自动化测试全部通过（含Windows上原先失败的2项）。

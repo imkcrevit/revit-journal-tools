@@ -30,6 +30,8 @@ class RuleMatch:
     match_truncated: bool
     excerpt: str
     excerpt_start_column: int
+    # Rule-declared labels, e.g. ui_warning for Revit modelling prompts.
+    tags: tuple[str, ...] = ()
 
 
 @dataclass
@@ -83,6 +85,9 @@ class ScanReport:
     encoding_fallback: bool = False
     decode_degraded_line_count: int = 0
     decode_degraded_lines: list[int] = field(default_factory=list)
+    # A journal Revit was still writing: the report covers a snapshot of it.
+    live: bool = False
+    snapshot: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

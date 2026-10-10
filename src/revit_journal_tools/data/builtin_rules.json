@@ -36,8 +36,9 @@
       "severity": "error",
       "pattern": "(?:^|[\\s>:\\]])(?:ERROR|错误)\\s*[:：]",
       "gate": ["error", "错误"],
+      "exclude_patterns": ["^\\s*'\\s*\\d+:<\\s*(?:ERROR|错误)\\s*[:：]", "\\bAdlsdk Error\\b"],
       "basis": "heuristic",
-      "explanation": "匹配带冒号的错误标记，避免只因出现error单词就判定错误。"
+      "explanation": "匹配带冒号的错误标记，避免只因出现error单词就判定错误。Revit界面提示（' N:< 错误:）归revit.ui_warning，许可SDK错误归revit.license_error。"
     },
     {
       "id": "revit.api_error",
@@ -114,6 +115,52 @@
       "basis": "documented_marker",
       "source_url": "https://www.autodesk.com/support/technical/article/caas/sfdcarticles/sfdcarticles/A-serious-error-has-occurred-Please-open-the-model-with-Audit-error-with-Revit-2024-3.html",
       "explanation": "Autodesk有相关问题记录，但版本与现场条件仍需核对；此规则不自动给出修复结论。"
+    },
+    {
+      "id": "revit.license_error",
+      "title": "许可验证错误",
+      "severity": "warning",
+      "pattern": "\\bAdlsdk Error\\b|\\bLicenseUpd\\(\\d+\\)[^\\r\\n]*\\bError\\b",
+      "gate": ["adlsdk error", "licenseupd("],
+      "basis": "heuristic",
+      "explanation": "许可SDK（Adlsdk）报告错误。许可验证失败通常早于其他现象出现，需要结合之后的启动、打开文档与退出记录判断影响；单独命中不说明许可已失效。"
+    },
+    {
+      "id": "revit.model_open_failed",
+      "title": "模型打开或载入失败",
+      "severity": "error",
+      "pattern": "\\bLoad exception \"|\\bopenFromModelPath did not complete\\b|\\bexceptionsInOnOpenDocument\\b",
+      "gate": ["load exception \"", "openfrommodelpath did not complete", "exceptionsinonopendocument"],
+      "basis": "heuristic",
+      "explanation": "打开或载入模型时报告异常或未完成。同一次打开通常连续出现多条；原因见异常文字（文件损坏、磁盘空间、取消、版本等），需要结合原文判断。"
+    },
+    {
+      "id": "revit.steel_localdb",
+      "title": "钢结构连接/LocalDB线索",
+      "severity": "error",
+      "pattern": "\\bSQLLocalDB instance is malfunctioning\\b|\\bexception\\b[^\\r\\n]*\\bregistered by application Steel Connections DB extension\\b",
+      "gate": ["sqllocaldb instance is malfunctioning", "steel connections db extension"],
+      "basis": "heuristic",
+      "explanation": "Steel Connections（钢结构连接）依赖SQL Server Express LocalDB。LocalDB故障时Journal中常常没有直接证据，请同时查看会话摘要列出的%ProgramData%\\Autodesk\\Revit Steel Connections <year>\\<lang>\\DatabaseConnectionErrors.log；修复可使用独立工具RevitLocalDbFix（不是Revit插件）。"
+    },
+    {
+      "id": "revit.addin_conflict",
+      "title": "Add-in程序集版本冲突",
+      "severity": "warning",
+      "pattern": "\\bAssembly version conflict in\\b",
+      "gate": ["assembly version conflict in"],
+      "basis": "heuristic",
+      "explanation": "Add-in引用的程序集与Revit已加载的版本不同，多数情况下仍能加载；会话摘要按程序集聚合计数，列表中相同的冲突块会折叠。"
+    },
+    {
+      "id": "revit.ui_warning",
+      "title": "Revit界面提示（错误文字）",
+      "severity": "warning",
+      "tags": ["ui_warning"],
+      "pattern": "^\\s*'\\s*\\d+:<\\s*(?:ERROR|错误)\\s*[:：]",
+      "gate": ["error", "错误"],
+      "basis": "heuristic",
+      "explanation": "Revit向用户显示的建模提示（如“错误: 不满足约束”“Error: Can't create Railings”），通常是建模警告而不是程序故障。"
     }
   ]
 }

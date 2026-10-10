@@ -13,12 +13,16 @@ from typing import Any, TextIO
 
 from . import __version__
 from .analyzer import ScanOptions, analyze
+from .blocks import PHASES
+from .discovery import journal_folders, parse_years
+from .live import SNAPSHOT_MODES
 from .models import SEVERITY_RANK
 from .loading import BLOCK_FILTERS
 from .reader import resolve_encoding
 from .reporting import write_reports
 from .rules import load_rules
 from .sessions import InputFile, plan_inputs
+from .sidecars import attach_steel_logs, revit_year
 
 TEXT_SUFFIXES = {".txt", ".log", ".journal"}
 ENCODING_HELP = (
@@ -32,14 +36,28 @@ def _is_text_input(path: Path) -> bool:
     return path.suffix.lower() in TEXT_SUFFIXES or path.name.lower().endswith(".txt.abbrev")
 
 
+def _workspace_options(command: argparse.ArgumentParser, index: bool) -> None:
+    command.add_argument("paths", nargs="*", type=Path,
+                         help="文件或目录，可传多个；省略时自动查找本机各版本Revit的Journals目录")
+    command.add_argument("--recursive", action="store_true", help="递归扫描目录")
+    command.add_argument("--encoding", default="auto", help=ENCODING_HELP)
+    command.add_argument("--revit", action="append", metavar="YEAR",
+                         help="只看指定版本，如--revit 2024；可重复或用逗号分隔")
+    command.add_argument("--latest", nargs="?", type=int, const=1, default=0, metavar="N",
+                         help="只看最新的N个会话（默认1个）")
+    command.add_argument("--snapshot", choices=SNAPSHOT_MODES, default="auto",
+                         help="正在写入的Journal：auto对Revit占用或读取中变化的文件读快照（默认），always总是读快照，never视为读取失败")
+    if index:
+        command.add_argument("--jobs", type=int, default=None, metavar="N",
+                             help="多文件建索引的进程数；默认逻辑核数减1、最多8，1为顺序")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Revit Journal读取与错误候选定位")
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
     scan = commands.add_parser("scan", help="扫描文本文件或目录")
-    scan.add_argument("paths", nargs="+", type=Path, help="文件或目录，可传多个")
-    scan.add_argument("--recursive", action="store_true", help="递归扫描目录")
-    scan.add_argument("--encoding", default="auto", help=ENCODING_HELP)
+    _workspace_options(scan, index=False)
     scan.add_argument("--context", type=int, default=3, help="命中行前后各保留多少行，0到100")
     scan.add_argument("--min-severity", choices=SEVERITY_RANK, default="warning")
     scan.add_argument("--max-findings", type=int, default=500, help="每文件最多保留多少条候选明细")
@@ -52,23 +70,27 @@ def _parser() -> argparse.ArgumentParser:
     rules = commands.add_parser("rules", help="列出规则及其来源")
     rules.add_argument("--rules", type=Path, help="追加自定义JSON规则")
     browse = commands.add_parser("browse", help="打开CLI终端段落查看器（颜色、折叠、搜索）")
-    browse.add_argument("paths", nargs="+", type=Path)
-    browse.add_argument("--recursive", action="store_true")
-    browse.add_argument("--encoding", default="auto", help=ENCODING_HELP)
+    _workspace_options(browse, index=True)
     browse.add_argument("--database", type=Path, default=Path(".journal-cache/terminal.sqlite3"))
     browse.add_argument("--category", choices=("all", *BLOCK_FILTERS), default="all")
+    browse.add_argument("--phase", choices=("all", *PHASES), default="all", help="只看某个会话阶段的段落")
     browse.add_argument("--query", default="", help="搜索段落内任意行；词语/末词前缀")
     browse.add_argument("--addin-prefix", default="", help="按Add-in名称或Class前缀筛选，如ATFTranslationServer")
+    browse.add_argument("--no-fold", dest="fold", action="store_false", help="不折叠内容相同的段落")
     browse.add_argument("--color", choices=("auto", "always", "never"), default="auto")
     browse.add_argument("--print", dest="print_only", action="store_true", help="输出一页段落摘要，不进入交互界面")
     browse.add_argument("--format", choices=("text", "json"), default="text", help="JSON始终以非交互方式输出")
     browse.add_argument("--page-size", type=int, default=100, help="每页1到200个完整段落")
     browse.add_argument("--after", type=int, default=0, help="从此起始行之后的段落继续分页")
     browse.set_defaults(rules=None)
+    summary = commands.add_parser("summary", help="会话摘要：怎么结束的、最后在做什么、许可/插件/对话框/侧车日志")
+    _workspace_options(summary, index=True)
+    summary.add_argument("--database", type=Path, default=Path(".journal-cache/terminal.sqlite3"))
+    summary.add_argument("--format", choices=("text", "json"), default="text")
+    summary.add_argument("--tail", type=int, default=10, help="列出结束前最后N个操作与对话框，1到200")
+    summary.set_defaults(rules=None)
     view = commands.add_parser("view", help="启动原有本地Web查看器")
-    view.add_argument("paths", nargs="+", type=Path, help="需要打开的日志文件或目录")
-    view.add_argument("--recursive", action="store_true", help="包括子目录中的日志")
-    view.add_argument("--encoding", default="auto", help=ENCODING_HELP)
+    _workspace_options(view, index=True)
     view.add_argument("--port", type=int, default=8765)
     view.add_argument("--database", type=Path, default=Path(".journal-cache/viewer.sqlite3"))
     view.set_defaults(rules=None)
@@ -105,6 +127,32 @@ def _discover(paths: list[Path], recursive: bool) -> tuple[list[Path], list[dict
         except OSError as error:
             errors.append(_error(path, str(error)))
     return sorted(found), errors, sorted(dumps - found)
+
+
+def _workspace(args, years: list[int], attach: bool) -> tuple[list[InputFile], list[dict[str, Any]], list[Path]]:
+    """Plan the inputs: explicit paths, or every local Revit Journals folder.
+    Returns (planned files, input errors, every input path to protect)."""
+    paths = list(args.paths)
+    if not paths:
+        folders = journal_folders(years)
+        if not folders:
+            where = "、".join(map(str, years)) if years else "任何版本"
+            raise ValueError(f"没有找到{where}的Revit Journals目录（%LOCALAPPDATA%\\Autodesk\\Revit\\Autodesk Revit <year>\\Journals）；请传入文件或目录")
+        paths = [folder for _, folder in folders]
+    files, errors, dumps = _discover(paths, args.recursive)
+    if years and args.paths:
+        files = [path for path in files if revit_year(path) in years]
+        dumps = [path for path in dumps if revit_year(path) in years]
+    attached = attach_steel_logs(files) if attach else {}
+    planned = plan_inputs([*files, *dumps], attached)
+    if args.latest:
+        keep = []
+        for item in planned:  # planned is newest session first
+            if item.session.key not in keep:
+                keep.append(item.session.key)
+        keep = set(keep[:args.latest])
+        planned = [item for item in planned if item.session.key in keep]
+    return planned, errors, [*files, *dumps, *attached, *args.paths]
 
 
 def _duplicate(item: InputFile) -> dict[str, Any]:
@@ -157,37 +205,47 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"schema_version": 1, "rules": [rule.definition() for rule in rules]}, ensure_ascii=False, indent=2))
             return 0
         resolve_encoding(args.encoding)  # Reject unknown codecs before any work.
-        if args.command in {"view", "browse"}:
-            paths, errors, dumps = _discover(args.paths, args.recursive)
+        years = parse_years(args.revit)
+        if getattr(args, "jobs", None) is not None and args.jobs < 1:
+            raise ValueError("--jobs必须大于0")
+        if args.command in {"view", "browse", "summary"}:
+            planned, errors, inputs = _workspace(args, years, attach=True)
             if errors:
                 raise ValueError("；".join(item["error"] for item in errors))
             for target in (args.database, Path(str(args.database) + "-wal"), Path(str(args.database) + "-shm")):
-                _protect_inputs(target, [*paths, *dumps, *args.paths])
-            planned = plan_inputs([*paths, *dumps])
-            if args.command == "browse":
+                _protect_inputs(target, inputs)
+            if args.command in {"browse", "summary"}:
                 from .terminal import run
 
+                if args.command == "summary":
+                    if not 1 <= args.tail <= 200:
+                        raise ValueError("--tail需要在1到200之间")
+                    return run(planned, args.database, args.encoding, format_name=args.format, print_only=True,
+                               jobs=args.jobs, snapshot=args.snapshot, summary_tail=args.tail)
                 return run(planned, args.database, args.encoding, category=args.category, query=args.query,
                            addin_prefix=args.addin_prefix,
                            color=args.color, print_only=args.print_only, format_name=args.format,
-                           after=args.after, page_size=args.page_size)
+                           after=args.after, page_size=args.page_size, jobs=args.jobs, snapshot=args.snapshot,
+                           phase=args.phase, fold=args.fold)
             from .viewer_server import serve
 
-            serve(planned, args.database, args.encoding, args.port)
+            serve(planned, args.database, args.encoding, args.port, jobs=args.jobs, snapshot=args.snapshot)
             return 0
         options = ScanOptions(
             encoding=args.encoding, context=args.context, min_severity=args.min_severity,
             max_findings=args.max_findings, max_groups=args.max_groups,
             max_line_chars=args.max_line_chars,
         )
-        paths, input_errors, _ = _discover(args.paths, args.recursive)
+        planned, input_errors, inputs = _workspace(args, years, attach=False)
+        explicit = {path.resolve() for path in args.paths}
+        # Directory .dmp files are session sidecars, not scan inputs; an explicit one is reported.
+        planned = [item for item in planned if item.status != "binary" or item.path in explicit]
         # Also protect the custom rule document, including symlinks and hard links.
-        protected = [*paths, *args.paths]
+        protected = list(inputs)
         if args.rules is not None:
             protected.append(args.rules)
         _protect_inputs(args.output, protected)
         exit_code = 2 if input_errors else 0
-        planned = plan_inputs(paths)
 
         def reports() -> Iterator[dict[str, Any]]:
             nonlocal exit_code
@@ -199,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
                     yield _duplicate(item)
                     continue
                 try:
-                    report = analyze(path, options=options, rules=rules)
+                    report = analyze(path, options=options, rules=rules, snapshot=args.snapshot)
                 except (OSError, ValueError, LookupError) as error:
                     exit_code = 2
                     yield _error(path, str(error))

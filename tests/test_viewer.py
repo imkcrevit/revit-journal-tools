@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -220,6 +221,15 @@ class ParallelBuildTests(unittest.TestCase):
         self.assertEqual(index.events(file_id, query="Vendor")["items"], [])
         with index.connect() as connection:
             connection.execute("INSERT INTO line_search(line_search, rank) VALUES('integrity-check',1)")
+
+    def test_dead_workers_fall_back_to_serial_instead_of_waiting(self):
+        # Workers that exit while starting (as when spawn cannot re-import the
+        # main module) used to leave the build waiting forever.
+        serial = self.build(1, "serial.sqlite3")
+        index = ViewerIndex(self.root / "broken.sqlite3", workers=3)
+        index.worker_init = (os._exit, (3,))
+        index.build(index.register(self.paths, "utf-8"), "utf-8")
+        self.assertEqual(self.snapshot(serial), self.snapshot(index))
 
     def test_stop_leaves_unfinished_files_queued(self):
         index = ViewerIndex(self.root / "stop.sqlite3", workers=3)

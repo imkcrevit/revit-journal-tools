@@ -9,17 +9,22 @@ import sqlite3
 import tempfile
 import threading
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from pathlib import Path
 
 from .categories import CATEGORIES, Categorizer
-from .blocks import BLOCK_VERSION, BlockBuilder
+from .blocks import BLOCK_VERSION, PHASES, BlockBuilder
 from .loading import BLOCK_FILTERS, block_filter, matches_filter
-from .reader import JournalReader, resolve_encoding
+from .live import Snapshot, held_for_writing, wants_snapshot
+from .reader import JournalReader, SourceChangedError, resolve_encoding
 from .rules import load_rules, ruleset_digest
-from .sessions import ROLE_LABELS, InputFile, describe, plan_inputs, sort_key
+from .summary import END_STATES, SessionCollector, end_state, session_findings
+from .sessions import ROLE_LABELS, InputFile, SessionName, describe, plan_inputs, recency_sort
+from .sidecars import BASIS_TEXT, cer_logs, match_cer, match_steel_log, parse_steel_log, revit_year, session_window
 
-INDEX_VERSION = "viewer-3:" + BLOCK_VERSION
+INDEX_VERSION = "viewer-4:" + BLOCK_VERSION
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
  id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
@@ -42,9 +47,14 @@ CREATE TABLE IF NOT EXISTS blocks (
  complete INTEGER NOT NULL, addin_origin TEXT NOT NULL DEFAULT '',
  addin_evidence TEXT NOT NULL DEFAULT '[]', addin_name TEXT NOT NULL DEFAULT '',
  addin_class TEXT NOT NULL DEFAULT '', addin_identity_truncated INTEGER NOT NULL DEFAULT 0,
+ phase TEXT NOT NULL DEFAULT '', fingerprint TEXT NOT NULL DEFAULT '',
  PRIMARY KEY(file_id,start_line)
 );
 CREATE INDEX IF NOT EXISTS blocks_category ON blocks(file_id,category,start_line);
+CREATE TABLE IF NOT EXISTS block_folds (
+ file_id INTEGER NOT NULL, fingerprint TEXT NOT NULL, first_line INTEGER NOT NULL,
+ last_line INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(file_id,fingerprint)
+);
 CREATE TABLE IF NOT EXISTS block_stats (
  file_id INTEGER PRIMARY KEY, block_count INTEGER NOT NULL, counts TEXT NOT NULL
 );
@@ -71,7 +81,8 @@ _INSERT_LINES = ("INSERT INTO lines(file_id,line_number,body,category,severity,r
                  "VALUES(?,?,?,?,?,?,?)")
 _INSERT_BLOCKS = (
     "INSERT INTO blocks(file_id,start_line,end_line,category,severity,rules,title,title_line,boundary,complete,"
-    "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated,phase,fingerprint) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 
@@ -86,7 +97,7 @@ def _insert_batch(connection, file_id, lines, blocks, block_counts) -> None:
         (file_id, b.start_line, b.end_line, b.category, b.severity, ",".join(sorted(b.rules)),
          b.title, b.title_line, b.boundary, int(b.complete), b.addin_origin,
          json.dumps(b.addin_evidence, ensure_ascii=False), b.addin_name, b.addin_class,
-         int(b.addin_identity_truncated)) for b in blocks])
+         int(b.addin_identity_truncated), b.phase, b.fingerprint) for b in blocks])
 
 
 def parse_into(connection, file_id, path, encoding, rules, stop=None, progress=None) -> dict | None:
@@ -94,8 +105,8 @@ def parse_into(connection, file_id, path, encoding, rules, stop=None, progress=N
     transaction (no commit). Returns the file metadata, or None when stopped."""
     counts: Counter[str] = Counter()
     block_counts: Counter[str] = Counter()
-    categorizer, builder = Categorizer(rules), BlockBuilder()
-    classify, feed = categorizer.classify, builder.feed
+    categorizer, builder, collector = Categorizer(rules), BlockBuilder(), SessionCollector()
+    classify, feed, collect = categorizer.classify, builder.feed, collector.feed
     batch: list[tuple] = []
     block_batch: list = []
     with JournalReader(path, encoding) as reader:
@@ -103,8 +114,10 @@ def parse_into(connection, file_id, path, encoding, rules, stop=None, progress=N
             classification = classify(line.text)
             counts[classification[0]] += 1
             batch.append((file_id, line.number, line.text, *classification, int(line.degraded)))
+            collect(line.number, line.text, classification)
             block_batch.extend(feed(line, classification))
             if len(batch) >= _BATCH:
+                collector.add_blocks(block_batch)
                 _insert_batch(connection, file_id, batch, block_batch, block_counts)
                 batch.clear()
                 block_batch.clear()
@@ -113,9 +126,32 @@ def parse_into(connection, file_id, path, encoding, rules, stop=None, progress=N
                 if stop and stop.is_set():
                     return None
         block_batch.extend(builder.finish())
+        collector.add_blocks(block_batch)
         _insert_batch(connection, file_id, batch, block_batch, block_counts)
         return {**reader.decoding_summary(), "sha256": reader.sha256, "line_count": reader.line_count,
-                "byte_count": reader.byte_count, "counts": dict(counts), "block_counts": dict(block_counts)}
+                "byte_count": reader.byte_count, "counts": dict(counts), "block_counts": dict(block_counts),
+                "summary": collector.finish(), "live": False, "snapshot": None}
+
+
+def parse_file(connection, file_id, path, encoding, rules, stop=None, progress=None,
+               snapshot: str = "auto") -> dict | None:
+    """parse_into on the file itself, or on a snapshot when Revit is still
+    writing it (or it changed while read and snapshot is not "never")."""
+    if not wants_snapshot(path, snapshot):
+        try:
+            return parse_into(connection, file_id, path, encoding, rules, stop, progress)
+        except SourceChangedError:
+            if snapshot == "never":
+                raise
+            # Discard the rows of the attempt (no FTS rows exist yet) and retry.
+            connection.execute("DELETE FROM lines WHERE file_id=?", (file_id,))
+            connection.execute("DELETE FROM blocks WHERE file_id=?", (file_id,))
+    with Snapshot(path) as info:
+        meta = parse_into(connection, file_id, Path(info["path"]), encoding, rules, stop, progress)
+    if meta is not None:
+        meta["live"] = True
+        meta["snapshot"] = {key: info[key] for key in ("bytes", "source_size", "trimmed_bytes", "taken_at")}
+    return meta
 
 
 # Child processes parse into a private scratch database (same columns, no
@@ -132,20 +168,22 @@ CREATE TABLE blocks (
  category TEXT NOT NULL, severity TEXT NOT NULL, rules TEXT NOT NULL,
  title TEXT NOT NULL, title_line INTEGER NOT NULL, boundary TEXT NOT NULL,
  complete INTEGER NOT NULL, addin_origin TEXT NOT NULL, addin_evidence TEXT NOT NULL,
- addin_name TEXT NOT NULL, addin_class TEXT NOT NULL, addin_identity_truncated INTEGER NOT NULL
+ addin_name TEXT NOT NULL, addin_class TEXT NOT NULL, addin_identity_truncated INTEGER NOT NULL,
+ phase TEXT NOT NULL, fingerprint TEXT NOT NULL
 );
 """
 _BLOCK_COLUMNS = ("start_line,end_line,category,severity,rules,title,title_line,boundary,complete,"
-                  "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated")
+                  "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated,phase,fingerprint")
 # Below this much work, starting processes costs more than it saves.
 PARALLEL_MIN_BYTES = 2 * 1024 * 1024
+_OWN_FORMAT_ROLES = {"steel_log"}
 _worker_rules = None
 
 
 def _parse_to_scratch(task: tuple) -> tuple[int, dict | None, str | None]:
     """Runs in a child process. Returns (file_id, metadata or None, error or None)."""
     global _worker_rules
-    file_id, path, encoding, stamp, scratch = task
+    file_id, path, encoding, stamp, scratch, snapshot = task
     try:
         if _worker_rules is None:
             _worker_rules = load_rules()
@@ -154,15 +192,25 @@ def _parse_to_scratch(task: tuple) -> tuple[int, dict | None, str | None]:
             connection.execute("PRAGMA journal_mode=OFF")
             connection.execute("PRAGMA synchronous=OFF")
             connection.executescript(_SCRATCH_SCHEMA)
-            meta = parse_into(connection, file_id, Path(path), encoding, _worker_rules)
+            meta = parse_file(connection, file_id, Path(path), encoding, _worker_rules, snapshot=snapshot)
             connection.commit()
         finally:
             connection.close()
-        if _stamp(Path(path)) != stamp:
+        if not meta["live"] and _stamp(Path(path)) != stamp:
             return file_id, None, "源文件自任务创建后发生变化，请重新索引"
         return file_id, meta, None
     except (OSError, ValueError, LookupError, sqlite3.Error) as error:
         return file_id, None, str(error)
+
+
+def _terminate_workers(executor) -> None:
+    """Stop worker processes now (stop request or broken pool)."""
+    terminate = getattr(executor, "terminate_workers", None)  # Python 3.14+
+    if terminate is not None:
+        terminate()
+        return
+    for process in list((getattr(executor, "_processes", None) or {}).values()):
+        process.terminate()
 
 
 def _ignore_interrupts() -> None:
@@ -186,19 +234,32 @@ _FILE_COLUMNS = {
     "encoding_request": "TEXT", "encoding_requested": "TEXT",
     "encoding_fallback": "INTEGER NOT NULL DEFAULT 0",
     "degraded_lines": "INTEGER NOT NULL DEFAULT 0", "degraded_sample": "TEXT NOT NULL DEFAULT '[]'",
+    "live": "INTEGER NOT NULL DEFAULT 0", "snapshot": "TEXT NOT NULL DEFAULT ''",
+    "summary": "TEXT NOT NULL DEFAULT '{}'",
 }
 
 
 class ViewerIndex:
-    def __init__(self, database: str | Path, workers: int | None = None):
-        """workers: processes for multi-file builds (default: cores-1, at most 8; 1 = serial)."""
+    def __init__(self, database: str | Path, workers: int | None = None, snapshot: str = "auto",
+                 local_appdata: str | Path | None = None):
+        """workers: processes for multi-file builds (default: cores-1, at most 8; 1 = serial).
+        snapshot: auto/always/never for journals Revit is still writing (live.py).
+        local_appdata: root for CER logs (default %LOCALAPPDATA%)."""
         self.workers = default_workers() if workers is None else max(1, workers)
+        # (initializer, args) run in each worker process; tests replace it.
+        self.worker_init: tuple = (_ignore_interrupts, ())
+        self.snapshot = snapshot
+        self.local_appdata = local_appdata
+        self._cer_logs: list[dict] | None = None
         self.database = Path(database).resolve()
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.rules = load_rules()
         self.signature = INDEX_VERSION + ":" + ruleset_digest(self.rules)
         self.file_ids: list[int] = []
         self.sidecars: list[dict] = []
+        self.overrides: dict[str, SessionName] = {}
+        self.encoding_overrides: dict[int, str] = {}  # file id -> request for sidecar logs  # sidecar logs attached to a session by time
+        self.preferred_id: int | None = None  # newest main journal: opened and indexed first
         # file id -> (bytes read, lines read) while its single transaction is open.
         self.progress: dict[int, tuple[int, int]] = {}
         with self.connect() as connection:
@@ -215,7 +276,7 @@ class ViewerIndex:
                 connection.execute("ALTER TABLE blocks ADD COLUMN addin_origin TEXT NOT NULL DEFAULT ''")
             if "addin_evidence" not in columns:
                 connection.execute("ALTER TABLE blocks ADD COLUMN addin_evidence TEXT NOT NULL DEFAULT '[]'")
-            for name in ("addin_name", "addin_class"):
+            for name in ("addin_name", "addin_class", "phase", "fingerprint"):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE blocks ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
             if "addin_identity_truncated" not in columns:
@@ -247,25 +308,38 @@ class ViewerIndex:
 
     def register(self, paths: list[Path | InputFile], encoding: str) -> list[int]:
         """Register indexable inputs. Empty, binary and duplicate files become sidecars."""
-        policy = resolve_encoding(encoding)
+        policies = {encoding: resolve_encoding(encoding), "auto": resolve_encoding("auto")}
         planned = [item if isinstance(item, InputFile) else None for item in paths]
         if any(item is None for item in planned):
             planned = plan_inputs([getattr(item, "path", item) for item in paths])
         queued = []
         self.file_ids = []
         self.sidecars = [item.sidecar() for item in planned if item.status != "index"]
+        self.overrides = {str(item.path): item.session_override for item in planned if item.session_override}
+        # planned is newest session first; the queue follows it, newest main journal first.
         indexable = [item.path for item in planned if item.status == "index"]
+        # Sidecar logs keep their own format (the Steel Connections log is
+        # UTF-16 with a BOM): the journals' encoding request does not apply.
+        own_format = {item.path for item in planned if item.session.role in _OWN_FORMAT_ROLES}
+        self.encoding_overrides = {}
+        main = next((item.path for item in planned if item.status == "index" and item.session.role == "main"), None)
+        if main is not None:
+            indexable.remove(main)
+            indexable.insert(0, main)
+        self.preferred_id = None
         with self.connect() as connection:
-            for path in sorted(indexable, key=lambda item: item.stat().st_size):
+            for path in indexable:
                 if path == self.database:
                     raise ValueError("索引数据库不能覆盖输入文件")
                 stamp = _stamp(path)
+                request = "auto" if path in own_format else encoding
+                policy = policies[request]
                 previous = connection.execute("SELECT * FROM files WHERE path=?", (str(path),)).fetchone()
                 if previous is None:
                     cursor = connection.execute(
                         "INSERT INTO files(path,name,size,stamp,signature,encoding_request,encoding_requested) "
                         "VALUES(?,?,?,?,?,?,?)",
-                        (str(path), path.name, path.stat().st_size, stamp, self.signature, policy.key, encoding),
+                        (str(path), path.name, path.stat().st_size, stamp, self.signature, policy.key, request),
                     )
                     file_id = cursor.lastrowid
                     queued.append(file_id)
@@ -276,14 +350,22 @@ class ViewerIndex:
                         connection.execute(
                             "UPDATE files SET status='queued',stamp=?,size=?,signature=?,encoding_request=?,"
                             "encoding_requested=?,error=NULL WHERE id=?",
-                            (stamp, path.stat().st_size, self.signature, policy.key, encoding, file_id),
+                            (stamp, path.stat().st_size, self.signature, policy.key, request, file_id),
                         )
                         queued.append(file_id)
                     # On reuse the row keeps the request it was built with.
                 self.file_ids.append(file_id)
+                if request != encoding:
+                    self.encoding_overrides[file_id] = request
+                if path == main:
+                    self.preferred_id = file_id
         return queued
 
-    def build(self, file_ids: list[int], encoding: str, stop: threading.Event | None = None) -> None:
+    def build(self, file_ids: list[int], encoding: str, stop: threading.Event | None = None,
+              snapshot: str | None = None) -> None:
+        """snapshot: auto (default) / always / never, see live.py."""
+        if snapshot is not None:
+            self.snapshot = snapshot
         if self._parallel(file_ids):
             self._build_parallel(file_ids, encoding, stop)
         else:
@@ -294,7 +376,7 @@ class ViewerIndex:
             if stop and stop.is_set():
                 return
             try:
-                self._build_file(file_id, encoding, stop)
+                self._build_file(file_id, self.encoding_overrides.get(file_id, encoding), stop)
             except (OSError, ValueError, LookupError, sqlite3.Error) as error:
                 self._fail(file_id, error)
             finally:
@@ -317,37 +399,58 @@ class ViewerIndex:
         # Largest first keeps every worker busy until the end (shortest makespan).
         order = sorted(file_ids, key=lambda file_id: -rows[file_id]["size"])
         scratch_dir = Path(tempfile.mkdtemp(prefix="revit-journal-build-"))
-        tasks = [(file_id, rows[file_id]["path"], encoding, rows[file_id]["stamp"],
-                  str(scratch_dir / f"{file_id}.sqlite3")) for file_id in order]
+        if self.preferred_id in order:  # The file the viewer opens first starts first.
+            order.remove(self.preferred_id)
+            order.insert(0, self.preferred_id)
+        tasks = [(file_id, rows[file_id]["path"], self.encoding_overrides.get(file_id, encoding),
+                  rows[file_id]["stamp"], str(scratch_dir / f"{file_id}.sqlite3"), self.snapshot)
+                 for file_id in order]
         context = multiprocessing.get_context("spawn")  # Windows-safe; no inherited connections
+        remaining = list(order)
         try:
             try:
-                pool = context.Pool(min(self.workers, len(tasks)), initializer=_ignore_interrupts)
+                executor = ProcessPoolExecutor(min(self.workers, len(tasks)), mp_context=context,
+                                               initializer=self.worker_init[0], initargs=self.worker_init[1])
             except OSError:
                 self._build_serial(order, encoding, stop)  # Processes unavailable: same result, slower.
                 return
-            with pool:
-                results = pool.imap_unordered(_parse_to_scratch, tasks)
-                pending = len(tasks)
-                while pending:
+            broken = stopped = False
+            try:
+                futures = {executor.submit(_parse_to_scratch, task): task[0] for task in tasks}
+                pending = set(futures)
+                while pending and not broken:
                     if stop and stop.is_set():
-                        pool.terminate()  # Unfinished files stay queued.
+                        stopped = True  # Unfinished files stay queued.
                         return
-                    try:
-                        file_id, meta, error = results.next(timeout=0.2)
-                    except multiprocessing.TimeoutError:
-                        continue
-                    pending -= 1
-                    scratch = scratch_dir / f"{file_id}.sqlite3"
-                    try:
-                        if error is not None:
-                            raise ValueError(error)
-                        self._copy_scratch(file_id, scratch, meta)
-                    except (OSError, ValueError, LookupError, sqlite3.Error) as failure:
-                        self._fail(file_id, failure)
-                    finally:
-                        self.progress.pop(file_id, None)
-                        scratch.unlink(missing_ok=True)
+                    done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        file_id = futures[future]
+                        try:
+                            _, meta, error = future.result()
+                        except BrokenProcessPool:
+                            # A worker died (e.g. the main module cannot be
+                            # re-imported by spawn): finish here instead of waiting.
+                            broken = True
+                            continue
+                        except Exception as failure:  # noqa: BLE001 - reported per file
+                            meta, error = None, f"{type(failure).__name__}: {failure}"
+                        remaining.remove(file_id)
+                        scratch = scratch_dir / f"{file_id}.sqlite3"
+                        try:
+                            if error is not None:
+                                raise ValueError(error)
+                            self._copy_scratch(file_id, scratch, meta)
+                        except (OSError, ValueError, LookupError, sqlite3.Error) as failure:
+                            self._fail(file_id, failure)
+                        finally:
+                            self.progress.pop(file_id, None)
+                            scratch.unlink(missing_ok=True)
+            finally:
+                if broken or stopped:
+                    _terminate_workers(executor)
+                executor.shutdown(wait=not (broken or stopped), cancel_futures=True)
+            if broken:
+                self._build_serial(remaining, encoding, stop)
         finally:
             shutil.rmtree(scratch_dir, ignore_errors=True)
 
@@ -381,25 +484,34 @@ class ViewerIndex:
         connection.execute("DELETE FROM lines WHERE file_id=?", (file_id,))
         connection.execute("DELETE FROM blocks WHERE file_id=?", (file_id,))
         connection.execute("DELETE FROM block_stats WHERE file_id=?", (file_id,))
+        connection.execute("DELETE FROM block_folds WHERE file_id=?", (file_id,))
         connection.execute("UPDATE files SET status='indexing',line_count=0,indexed_bytes=0,counts='{}',error=NULL,"
-                           "encoding=NULL,encoding_fallback=0,degraded_lines=0,degraded_sample='[]' WHERE id=?", (file_id,))
+                           "encoding=NULL,encoding_fallback=0,degraded_lines=0,degraded_sample='[]',"
+                           "live=0,snapshot='',summary='{}' WHERE id=?", (file_id,))
         connection.commit()
         self.progress[file_id] = (0, 0)
         return row
 
     @staticmethod
     def _finish_file(connection, file_id: int, meta: dict) -> None:
-        """Same transaction as the rows: full-text rows, statistics, ready state."""
+        """Same transaction as the rows: full-text rows, folds, statistics, ready state."""
         connection.execute("INSERT INTO line_search(rowid, body) SELECT id, body FROM lines WHERE file_id=?", (file_id,))
+        # Only fingerprints that repeat; the list shows their first block with the count.
+        connection.execute(
+            "INSERT INTO block_folds(file_id,fingerprint,first_line,last_line,count) "
+            "SELECT file_id,fingerprint,MIN(start_line),MAX(start_line),COUNT(*) FROM blocks "
+            "WHERE file_id=? AND fingerprint<>'' GROUP BY fingerprint HAVING COUNT(*)>1", (file_id,))
         block_counts = meta["block_counts"]
         connection.execute("INSERT OR REPLACE INTO block_stats VALUES(?,?,?)",
                            (file_id, sum(block_counts.get(key, 0) for key in CATEGORIES), json.dumps(block_counts)))
         connection.execute(
             "UPDATE files SET status='ready',encoding=?,sha256=?,line_count=?,indexed_bytes=?,counts=?,"
-            "encoding_fallback=?,degraded_lines=?,degraded_sample=? WHERE id=?",
+            "encoding_fallback=?,degraded_lines=?,degraded_sample=?,live=?,snapshot=?,summary=? WHERE id=?",
             (meta["encoding"], meta["sha256"], meta["line_count"], meta["byte_count"], json.dumps(meta["counts"]),
              int(meta["encoding_fallback"]), meta["decode_degraded_line_count"],
-             json.dumps(meta["decode_degraded_lines"]), file_id),
+             json.dumps(meta["decode_degraded_lines"]), int(meta["live"]),
+             json.dumps(meta["snapshot"]) if meta["snapshot"] else "",
+             json.dumps(meta["summary"], ensure_ascii=False), file_id),
         )
 
     def _build_file(self, file_id: int, encoding: str, stop: threading.Event | None) -> None:
@@ -413,16 +525,21 @@ class ViewerIndex:
 
             # One transaction for the whole file: a failure or stop rolls back
             # every row, so a file is either complete and ready or absent.
-            meta = parse_into(connection, file_id, path, encoding, self.rules, stop, progress)
+            meta = parse_file(connection, file_id, path, encoding, self.rules, stop, progress, self.snapshot)
             if meta is None:
                 connection.rollback()
                 connection.execute("UPDATE files SET status='queued' WHERE id=?", (file_id,))
                 return
-            if _stamp(path) != row["stamp"]:
+            if not meta["live"] and _stamp(path) != row["stamp"]:
                 raise ValueError("源文件自任务创建后发生变化，请重新索引")
             self._finish_file(connection, file_id, meta)
 
+    def describe(self, path: str | Path) -> SessionName:
+        """Session of a workspace file, honouring sidecar logs attached by time."""
+        return self.overrides.get(str(path)) or describe(Path(path))
+
     def catalog(self) -> list[dict]:
+        """Workspace files, newest session first; live/writing state is explicit."""
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT f.*,coalesce(b.block_count,0) AS block_count,coalesce(b.counts,'{}') AS block_counts "
@@ -441,26 +558,42 @@ class ViewerIndex:
             item["block_counts"] = json.loads(item["block_counts"])
             item["degraded_sample"] = json.loads(item["degraded_sample"] or "[]")
             item["encoding_fallback"] = bool(item["encoding_fallback"])
-            item["kind"] = _kind(Path(item["path"]))
-            name = describe(Path(item["path"]))
+            item["live"] = bool(item["live"])
+            item["snapshot"] = json.loads(item["snapshot"]) if item["snapshot"] else None
+            item["summary"] = json.loads(item["summary"] or "{}")
+            name = self.describe(item["path"])
+            item["kind"] = ROLE_LABELS[name.role] if name.role != "unrecognized" else _kind(Path(item["path"]))
             item.update(session=name.key, session_label=name.label, session_directory=name.directory,
-                        role=name.role)
+                        role=name.role, mtime_ns=json.loads(item["stamp"])[3])
+            # Revit still holds the file open for writing right now (read-only probe).
+            item["writing"] = held_for_writing(item["path"])
             try:
                 item["source_changed"] = _stamp(Path(item["path"])) != item["stamp"]
             except OSError:
                 item["source_changed"] = True
             result.append(item)
-        result.sort(key=lambda item: sort_key(Path(item["path"])))
-        return result
+        return recency_sort(result, lambda item: (self.describe(item["path"]), item["mtime_ns"]))
+
+    def _cer(self) -> list[dict]:
+        if self._cer_logs is None:
+            self._cer_logs = cer_logs(self.local_appdata)
+        return self._cer_logs
 
     def sessions(self, catalog: list[dict] | None = None) -> list[dict]:
-        """Indexed files and sidecars (empty/binary/duplicate) grouped by Revit session."""
+        """Workspace grouped by Revit session (newest first), with the session
+        summary, sidecar logs and session-level findings (all candidates)."""
         catalog = self.catalog() if catalog is None else catalog
         groups: dict[str, dict] = {}
-        members = [(Path(item["path"]), "file", item) for item in catalog]
-        members += [(Path(item["path"]), "sidecar", item) for item in self.sidecars]
-        for path, kind, item in sorted(members, key=lambda member: sort_key(member[0])):
-            name = describe(path)
+        # Session order follows the catalog (newest indexed file first); sessions
+        # made only of sidecars (e.g. an empty dump.NNNN.txt) by their own time.
+        with_files = {self.describe(item["path"]).key for item in catalog}
+        members = [(item, "file") for item in catalog] + [(item, "sidecar") for item in self.sidecars]
+        ordered = recency_sort(members, lambda member: (
+            self.describe(member[0]["path"]),
+            0 if member[1] == "sidecar" and self.describe(member[0]["path"]).key in with_files
+            else member[0].get("mtime_ns", 0)))
+        for item, kind in ordered:
+            name = self.describe(item["path"])
             group = groups.setdefault(name.key, {
                 "session": name.key, "label": name.label, "directory": name.directory,
                 "recognized": name.role != "unrecognized", "files": [], "sidecars": [],
@@ -473,7 +606,47 @@ class ViewerIndex:
                 if item["status"] == "binary":
                     group["dump_count"] += 1
                     group["dump_bytes"] += item["size"]
+        by_id = {item["id"]: item for item in catalog}
+        for group in groups.values():
+            self._summarize(group, [by_id[file_id] for file_id in group["files"]])
         return list(groups.values())
+
+    def _summarize(self, group: dict, files: list[dict]) -> None:
+        main = next((item for item in files if item["role"] == "main"), files[0] if files else None)
+        group["main"] = main["path"] if main else None
+        group["writing"] = any(item["writing"] for item in files)
+        group["live"] = group["writing"] or bool(main and main["live"])
+        summary = main["summary"] if main and main["status"] == "ready" else {}
+        group["summary"] = summary
+        sidecars = []
+        for item in files:
+            if item["role"] == "worker":
+                sidecars.append({"kind": "worker", "path": item["path"], "size": item["size"],
+                                 "line_count": item["line_count"], "status": item["status"]})
+            elif item["role"] == "steel_log":
+                entries = []
+                try:
+                    entries = parse_steel_log(Path(item["path"]))
+                except (OSError, ValueError, LookupError):
+                    pass
+                window = session_window(Path(main["path"])) if main else None
+                basis = match_steel_log(Path(item["path"]), entries, window) if window else ""
+                sidecars.append({"kind": "steel_log", "path": item["path"], "size": item["size"],
+                                 "entries": entries, "basis": BASIS_TEXT.get(basis, "同一Revit版本，按时间关联")})
+        for item in group["sidecars"]:
+            sidecars.append({"kind": "dump" if item["status"] == "binary" else item["status"],
+                             "path": item["path"], "size": item["size"], "status": item["status"],
+                             "duplicate_of": item.get("duplicate_of")})
+        if summary and main:
+            sidecars.extend(match_cer(summary, revit_year(Path(main["path"])), self._cer()))
+        group["sidecar_logs"] = sidecars
+        if summary.get("recording_started"):  # only real session journals have an end state
+            group["end_state"] = end_state(summary, group["live"])
+            group["end_state_label"] = END_STATES[group["end_state"]]
+            group["session_findings"] = session_findings(summary, group["live"], sidecars, main["path"])
+        else:
+            group["end_state"] = group["end_state_label"] = None
+            group["session_findings"] = []
 
     def _ready(self, connection, file_id):
         if file_id not in self.file_ids:
@@ -537,19 +710,46 @@ class ViewerIndex:
             values.extend([pattern, pattern])
         return where, values
 
-    def blocks(self, file_id: int, category: str = "all", query: str = "", after: int = 0, limit: int = 50, *, addin_prefix: str = "") -> dict:
-        """Page by entire event; FTS hits anywhere inside it select the event once."""
+    def blocks(self, file_id: int, category: str = "all", query: str = "", after: int = 0, limit: int = 50, *,
+               addin_prefix: str = "", phase: str = "all", fold: bool = False) -> dict:
+        """Page by entire event; FTS hits anywhere inside it select the event once.
+        fold: blocks with the same fingerprint (same category and content apart
+        from timestamps/counters) are listed once, at their first occurrence,
+        with fold_count; a keyword search never folds."""
         if category != "all" and category not in BLOCK_FILTERS:
             raise ValueError("未知分类")
+        if phase != "all" and phase not in PHASES:
+            raise ValueError("未知阶段")
         if not 1 <= limit <= 200 or after < 0 or len(query) > 256 or len(addin_prefix) > 256:
             raise ValueError("分页或搜索参数超出范围")
         addin_prefix = addin_prefix.strip()
         where, values = self._block_conditions(file_id, category, after, addin_prefix)
+        if phase != "all":
+            where.append("b.phase=?")
+            values.append(phase)
         with self.connect() as connection:
             self._ready(connection, file_id)
             if query.strip():
                 phrase = '"' + query.strip().replace('"', '""') + '"*'
-                rows = self._search_blocks(connection, file_id, category, phrase, after, limit + 1, addin_prefix)
+                rows = self._search_blocks(connection, file_id, category, phrase, after, limit + 1, addin_prefix,
+                                           phase)
+            elif fold and phase == "all":
+                # Precomputed groups are exact here: category and add-in fields are
+                # part of the content, so every filter keeps or drops a group whole.
+                rows = connection.execute(
+                    "SELECT b.*,coalesce(f.count,1) AS fold_count,f.last_line AS fold_last_line FROM blocks b "
+                    "LEFT JOIN block_folds f ON f.file_id=b.file_id AND f.fingerprint=b.fingerprint WHERE "
+                    + " AND ".join(where) + " AND (f.first_line IS NULL OR f.first_line=b.start_line) "
+                    "ORDER BY b.start_line LIMIT ?", [*values, limit + 1]).fetchall()
+            elif fold:
+                # The same content can occur in several phases: fold within the filter.
+                inner = [condition for condition in where if condition != "b.start_line>?"]
+                inner_values = [value for value, condition in zip(values, where) if condition != "b.start_line>?"]
+                rows = connection.execute(
+                    "SELECT * FROM (SELECT b.*,COUNT(*) OVER w AS fold_count,MIN(b.start_line) OVER w AS fold_first,"
+                    "MAX(b.start_line) OVER w AS fold_last_line FROM blocks b WHERE " + " AND ".join(inner)
+                    + " WINDOW w AS (PARTITION BY b.fingerprint)) WHERE start_line=fold_first AND start_line>? "
+                    "ORDER BY start_line LIMIT ?", [*inner_values, after, limit + 1]).fetchall()
             else:
                 rows = connection.execute("SELECT b.* FROM blocks b WHERE " + " AND ".join(where)
                                           + " ORDER BY b.start_line LIMIT ?", [*values, limit + 1]).fetchall()
@@ -557,9 +757,34 @@ class ViewerIndex:
         return {"items": items, "has_more": len(rows) > limit,
                 "next_after": items[-1]["start_line"] if items else after}
 
+    def fold_members(self, file_id: int, fingerprint: str, limit: int = 50) -> dict:
+        """Start lines of every block sharing a fingerprint (expanding a folded entry)."""
+        with self.connect() as connection:
+            self._ready(connection, file_id)
+            total = connection.execute("SELECT COUNT(*) FROM blocks WHERE file_id=? AND fingerprint=?",
+                                       (file_id, fingerprint)).fetchone()[0]
+            lines = [row[0] for row in connection.execute(
+                "SELECT start_line FROM blocks WHERE file_id=? AND fingerprint=? ORDER BY start_line LIMIT ?",
+                (file_id, fingerprint, limit))]
+        return {"count": total, "start_lines": lines, "truncated": total > len(lines)}
+
+    def tail_blocks(self, file_id: int, limit: int = 20, categories=("operation", "dialog")) -> list[dict]:
+        """The last operations and dialogs before the journal ends, in file order.
+        Jrn.Directive settings records are left out: Revit writes them itself."""
+        if not 1 <= limit <= 200:
+            raise ValueError("分页或搜索参数超出范围")
+        with self.connect() as connection:
+            self._ready(connection, file_id)
+            rows = connection.execute(
+                f"SELECT * FROM blocks WHERE file_id=? AND category IN ({','.join('?' * len(categories))}) "
+                "AND title NOT LIKE 'Jrn.Directive%' ORDER BY start_line DESC LIMIT ?",
+                (file_id, *categories, limit)).fetchall()
+        return [self._block_dict(row) for row in reversed(rows)]
+
     @staticmethod
-    def _search_blocks(connection, file_id, category, phrase, after, limit, addin_prefix=""):
+    def _search_blocks(connection, file_id, category, phrase, after, limit, addin_prefix="", phase="all"):
         condition, value = block_filter(category)
+        phase_sql, phase_values = (" AND b.phase=?", [phase]) if phase != "all" else ("", [])
         first = connection.execute("SELECT id FROM lines WHERE file_id=? AND line_number>? "
                                    "ORDER BY line_number LIMIT 1", (file_id, after)).fetchone()
         if first is None:
@@ -568,11 +793,11 @@ class ViewerIndex:
         if addin_prefix:
             where, values = ViewerIndex._block_conditions(file_id, category, after, addin_prefix)
             return connection.execute(
-                "SELECT b.* FROM blocks b WHERE " + " AND ".join(where)
+                "SELECT b.* FROM blocks b WHERE " + " AND ".join(where) + phase_sql
                 + " AND EXISTS (SELECT 1 FROM lines l INDEXED BY lines_position WHERE l.file_id=b.file_id "
                 "AND l.line_number BETWEEN b.start_line AND b.end_line AND l.id IN "
                 "(SELECT rowid FROM line_search WHERE line_search MATCH ? AND rowid>=? AND rowid<=?)) "
-                "ORDER BY b.start_line LIMIT ?", [*values, phrase, first[0], last_id, limit],
+                "ORDER BY b.start_line LIMIT ?", [*values, *phase_values, phrase, first[0], last_id, limit],
             ).fetchall()
         cursor, result, previous = first[0] - 1, [], None
         while True:
@@ -589,11 +814,12 @@ class ViewerIndex:
                     # For a common word and a small category, test only those
                     # blocks instead of mapping every matching ordinary line.
                     return connection.execute(
-                        f"SELECT b.* FROM blocks b WHERE b.file_id=? AND {condition} AND b.start_line>? "
+                        f"SELECT b.* FROM blocks b WHERE b.file_id=? AND {condition} AND b.start_line>?{phase_sql} "
                         "AND EXISTS (SELECT 1 FROM lines l INDEXED BY lines_position WHERE l.file_id=b.file_id "
                         "AND l.line_number BETWEEN b.start_line AND b.end_line AND l.id IN "
                         "(SELECT rowid FROM line_search WHERE line_search MATCH ? AND rowid>? AND rowid<=?)) "
-                        "ORDER BY b.start_line LIMIT ?", (file_id, value, after, phrase, cursor, last_id, limit),
+                        "ORDER BY b.start_line LIMIT ?", (file_id, value, after, *phase_values, phrase, cursor,
+                                                          last_id, limit),
                     ).fetchall()
             for hit in hits:
                 if previous is not None and previous["start_line"] <= hit["line_number"] <= previous["end_line"]:
@@ -602,7 +828,8 @@ class ViewerIndex:
                     "SELECT * FROM blocks WHERE file_id=? AND start_line<=? ORDER BY start_line DESC LIMIT 1",
                     (file_id, hit["line_number"]),
                 ).fetchone()
-                if previous and previous["start_line"] > after and matches_filter(previous, category):
+                if (previous and previous["start_line"] > after and matches_filter(previous, category)
+                        and (phase == "all" or previous["phase"] == phase)):
                     result.append(previous)
                     if len(result) >= limit:
                         return result

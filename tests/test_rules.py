@@ -122,6 +122,21 @@ GATE_SAMPLES = [
     # IGNORECASE also matches i/s/k with U+0130, U+0131, U+017F and U+212A.
     "Exceptıon: dotless i", "EXCEPTİON: dotted I", "Aſſertion failed: long s", "dbg_errOr:", "mıssıng esschema",
     "ExceptıonCode=0x1", "file not ſaved", "Fatal errOR", "API_ERRORK", "outofmemoryexception",
+    # J14 rules: constructed fragments in the observed formats (no real Journal lines).
+    "'C 01-Jan-2026 09:00:00.000;   0:< LicenseUpd(2) Adlsdk Error:(9) vendor:EXAMPLE",
+    "' 0:< LicenseUpd(3) renewal Error reported", "' 0:< LicenseUpd(1)  ", "' 0:< License initialization complete",
+    "  'C 01-Jan-2026 09:00:01.000;   3:< Load exception \"CSyntheticException\", code=7: synthetic file is damaged",
+    "DBG_INFO: openFromModelPath did not complete.: line 1 of synthetic.cpp.",
+    "' 1.000000     3:<<exceptionsInOnOpenDocument reportSaveLoadException bSaving=no [C:\\demo\\model.rvt]",
+    "' 2.000000   2:<<FormOrAbandon::openFromModelPath [C:\\demo\\model.rvt]", "Load exception without quote",
+    "' 1:< API_ERROR {  System.Exception exception(synthetic) was thrown from a handler of Demo event. "
+    "The API event handler was registered by application Steel Connections DB extension (00000000-0000). }",
+    "SQLLocalDB instance is malfunctioning", "sqllocaldb instance is MALFUNCTIONING here",
+    "' 0:< API_SUCCESS { Registering DocumentCreating event by application Steel Connections DB extension (0000). }",
+    "' 0:< API_ERROR { : Assembly version conflict in some references in Demo.Plugin.dll assembly",
+    "'Addin's module Demo.Core of version 2.0.0.0 conflicts with same preloaded module of version 1.0.0.0 }",
+    "  ' 1:< 错误: 不满足约束", "' 2:< Error: Can't create Demo. - 3 times", "    ' 1:< ERROR : spaced prompt",
+    "' 0:< see Error: not a prompt", "' 1:< Warning: not an error prompt",
 ]
 FUZZ_TOKENS = [
     "DBG_ERROR", "DBG_WARN", "API_ERROR", "API_SUCCESS", "ERROR", "Error", "错误", "Exception", "System.Exception",
@@ -133,6 +148,10 @@ FUZZ_TOKENS = [
     "Missing ESSchema", "fatal error", "unrecoverable error", "unhandled exception", "access violation",
     "无法恢复的错误", "致命错误", "未处理的异常", "访问冲突", "' 0:< ", ">", "]", ":", "：", "=", " = ", "{", "0x1",
     "0x0", " ", ".", "_", "x", "123", "Synthetic.",
+    "Adlsdk Error", "LicenseUpd(1)", "LicenseUpd(", "Load exception \"", "openFromModelPath did not complete",
+    "exceptionsInOnOpenDocument", "SQLLocalDB instance is malfunctioning", " exception ",
+    "registered by application Steel Connections DB extension", "Assembly version conflict in", "' 1:< ",
+    "' 3:< ", "错误:", "Error:",
 ]
 LOOKALIKES = {"i": ["ı", "İ"], "s": ["ſ"], "k": ["K"]}
 

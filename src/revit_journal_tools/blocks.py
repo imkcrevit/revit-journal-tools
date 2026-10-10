@@ -5,6 +5,7 @@ lines, timestamp records, API braces and VB continuation markers are evidence
 for boundaries. Source lines remain independently addressable in the index.
 """
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 
@@ -13,7 +14,7 @@ from .reader import JournalLine
 from .loading import START_GATE, LoadingEvidence, is_addin_start
 from .rules import fold
 
-BLOCK_VERSION = "blocks-3-addin-list"
+BLOCK_VERSION = "blocks-5-phase-fold"
 _TIMESTAMP = re.compile(r"^\s*'[A-Z]\s+\d{1,2}-[A-Za-z]+-\d{4}\s+[\d:.]+;\s*(.*)")
 _PREFIX = re.compile(r"^\s*'\s*(?:\d+:<\s*)?")
 _API = re.compile(r"\bAPI_(ERROR|SUCCESS|INFO)\s*([{:])", re.I)
@@ -38,10 +39,42 @@ _STRONG_GATE = ("error", "exceptioncode", "assertion failed")
 _NATIVE_GATE = ("exception",)
 _NATIVE_CODE_GATE = ("exceptioncode",)
 _EXCEPTION_GATE = ("Exception", "Error")
+_NORMALIZE = re.compile(r"^\s*'(?:[A-Z]\s+\d{1,2}-[A-Za-z]+-\d{4}\s+[\d:.]+;)?\s*(?:\d+\.\d+\s+)?(?:\d+:<+\s*)?")
+_REPEATS = re.compile(r"\s*-\s*\d+\s+times\s*$")
+PHASES = {
+    "startup": "启动", "licensing": "许可", "addin_loading": "Add-in加载", "document_open": "打开文档",
+    "interactive": "交互操作", "shutdown": "退出",
+}
+_JOINED_TITLE = 300  # a list title; the full record stays in the lines table
+_LICENSING_MARKS = ("license initialization", "licenseupd(", "adlsdk")
+_OPEN_COMMANDS = ("id_revit_file_open", "id_file_new_choose_template", "id_family_new", "id_appmenu_project_open",
+                  "id_family_open")
+# Records Revit writes on its own: settings and header data ('H records),
+# add-in events, answers to dialogs and the automatic first ribbon tab.
+_PASSIVE_JRN = re.compile(r"^\s*Jrn\.(?:Directive|AddInEvent|Data\b|RibbonEvent\s*\"TabActivated:)")
 
 
 def payload(text: str) -> str:
     return _PREFIX.sub("", text).strip()
+
+
+def normalized(text: str) -> str:
+    """Line content for fold fingerprints: no timestamp, level prefix or repeat counter."""
+    text = _NORMALIZE.sub("", text, count=1)
+    if "times" in text:
+        text = _REPEATS.sub("", text)
+    return text.strip()
+
+
+def normalized_from(text: str, content: str) -> str:
+    """normalized(text) given content == payload(text), skipping the regex when
+    the payload cannot start with a timestamp, elapsed time or extra '<'."""
+    first = content[:1]
+    if first and (first.isdigit() or first == "<" or (first.isupper() and content[1:2].isspace())):
+        return normalized(text)
+    if "times" in content:
+        return _REPEATS.sub("", content).strip()
+    return content
 
 
 @dataclass
@@ -60,6 +93,8 @@ class JournalBlock:
     addin_name: str = ""
     addin_class: str = ""
     addin_identity_truncated: bool = False
+    phase: str = ""
+    fingerprint: str = ""
 
 
 class BlockBuilder:
@@ -75,6 +110,32 @@ class BlockBuilder:
         self.native_pending = False
         self.native_code = False
         self.loading = LoadingEvidence()
+        self.phase = "startup"
+        self._digest = None
+
+    def _open(self, line: JournalLine, category: str, boundary: str) -> None:
+        self.current = JournalBlock(line.number, line.number, category, boundary=boundary, phase=self.phase)
+        self._digest = hashlib.blake2b(digest_size=8)
+
+    def _advance_phase(self, text: str, folded: str, command, addin_start: bool) -> None:
+        """Session phase from explicit markers; a reading aid, not a diagnosis."""
+        phase = self.phase
+        if phase == "shutdown":
+            return
+        has = folded.__contains__
+        # Spelled out instead of any(map(...)): this runs on every line.
+        if ("exitmanagedinstance" in folded or "finished recording journal file" in folded
+                or "journal exit" in folded or "license shutdown starting" in folded):
+            self.phase = "shutdown"
+        elif "openfrommodelpath" in folded or (command and any(map(has, _OPEN_COMMANDS))):
+            self.phase = "document_open"
+        elif command and not _PASSIVE_JRN.match(text):
+            # A user action ends start-up; answering the open dialog (Jrn.Data) does not end opening.
+            self.phase = "interactive"
+        elif phase == "startup" and any(map(has, _LICENSING_MARKS)):
+            self.phase = "licensing"
+        elif phase in ("startup", "licensing") and addin_start:
+            self.phase = "addin_loading"
 
     def _flush(self, complete: bool = True) -> list[JournalBlock]:
         if self.current is None:
@@ -85,6 +146,10 @@ class BlockBuilder:
         block.addin_name = self.loading.name
         block.addin_class = self.loading.class_name
         block.addin_identity_truncated = self.loading.identity_truncated
+        # Same category and same content apart from timestamps, level prefixes
+        # and "- N times" counters: the list folds such blocks into one entry.
+        block.fingerprint = hashlib.blake2b(block.category.encode() + b"\0" + self._digest.digest(),
+                                            digest_size=8).hexdigest()
         self.current = None
         self.kind = ""
         self.api_depth = 0
@@ -102,9 +167,15 @@ class BlockBuilder:
         block = self.current
         assert block is not None
         block.end_line = line.number
+        if content is None:
+            content = payload(line.text)
+        self._digest.update(normalized_from(line.text, content).encode("utf-8", "surrogatepass") + b"\n")
         self.loading.feed(line.number, line.text, folded)
         if block.category == "other" and category != "other":
             block.category = category
+        elif category == "dialog" and block.category == "operation":
+            # Jrn.Data  _ whose continuation names "TaskDialogResult": the dialog's answer.
+            block.category = "dialog"
         if severity and SEVERITY_RANK.get(severity, 0) > SEVERITY_RANK.get(block.severity, 0):
             block.severity = severity
         if rules:
@@ -115,6 +186,11 @@ class BlockBuilder:
             if content:
                 block.title = content[:700]
                 block.title_line = line.number
+        elif self.continued and block.title.endswith("_") and len(block.title) < _JOINED_TITLE:
+            # "Jrn.Data  _" says nothing; the continuation lines name the record.
+            if content is None:
+                content = payload(line.text)
+            block.title = (block.title[:-1].rstrip() + " " + content)[:_JOINED_TITLE]
 
     def feed(self, line: JournalLine, classification: tuple[str, str, str]) -> list[JournalBlock]:
         category, severity, rules = classification
@@ -133,6 +209,10 @@ class BlockBuilder:
         strong = any(map(has, _STRONG_GATE)) and bool(_STRONG_ERROR.search(content))
         addin_start = any(map(has, START_GATE)) and is_addin_start(text, folded)
         native_start = any(map(has, _NATIVE_GATE)) and bool(_NATIVE_START.search(text))
+        self._advance_phase(text, folded, command, addin_start)
+        if self.pending_timestamp and self.current is not None:
+            # The empty timestamp record belongs to the command it introduces.
+            self.current.phase = self.phase
         blank = not content
         result: list[JournalBlock] = []
 
@@ -162,7 +242,7 @@ class BlockBuilder:
 
         if timestamp:
             result += self._flush()
-            self.current = JournalBlock(line.number, line.number, category, boundary="timestamp")
+            self._open(line, category, "timestamp")
             self.kind = "paragraph"
             self._add(line, category, severity, rules, content, folded)
             self.native_pending = native_start or native_code
@@ -178,7 +258,7 @@ class BlockBuilder:
 
         if blank:
             if self.current is None:
-                self.current = JournalBlock(line.number, line.number, "other", boundary="blank")
+                self._open(line, "other", "blank")
                 self.kind = "blank"
             self._add(line, category, severity, rules, content, folded)
             if self.kind != "blank":
@@ -206,6 +286,8 @@ class BlockBuilder:
             category = "system"
         elif addin_start:
             boundary = "addin_load"
+        elif category == "dialog":
+            boundary = "dialog"
         elif category in {"error", "api_error", "warning"} and not error_followup:
             boundary = "error_record"
 
@@ -219,7 +301,7 @@ class BlockBuilder:
                 result += self._flush()
 
         if self.current is None:
-            self.current = JournalBlock(line.number, line.number, category, boundary=boundary)
+            self._open(line, category, boundary)
             self.kind = boundary
         elif self.pending_timestamp:
             if category != "other":
