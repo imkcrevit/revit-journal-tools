@@ -51,6 +51,19 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(report.ungrouped_match_count, 1)
         self.assertEqual(len(report.warnings), 2)
 
+    def test_per_group_limit_keeps_later_distinct_candidates(self):
+        # Observed shape: one renderer error line repeated >100,000 times before the crash.
+        text = "USD: Runtime Error: GL error\n" * 50 + "DBG_ERROR: later and different\n"
+        plain = self.scan(text, max_findings=5, context=0)
+        self.assertEqual([finding.line_number for finding in plain.findings], [1, 2, 3, 4, 5])
+        limited = self.scan(text, max_findings=5, context=0, max_per_group=1)
+        self.assertEqual([finding.line_number for finding in limited.findings], [1, 51])
+        self.assertEqual((limited.matched_line_count, limited.omitted_finding_count), (51, 49))
+        self.assertEqual(limited.groups[0].count, 50)
+        self.assertEqual(limited.retention_policy, "severity_then_first,max_per_group=1")
+        with self.assertRaises(ValueError):
+            ScanOptions(max_per_group=-1)
+
     def test_distinct_element_ids_do_not_merge(self):
         report = self.scan("DBG_WARN: element 123\nDBG_WARN: element 456\n")
         self.assertEqual(len(report.groups), 2)

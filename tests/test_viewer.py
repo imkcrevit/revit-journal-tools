@@ -103,7 +103,7 @@ class IndexTests(unittest.TestCase):
 
     def test_degraded_decode_is_indexed_with_line_flags(self):
         bad = self.root / "bad.txt"
-        bad.write_bytes(b"normal\n" * 6000 + b"DBG_ERROR: \xff")
+        bad.write_bytes(b"normal\n" * 6000 + b"DBG_ERROR: \x81")
         with patch("revit_journal_tools.reader.system_fallback_encoding", return_value="gb18030"):
             queued = self.index.register([bad], "auto")
             self.index.build(queued, "auto")
@@ -111,7 +111,7 @@ class IndexTests(unittest.TestCase):
         self.assertEqual((file["status"], file["encoding"], file["encoding_fallback"]), ("ready", "gb18030", True))
         self.assertEqual((file["degraded_lines"], file["degraded_sample"]), (1, [6001]))
         last = self.index.events(queued[0], "error")["items"][0]
-        self.assertEqual((last["line_number"], last["text"], last["degraded"]), (6001, "DBG_ERROR: \\xff", 1))
+        self.assertEqual((last["line_number"], last["text"], last["degraded"]), (6001, "DBG_ERROR: \\x81", 1))
         self.assertEqual(self.index.context(queued[0], 6001, 0)["decode_degraded_line_count"], 1)
 
     def test_unknown_file_and_invalid_query_parameters(self):
@@ -274,9 +274,11 @@ class MixedEncodingIndexTests(unittest.TestCase):
         result = self.encodings()
         self.assertEqual(result["journal.0001.txt"], ("ready", "gb18030", 0))
         self.assertEqual(result["journal.0003.txt"], ("ready", "utf-8", 0))
-        # cp1252 bytes are not valid gb18030: indexed, degraded and visibly marked.
-        self.assertEqual(result["journal.0002.txt"][:2], ("ready", "gb18030"))
-        self.assertGreater(result["journal.0002.txt"][2], 0)
+        # cp1252 bytes are not valid gb18030 and do not read as Chinese: cp1252, not degraded.
+        self.assertEqual(result["journal.0002.txt"], ("ready", "cp1252", 0))
+        file = next(item for item in self.index.catalog() if item["name"] == "journal.0002.txt")
+        self.assertEqual(file["encoding_basis"], "candidate")
+        self.assertEqual(self.index.context(file["id"], 3, 0)["items"][0]["text"], "Diese Lizenz läuft")
 
     def test_cache_reuse_follows_the_encoding_actually_used(self, _):
         self.index.build(self.index.register(self.paths[:1], "auto"), "auto")
@@ -288,7 +290,7 @@ class MixedEncodingIndexTests(unittest.TestCase):
         # A different explicit codec or a different auto chain rebuilds.
         self.assertEqual(len(self.index.register(self.paths[:1], "cp1252")), 1)
         self.index.build(self.index.register(self.paths[:1], "auto"), "auto")
-        with patch("revit_journal_tools.reader.system_fallback_encoding", return_value="cp1252"):
+        with patch("revit_journal_tools.reader.system_fallback_encoding", return_value="cp1251"):
             self.assertEqual(len(self.index.register(self.paths[:1], "auto")), 1)
 
 

@@ -67,6 +67,8 @@
 | `revit.steel_localdb` | error | `SQLLocalDB instance is malfunctioning`；由`Steel Connections DB extension`注册的处理程序抛出的异常 | 同时查看会话摘要中的钢连接错误日志；修复工具RevitLocalDbFix |
 | `revit.addin_conflict` | warning | `Assembly version conflict in` | 多数情况下仍能加载；会话摘要按程序集聚合，列表折叠相同块 |
 | `revit.ui_warning` | warning，`tags: ["ui_warning"]` | 层级前缀后直接是`ERROR:`/`错误:`（`' 1:< 错误: 不满足约束`） | Revit显示给用户的建模提示，不是程序故障 |
+| `revit.crash_protection` | fatal | `unhandledExceptionFilter is executed`、`Exception occurred during Revit crash protection`、`Id : TaskDialog_Fatal_Error_Occured`、`SLOG $… >Crash` | Revit崩溃路径上的标记；致命错误对话框按Id识别，与界面语言无关。会话摘要的“异常与崩溃”列出异常代码（含标准含义，如`0xe0434352`为.NET托管异常、`0x80000003`为断点/内部断言）与异常前最后的`Jrn.Command`，会话级候选为`session.crash` |
+| `revit.cef_init_failed` | error | `CEF failed to initialize` | 内嵌浏览器初始化失败，下一行通常写明原因；在一个启动阶段崩溃的案例中随后出现.NET异常 |
 
 `generic.error_marker`排除上述界面提示与`Adlsdk Error`，因此“错误: 不满足约束”“Error: Can't create Railings”不再进入“错误”分类。本机全部Journal中带层级前缀的`ERROR:`/`错误:`行都是这类建模提示（栏杆、约束、尺寸标注、族载入、锁定图元等）；其他位置的错误标记照旧为error。同一`API_ERROR`记录上的Add-in冲突或钢连接命中与`revit.api_error`一起保留，不被API错误掩盖。
 

@@ -61,8 +61,9 @@ revit-journal browse cases/inbox --recursive --category addin_third_party
 revit-journal browse journal.0001.txt --category addin
 revit-journal browse journal.0001.txt --addin-prefix ATFTranslationServer
 
-# 英文系统产生的cp1252文件与本机文件混在一起时，按顺序尝试候选编码
-revit-journal browse cases/inbox --recursive --encoding utf-8,gb18030,cp1252
+# 其他语言系统产生的Journal（如德文系统的cp1252）：auto逐文件判定并显示依据；判错时再显式指定
+revit-journal browse cases/inbox --recursive
+revit-journal browse journal.0076.txt --encoding cp1252
 
 # 用人工样例检查官方、第三方、来源缺失和加载失败
 revit-journal browse examples/addin-loading.journal.txt
@@ -164,11 +165,11 @@ revit-journal rules
 
 每个展示行最多保存4096个字符，超出时标记`text_truncated`。识别会检查整行，匹配点附近的独立片段与列号仍会保留。默认单行上限为1,048,576字符，超限返回明确错误，可通过`--max-line-chars`调整，不会静默跳过后半行。
 
-`--encoding auto`（默认）逐文件判定编码：有BOM按BOM；否则先严格UTF-8，再严格尝试系统ANSI代码页的超集（中文Windows的cp936使用gb18030，西文Windows为cp1252）。同一批文件可以各自使用不同编码，报告、`browse --format json`和索引都记录每个文件实际使用的`encoding`、请求值`encoding_requested`以及是否回退`encoding_fallback`。
+`--encoding auto`（默认）逐文件判定编码：有BOM按BOM；否则先严格UTF-8；再按Journal头部声明的界面语言（`Actual language code=DEU`等：德、法、意、西、葡、荷为cp1252，波兰、捷克、匈牙利为cp1250，俄语cp1251，简体中文gb18030，繁体cp950，日文cp932，韩文cp949；英文ENU/ENG不说明系统代码页）；再依次尝试gb18030、系统ANSI代码页的超集与cp1252。gb18030几乎能“解码”任何字节，西文系统的cp1252文件也会被读成看似正常的汉字（如`Außenanlagen`变成`Au遝nanlagen`），因此只有解码后非ASCII字符中至少一半是常用汉字（GB2312）时才采用：本机95个真实中文Journal为0.83–1.0，上传的cp1252 Journal不超过0.003。同样，cp1252几乎能解码任何字节：内容像中文时，不会因为几个损坏字节改用cp1252，而是按gb18030退化解码并标记。同一批文件可以各自使用不同编码，报告、`browse --format json`和索引都记录每个文件实际使用的`encoding`、判定依据`encoding_basis`（如`language_code:DEU`、`chinese_text`）、请求值`encoding_requested`以及是否回退`encoding_fallback`；只有gb18030能解码但内容不像中文时标为“编码存疑”。
 
 所有候选编码都无法完整解码时，`auto`不再让整个文件失败，而是按最后一个候选读取：无法解码的字节以`\xNN`原样显示，该行标记为`decode_degraded`，文件级给出退化行数`decode_degraded_line_count`和前20个行号，并在报告注意事项中说明。退化行上的识别结果可能不完整，可改用正确的编码重试。字节不会被静默替换或丢弃，SHA-256仍按原始字节计算。
 
-显式指定单个编码（如`--encoding cp1252`）为严格模式：任何无法解码的字节都会使该文件读取失败，与旧版本一致。也可以给出逗号分隔的候选列表，例如`--encoding utf-8,gb18030,cp1252`，按顺序逐文件尝试，全部失败时同样按最后一个候选退化解码。cp1252与gb18030的字节无法可靠区分：在中文系统上用`auto`打开英文系统产生的cp1252文件时，通常会以gb18030退化解码并显式标记；混合来源的目录建议使用候选列表。疑似二进制（含NUL）、超长行或扫描期间变化的文件仍记为读取失败。优先提供已停止写入的Journal副本。
+显式指定单个编码（如`--encoding cp1252`）为严格模式：任何无法解码的字节都会使该文件读取失败，与旧版本一致。也可以给出逗号分隔的候选列表，例如`--encoding utf-8,gb18030,cp1252`，按顺序逐文件尝试（gb18030同样要通过常用汉字检查），全部失败时按最后一个候选退化解码。候选列表不使用Journal声明的界面语言。疑似二进制（含NUL）、超长行或扫描期间变化的文件仍记为读取失败。优先提供已停止写入的Journal副本。
 
 首批上传的英/德文案例使用CP1252可以严格解码；其中不换行空格、角度符号和德文变音字符不符合UTF-8。扫描这批案例时显式使用`--encoding cp1252`，该选择不代表以后上传的所有文件都使用同一编码。
 

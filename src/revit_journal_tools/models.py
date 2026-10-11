@@ -83,6 +83,8 @@ class ScanReport:
     # degraded decoding was needed, and which lines contain escaped bytes.
     encoding_requested: str = "auto"
     encoding_fallback: bool = False
+    # Why this encoding was chosen (reader.ENCODING_BASIS), e.g. "language_code:DEU".
+    encoding_basis: str = ""
     decode_degraded_line_count: int = 0
     decode_degraded_lines: list[int] = field(default_factory=list)
     # A journal Revit was still writing: the report covers a snapshot of it.

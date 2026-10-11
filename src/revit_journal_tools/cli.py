@@ -27,8 +27,8 @@ from .sidecars import attach_steel_logs, revit_year
 
 TEXT_SUFFIXES = {".txt", ".log", ".journal"}
 ENCODING_HELP = (
-    "auto（默认）逐文件判定：BOM→严格UTF-8→系统代码页的超集（cp936用gb18030）；"
-    "全部失败时按该编码读取，无法解码的字节以\\xNN显示并在报告中标记退化行。"
+    "auto（默认）逐文件判定：BOM→严格UTF-8→Journal声明的界面语言对应的代码页→gb18030（须像中文）"
+    "→系统代码页→cp1252，并记录判定依据；全部失败时无法解码的字节以\\xNN显示并在报告中标记退化行。"
     "单个编码（如cp1252）为严格模式；逗号分隔的列表（如utf-8,gb18030,cp1252）按顺序尝试"
 )
 
@@ -238,9 +238,10 @@ def _report(args, years: list[int], rules) -> int:
         _protect_inputs(target, protected)
     index = ViewerIndex(args.database, workers=args.jobs, snapshot=args.snapshot)
     index.build(index.register(planned, args.encoding), args.encoding)
-    # Keep enough candidates to pick one per repeat group after UI prompts are set aside.
+    # The report lists one finding per repeat group: retain one per group, and
+    # enough of them to fill the list after UI prompts are set aside.
     options = ScanOptions(encoding=args.encoding, context=args.context, min_severity=args.min_severity,
-                          max_findings=max(500, args.max_findings * 20))
+                          max_findings=max(500, args.max_findings * 20), max_per_group=1)
     data = collect(index, rules, options, args.snapshot, args.tail, args.max_findings)
     render = to_json if args.format == "json" else to_markdown
     text = render(data, generated=datetime.now(), redact=None if args.include_personal_info else Redactor.current())

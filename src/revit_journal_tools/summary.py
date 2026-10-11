@@ -19,8 +19,32 @@ _PID = re.compile(r"Session(\d+)_P0MainQueue")
 _OPEN_PATH = re.compile(r"openFromModelPath \[([^\]]*)\]")
 _CONFLICT = re.compile(r"Assembly version conflict in some references in (.+?) assembly")
 _DIALOG = re.compile(r"\bTaskDialog\s*\"(.*)\"\s*$")
+_USER_COMMAND = re.compile(r"^\s*Jrn\.Command\b")
+_EXCEPTION_CODE = re.compile(r"\bExceptionCode\s*=\s*(0x[0-9A-Fa-f]+)")
 _LIMIT = 20
 _TEXT = 300
+# Revit's own crash path, as written to the journal (observed in uploaded cases;
+# the fatal-error dialog is matched by its Id, which is the same in every UI language).
+CRASH_MARKS = {
+    "exception": "异常（Revit崩溃保护捕获）",
+    "exception_code": "异常代码",
+    "crash_protection_failed": "崩溃保护过程中再次异常",
+    "unhandled": "未处理异常（进程随后终止）",
+    "fatal_dialog": "致命错误对话框",
+    "crash_log": "崩溃记录（SLOG >Crash）",
+    "cef_failed": "内嵌浏览器CEF初始化失败",
+}
+# Standard Windows/.NET exception codes; the code says what kind of failure, not why.
+EXCEPTION_CODES = {
+    "0xe0434352": ".NET托管异常",
+    "0xe06d7363": "C++异常",
+    "0xc0000005": "访问冲突",
+    "0x80000003": "断点/内部断言（程序主动中断）",
+    "0xc00000fd": "栈溢出",
+    "0xc0000409": "快速失败/栈缓冲区溢出",
+    "0xc0000374": "堆损坏",
+    "0xc0000017": "内存不足",
+}
 
 END_STATES = {"clean": "正常结束", "no_clean_exit": "未正常结束（无结束标记：崩溃、被强制结束或仍未写完）",
               "live": "正在写入（会话尚未结束）"}
@@ -65,10 +89,55 @@ class SessionCollector:
         self.third_party: dict[str, int] = {}
         self.addin_failures: list[dict] = []
         self.phases: dict[str, int] = {}
+        self.last_command: dict | None = None
+        self.crash_marks: list[dict] = []
+        self.crash_counts: Counter[str] = Counter()
+        self._cef_detail = False
+
+    def _crash(self, number: int, text: str) -> None:
+        """Record one crash-path line; the first ones are kept with the command before them."""
+        kind = None
+        if "Exception occurred during Revit crash protection" in text:
+            kind = "crash_protection_failed"
+        elif "Exception occurred" in text:
+            kind = "exception"
+        elif "ExceptionCode" in text and _EXCEPTION_CODE.search(text):
+            kind = "exception_code"
+        elif "unhandledExceptionFilter is executed" in text:
+            kind = "unhandled"
+        elif "TaskDialog_Fatal_Error_Occured" in text:
+            kind = "fatal_dialog"
+        elif ">Crash" in text and "SLOG" in text:
+            kind = "crash_log"
+        elif "CEF failed to initialize" in text:
+            kind = "cef_failed"
+        if kind is None:
+            return
+        self.crash_counts[kind] += 1
+        if len(self.crash_marks) >= 3 * _LIMIT:
+            return
+        mark = {**_evidence(number, text), "kind": kind}
+        if kind == "exception_code":
+            code = _EXCEPTION_CODE.search(text).group(1).lower()
+            mark["code"] = code
+            mark["meaning"] = EXCEPTION_CODES.get(code, "")
+        if kind == "exception" and self.last_command:
+            mark["command"] = self.last_command
+        self.crash_marks.append(mark)
+        self._cef_detail = kind == "cef_failed"
 
     def feed(self, number: int, text: str, classification: tuple[str, str, str]) -> None:
         category, _, rules = classification
         self.last_lines.append((number, text[:_TEXT]))
+        if self._cef_detail:
+            # "CEF failed to initialize due to failure:" names the failure on the next line.
+            self._cef_detail = False
+            if text.startswith("'") and not _TIMESTAMP.match(text) and self.crash_marks:
+                self.crash_marks[-1]["detail"] = text.strip()[:_TEXT]
+        if "Jrn.Command" in text and _USER_COMMAND.match(text):
+            self.last_command = _evidence(number, text)
+        if "xception" in text or "rash" in text or "CEF failed" in text or "TaskDialog_Fatal" in text:
+            self._crash(number, text)
         if ";" in text and "'" in text:
             match = _TIMESTAMP.match(text)
             if match:
@@ -161,6 +230,7 @@ class SessionCollector:
             },
             "dialogs": {"count": self.dialog_count, "last": list(self.dialogs)},
             "steel_localdb": self.steel,
+            "crash": {"marks": self.crash_marks, "counts": dict(self.crash_counts)},
             "phases": [{"phase": phase, "label": PHASES[phase], "first_line": line}
                        for phase, line in sorted(self.phases.items(), key=lambda item: item[1])],
             "last_operations": list(self.operations), "last_dialogs": list(self.dialog_blocks),
@@ -216,6 +286,30 @@ def session_findings(summary: dict, live: bool, sidecars: list[dict], source: st
         add("session.steel_localdb", "error", "钢结构连接/LocalDB错误",
             "Steel Connections依赖SQL Server Express LocalDB；钢连接错误日志或Journal中有LocalDB/钢连接异常。"
             "可使用独立修复工具RevitLocalDbFix（不是Revit插件）检查和修复LocalDB实例。", evidence)
+    crash = summary.get("crash") or {}
+    marks = crash.get("marks") or []
+    if marks:
+        counts = crash.get("counts") or {}
+        severe = state == "no_clean_exit" or any(
+            counts.get(kind) for kind in ("crash_protection_failed", "unhandled", "fatal_dialog", "crash_log"))
+        first = marks[0]
+        parts = [f"第{first['line_number']}行起记录到{CRASH_MARKS[first['kind']]}"]
+        codes = list(dict.fromkeys(mark["code"] for mark in marks if mark.get("code")))
+        if codes:
+            parts.append("异常代码" + "、".join(
+                code + (f"（{EXCEPTION_CODES[code]}）" if code in EXCEPTION_CODES else "") for code in codes))
+        command = next((mark["command"] for mark in marks if mark.get("command")), None)
+        if command:
+            parts.append(f"异常前最后的命令在第{command['line_number']}行：{command['text']}")
+        if severe:
+            parts.append("随后出现致命错误、未处理异常或会话没有正常结束：Revit很可能在此崩溃")
+        evidence = ([{"source": source, **command}] if command else []) + [
+            {"source": source, "line_number": mark["line_number"],
+             "text": mark["text"] + (f" ← {mark['meaning']}" if mark.get("meaning") else "")
+             + (f" ← {mark['detail']}" if mark.get("detail") else "")} for mark in marks[:8]]
+        add("session.crash", "fatal" if severe else "error", "Revit异常与崩溃记录",
+            "；".join(parts) + "。异常代码只说明故障类别，不说明具体原因；请结合异常前的操作、dmp与CER日志判断。",
+            evidence)
     dumps = [item for item in sidecars if item.get("status") == "binary"]
     if dumps:
         add("session.crash_dump", "warning", "同一会话存在崩溃转储",

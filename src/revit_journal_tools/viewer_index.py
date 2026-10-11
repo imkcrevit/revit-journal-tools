@@ -18,13 +18,13 @@ from .categories import CATEGORIES, Categorizer
 from .blocks import BLOCK_VERSION, PHASES, BlockBuilder
 from .loading import BLOCK_FILTERS, block_filter, matches_filter
 from .live import Snapshot, held_for_writing, wants_snapshot
-from .reader import JournalReader, SourceChangedError, resolve_encoding
+from .reader import JournalReader, SourceChangedError, basis_label, resolve_encoding
 from .rules import load_rules, ruleset_digest
 from .summary import END_STATES, SessionCollector, end_state, session_findings
 from .sessions import ROLE_LABELS, InputFile, SessionName, describe, plan_inputs, recency_sort
 from .sidecars import BASIS_TEXT, cer_logs, match_cer, match_steel_log, parse_steel_log, revit_year, session_window
 
-INDEX_VERSION = "viewer-4:" + BLOCK_VERSION
+INDEX_VERSION = "viewer-5:" + BLOCK_VERSION
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
  id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
@@ -232,7 +232,7 @@ def _kind(path: Path) -> str:
 # Added after the first release; existing databases get them via ALTER TABLE.
 _FILE_COLUMNS = {
     "encoding_request": "TEXT", "encoding_requested": "TEXT",
-    "encoding_fallback": "INTEGER NOT NULL DEFAULT 0",
+    "encoding_fallback": "INTEGER NOT NULL DEFAULT 0", "encoding_basis": "TEXT NOT NULL DEFAULT ''",
     "degraded_lines": "INTEGER NOT NULL DEFAULT 0", "degraded_sample": "TEXT NOT NULL DEFAULT '[]'",
     "live": "INTEGER NOT NULL DEFAULT 0", "snapshot": "TEXT NOT NULL DEFAULT ''",
     "summary": "TEXT NOT NULL DEFAULT '{}'",
@@ -486,7 +486,7 @@ class ViewerIndex:
         connection.execute("DELETE FROM block_stats WHERE file_id=?", (file_id,))
         connection.execute("DELETE FROM block_folds WHERE file_id=?", (file_id,))
         connection.execute("UPDATE files SET status='indexing',line_count=0,indexed_bytes=0,counts='{}',error=NULL,"
-                           "encoding=NULL,encoding_fallback=0,degraded_lines=0,degraded_sample='[]',"
+                           "encoding=NULL,encoding_fallback=0,encoding_basis='',degraded_lines=0,degraded_sample='[]',"
                            "live=0,snapshot='',summary='{}' WHERE id=?", (file_id,))
         connection.commit()
         self.progress[file_id] = (0, 0)
@@ -506,9 +506,10 @@ class ViewerIndex:
                            (file_id, sum(block_counts.get(key, 0) for key in CATEGORIES), json.dumps(block_counts)))
         connection.execute(
             "UPDATE files SET status='ready',encoding=?,sha256=?,line_count=?,indexed_bytes=?,counts=?,"
-            "encoding_fallback=?,degraded_lines=?,degraded_sample=?,live=?,snapshot=?,summary=? WHERE id=?",
+            "encoding_fallback=?,encoding_basis=?,degraded_lines=?,degraded_sample=?,live=?,snapshot=?,summary=? "
+            "WHERE id=?",
             (meta["encoding"], meta["sha256"], meta["line_count"], meta["byte_count"], json.dumps(meta["counts"]),
-             int(meta["encoding_fallback"]), meta["decode_degraded_line_count"],
+             int(meta["encoding_fallback"]), meta["encoding_basis"], meta["decode_degraded_line_count"],
              json.dumps(meta["decode_degraded_lines"]), int(meta["live"]),
              json.dumps(meta["snapshot"]) if meta["snapshot"] else "",
              json.dumps(meta["summary"], ensure_ascii=False), file_id),
@@ -693,7 +694,8 @@ class ViewerIndex:
                 (file_id, max(1, line - radius), line + radius),
             ).fetchall()
         return {"line": line, "sha256": file["sha256"], "encoding": file["encoding"],
-                "encoding_fallback": bool(file["encoding_fallback"]),
+                "encoding_fallback": bool(file["encoding_fallback"]), "encoding_basis": file["encoding_basis"],
+                "encoding_basis_label": basis_label(file["encoding_basis"]),
                 "decode_degraded_line_count": file["degraded_lines"],
                 "source": file["path"], "items": [dict(row) for row in rows]}
 

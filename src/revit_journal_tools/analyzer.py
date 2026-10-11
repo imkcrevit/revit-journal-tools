@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .live import Snapshot, wants_snapshot
 from .models import Finding, FindingGroup, ScanReport, SEVERITY_RANK, SourceLine
-from .reader import JournalReader, SourceChangedError
+from .reader import JournalReader, SourceChangedError, basis_label
 from .rules import Rule, load_rules, match_rules, ruleset_digest
 
 
@@ -21,10 +21,16 @@ class ScanOptions:
     max_groups: int = 500
     max_excerpt_chars: int = 4096
     max_line_chars: int = 1_048_576
+    # 0 = no limit. With N, an exact-repeat group (same line text and rules)
+    # takes at most N retained findings, so one line repeated 100,000 times
+    # cannot push later, different candidates out; counts stay complete.
+    max_per_group: int = 0
 
     def __post_init__(self) -> None:
         if not 0 <= self.context <= 100:
             raise ValueError("context必须在0到100之间")
+        if self.max_per_group < 0:
+            raise ValueError("max_per_group不能小于0")
         if self.min_severity not in SEVERITY_RANK:
             raise ValueError("min_severity必须为warning、error或fatal")
         for name in ("max_findings", "max_groups", "max_excerpt_chars", "max_line_chars"):
@@ -43,11 +49,19 @@ def decoding_warnings(decoding: dict) -> list[str]:
             f"退化解码：所有候选编码都无法完整解码，按{decoding['encoding']}读取；"
             f"{count}行含无法解码的字节（第{lines}行{more}），这些字节以\\xNN原样显示，"
             "该行的识别结果可能不完整。可用--encoding指定正确编码后重试；"
-            "来源混合（如英文系统产生的cp1252文件）时可用--encoding utf-8,gb18030,cp1252。"
+            "其他语言系统产生的文件可指定其代码页（西欧cp1252、中欧cp1250、俄语cp1251）。"
+        )
+    elif decoding.get("encoding_basis") == "unlikely_chinese":
+        warnings.append(
+            f"编码存疑：只有{decoding['encoding']}能严格解码，但解码后的非ASCII字符大多不是常用中文字符，"
+            "文字可能是乱码（例如其他语言系统产生的Journal）。请用--encoding指定正确编码"
+            "（西欧语言cp1252、中欧cp1250、俄语cp1251）后重试。"
         )
     elif decoding["encoding_fallback"]:
+        basis = basis_label(decoding.get("encoding_basis", ""))
         warnings.append(
-            f"编码回退：未按首选编码解码，按{decoding['encoding']}严格解码成功（请求：{decoding['encoding_requested']}）。"
+            f"编码判定：按{decoding['encoding']}严格解码（{basis + '；' if basis else ''}"
+            f"请求：{decoding['encoding_requested']}）。如果文字显示为乱码，请用--encoding指定正确编码。"
         )
     return warnings
 
@@ -95,6 +109,7 @@ def _analyze(path: str | Path, options: ScanOptions, rules: tuple[Rule, ...]) ->
     by_rule: Counter[str] = Counter()
     matched_count = 0
     ungrouped_count = 0
+    per_group: Counter[str] = Counter()
 
     with JournalReader(path, options.encoding, options.max_line_chars) as reader:
         for line in reader:
@@ -126,16 +141,20 @@ def _analyze(path: str | Path, options: ScanOptions, rules: tuple[Rule, ...]) ->
                 else:
                     ungrouped_count += 1
                 priority = (SEVERITY_RANK[severity], -line.number)
-                if len(retained) < options.max_findings or priority > retained[0][:2]:
+                if options.max_per_group and per_group[fingerprint] >= options.max_per_group:
+                    pass  # counted above; the group already has its retained examples
+                elif len(retained) < options.max_findings or priority > retained[0][:2]:
                     finding = Finding(
                         line.number, severity, preview, matches, fingerprint,
                         context_before=list(before),
                     )
                     item = (*priority, finding)
+                    per_group[fingerprint] += 1
                     if len(retained) < options.max_findings:
                         heapq.heappush(retained, item)
                     else:
                         evicted = heapq.heapreplace(retained, item)[2]
+                        per_group[evicted.fingerprint] -= 1
                         pending = deque(value for value in pending if value is not evicted)
                     if options.context:
                         pending.append(finding)
@@ -145,9 +164,10 @@ def _analyze(path: str | Path, options: ScanOptions, rules: tuple[Rule, ...]) ->
         omitted = matched_count - len(findings)
         warnings: list[str] = []
         if omitted:
+            per_group_text = f"每组相同行最多保留{options.max_per_group}条，" if options.max_per_group else ""
             warnings.append(
-                f"全文已扫描；按严重级别优先、同级按出现顺序保留{len(findings)}条候选明细，省略{omitted}条。"
-                "总计数完整；需要更多同级明细时请提高--max-findings或使用--min-severity筛选。"
+                f"全文已扫描；按严重级别优先、同级按出现顺序、{per_group_text}保留{len(findings)}条候选明细，"
+                f"省略{omitted}条。总计数完整；需要更多同级明细时请提高--max-findings或使用--min-severity筛选。"
             )
         if ungrouped_count:
             warnings.append(f"分组容量已满，{ungrouped_count}条命中未计入分组；总命中计数仍完整。")
@@ -162,8 +182,11 @@ def _analyze(path: str | Path, options: ScanOptions, rules: tuple[Rule, ...]) ->
             counts_by_rule=dict(sorted(by_rule.items())), findings=findings,
             groups=list(groups.values()), omitted_finding_count=omitted,
             ungrouped_match_count=ungrouped_count, warnings=warnings,
+            retention_policy="severity_then_first" + (
+                f",max_per_group={options.max_per_group}" if options.max_per_group else ""),
             encoding_requested=decoding["encoding_requested"],
             encoding_fallback=decoding["encoding_fallback"],
+            encoding_basis=decoding["encoding_basis"],
             decode_degraded_line_count=decoding["decode_degraded_line_count"],
             decode_degraded_lines=decoding["decode_degraded_lines"],
         )

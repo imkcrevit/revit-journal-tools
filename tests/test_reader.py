@@ -157,7 +157,7 @@ class AutoEncodingTests(unittest.TestCase):
         self.assertEqual(summary["encoding_requested"], "auto")
 
     def test_degraded_sample_is_bounded_but_count_is_complete(self, _):
-        reader, lines = self.read(b"x\xff\n" * 50)
+        reader, lines = self.read(b"x\x81\n" * 50)
         self.assertEqual(reader.degraded_line_count, 50)
         self.assertEqual(len(reader.degraded_lines), 20)
 
@@ -181,14 +181,93 @@ class AutoEncodingTests(unittest.TestCase):
         self.assertEqual(reader.encoding, "gb18030")
 
     def test_policy_resolution(self, _):
-        self.assertEqual(resolve_encoding("auto").candidates, ("utf-8", "gb18030"))
-        self.assertEqual(resolve_encoding("auto,cp1252").candidates, ("utf-8", "gb18030", "cp1252"))
+        self.assertEqual(resolve_encoding("auto").candidates, ("utf-8", "gb18030", "cp1252"))
+        self.assertEqual(resolve_encoding("auto,cp1251").candidates, ("utf-8", "gb18030", "cp1252", "cp1251"))
+        self.assertTrue(resolve_encoding("auto").language)
+        self.assertFalse(resolve_encoding("utf-8,gb18030").language)
+        self.assertNotEqual(resolve_encoding("auto").key, resolve_encoding("utf-8,gb18030,cp1252").key)
         self.assertFalse(resolve_encoding("cp936").detect)
         self.assertEqual(resolve_encoding("cp936").candidates, ("gbk",))
         with self.assertRaises(LookupError):
             resolve_encoding("no-such-codec")
         with self.assertRaises(LookupError):
             resolve_encoding(" , ")
+
+
+@patch.object(reader_module, "system_fallback_encoding", return_value="gb18030")
+class LanguageAndChineseTextTests(unittest.TestCase):
+    """cp1252 journals from German systems decode "strictly" as gb18030 mojibake
+    (observed in an uploaded case): the declared UI language and the share of
+    common Chinese characters decide instead. Text below is synthetic."""
+
+    GERMAN = "Au\u00dfenanlagen K\u00fcchenplanung enth\u00e4lt \u00c4nderungen m\u00f6chten L\u00f6scht"
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name) / "journal.txt"
+
+    def read(self, data, encoding="auto"):
+        self.path.write_bytes(data)
+        with JournalReader(self.path, encoding) as reader:
+            lines = list(reader)
+        return reader, [line.text for line in lines]
+
+    def journal(self, language, body, encoding):
+        header = f"' 0:< Actual language code={language} \r\n" if language else ""
+        return (header + "'C 07-Oct-2026 09:35:25.000;  started recording journal file \r\n" + body + "\r\n").encode(encoding)
+
+    def test_german_journal_is_not_read_as_gb18030(self, _):
+        data = self.journal("DEU", self.GERMAN, "cp1252")
+        data.decode("gb18030")  # the trap: gb18030 accepts these bytes
+        reader, lines = self.read(data)
+        self.assertEqual((reader.encoding, reader.encoding_basis, reader.degraded_line_count),
+                         ("cp1252", "language_code:DEU", 0))
+        self.assertEqual(lines[-1], self.GERMAN)
+
+    def test_without_a_header_the_text_shape_decides(self, _):
+        reader, lines = self.read((self.GERMAN + "\r\n").encode("cp1252"))  # e.g. a worker log
+        self.assertEqual((reader.encoding, reader.encoding_basis), ("cp1252", "not_chinese"))
+        self.assertEqual(lines, [self.GERMAN])
+
+    def test_chinese_journals_stay_gb18030(self, _):
+        body = "' 1:< 错误: 不满足约束 C:\\项目\\模型.rvt"
+        reader, lines = self.read(self.journal("ENU", body, "gb18030"))  # English UI on a Chinese system
+        self.assertEqual((reader.encoding, reader.encoding_basis), ("gb18030", "chinese_text"))
+        self.assertEqual(lines[-1], body)
+        reader, _ = self.read(self.journal("CHS", body, "gb18030"))
+        self.assertEqual((reader.encoding, reader.encoding_basis), ("gb18030", "language_code:CHS"))
+
+    def test_utf8_wins_over_the_declared_language(self, _):
+        reader, lines = self.read(self.journal("DEU", self.GERMAN, "utf-8"))
+        self.assertEqual((reader.encoding, reader.encoding_basis), ("utf-8", "utf-8"))
+        self.assertEqual(lines[-1], self.GERMAN)
+
+    def test_corrupt_bytes_in_a_chinese_journal_degrade_instead_of_cp1252_mojibake(self, _):
+        data = "' 1:< 错误: 不满足约束\r\n".encode("gb18030") + b"bad \xff\r\n"
+        data.decode("cp1252")  # cp1252 would "succeed"
+        reader, lines = self.read(data)
+        self.assertEqual((reader.encoding, reader.encoding_basis, reader.degraded_lines), ("gb18030", "degraded", [2]))
+        self.assertEqual(lines, ["' 1:< 错误: 不满足约束", "bad \\xff"])
+
+    def test_chains_apply_the_chinese_check_too(self, _):
+        data = (self.GERMAN + "\r\n").encode("cp1252")
+        reader, lines = self.read(data, "utf-8,gb18030,cp1252")
+        self.assertEqual((reader.encoding, lines), ("cp1252", [self.GERMAN]))
+        # Only gb18030 decodes: kept, but marked as probably wrong.
+        reader, _ = self.read(data, "utf-8,gb18030")
+        self.assertEqual((reader.encoding, reader.encoding_basis), ("gb18030", "unlikely_chinese"))
+
+    def test_scan_report_states_the_basis(self, _):
+        from revit_journal_tools.analyzer import ScanOptions, analyze
+
+        self.path.write_bytes(self.journal("DEU", "DBG_ERROR: " + self.GERMAN, "cp1252"))
+        report = analyze(self.path)
+        self.assertEqual((report.encoding, report.encoding_basis), ("cp1252", "language_code:DEU"))
+        self.assertTrue(any("界面语言DEU" in warning for warning in report.warnings))
+        self.path.write_bytes((self.GERMAN + "\r\n").encode("cp1252"))
+        report = analyze(self.path, options=ScanOptions(encoding="utf-8,gb18030"))
+        self.assertTrue(any(warning.startswith("编码存疑") for warning in report.warnings))
 
 
 class SystemFallbackTests(unittest.TestCase):

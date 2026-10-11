@@ -16,6 +16,7 @@ from .blocks import PHASES
 from .loading import ADDIN_FILTERS, ADDIN_KEYS, BLOCK_FILTERS, block_label, block_summary
 from .session_view import (duration_text, file_date, phase_label, session_label, sidecar_label, state_text,
                            summary_lines)
+from .reader import basis_label
 from .viewer_index import ViewerIndex
 
 COLORS = {"startup": 34, "system": 36, "error": 31, "api_error": 35,
@@ -59,8 +60,10 @@ def encoding_label(file: dict) -> str:
     text = file.get("encoding") or "未知编码"
     if file.get("degraded_lines"):
         text += f"（退化解码{file['degraded_lines']}行，字节以\\xNN显示）"
+    elif file.get("encoding_basis") == "unlikely_chinese":
+        text += "（编码存疑：内容不像中文，可能是乱码，请用--encoding指定）"
     elif file.get("encoding_fallback"):
-        text += "（自动回退）"
+        text += f"（{basis_label(file.get('encoding_basis', '')) or '自动回退'}）"
     return text
 
 
@@ -524,7 +527,7 @@ def _print_pages(index, category, query, after, limit, color, format_name, addin
     for file in catalog:
         result = {"source": file["path"], "status": file["status"], "sha256": file["sha256"],
                   "encoding": file["encoding"], "encoding_requested": file["encoding_requested"],
-                  "encoding_fallback": file["encoding_fallback"],
+                  "encoding_fallback": file["encoding_fallback"], "encoding_basis": file["encoding_basis"],
                   "decode_degraded_line_count": file["degraded_lines"],
                   "decode_degraded_lines": file["degraded_sample"],
                   "live": file["live"], "writing": file["writing"], "snapshot": file["snapshot"],
@@ -554,7 +557,7 @@ def _print_pages(index, category, query, after, limit, color, format_name, addin
             print(safe_text(f"{file['source']}{live_label(by_id[file_id])} | {file['line_count']}行 / "
                             f"{file['block_count']}块 | {encoding_label(by_id[file_id])}"))
             if by_id[file_id]["degraded_lines"]:
-                print("  提示：混合来源（如英文系统产生的cp1252文件）可试 --encoding utf-8,gb18030,cp1252")
+                print("  提示：其他语言系统产生的文件可指定其代码页，如 --encoding cp1252（西欧）、cp1250、cp1251")
             if category in ADDIN_FILTERS or addin_prefix:
                 print(safe_text(f"当前日志Add-in: {file['addin_count']}条加载记录 | 名称/Class前缀: {addin_prefix or '不限'}"))
             if "error" in file:

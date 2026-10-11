@@ -158,7 +158,8 @@ class TerminalTests(unittest.TestCase):
         self.assertNotIn("items", file)
 
     def test_degraded_lines_are_visible_in_print_json_and_expanded_view(self):
-        self.path.write_bytes(b"API_ERROR {\n'bad \xff byte }\n")
+        # 0x81 is invalid gb18030 before ASCII and undefined in cp1252: no candidate decodes it.
+        self.path.write_bytes(b"API_ERROR {\n'bad \x81 byte }\n")
         with patch("revit_journal_tools.reader.system_fallback_encoding", return_value="gb18030"):
             code, out, err = self.cli("browse", self.path, "--database", self.db, "--format", "json")
             self.assertEqual(code, 0, err)
@@ -170,7 +171,7 @@ class TerminalTests(unittest.TestCase):
             browser = Browser(self.index)
             browser.handle("\r")
             frame = browser.frame(160, 25, False)
-        self.assertIn("'bad \\xff byte }", frame)
+        self.assertIn("'bad \\x81 byte }", frame)
         self.assertIn("含无法解码字节", frame)
         self.assertEqual([item["degraded"] for item in self.index.block_lines(self.file_id, 1)["items"]], [0, 1])
 

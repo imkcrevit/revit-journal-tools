@@ -149,7 +149,7 @@ async function selectLine(line) {
     const selectedRow = $("context").querySelector(".context-line.selected");
     $("context").scrollTop = 0;
     if (selectedRow) $("context").scrollTop = Math.max(0, selectedRow.getBoundingClientRect().top - $("context").getBoundingClientRect().top - $("context").clientHeight * .35);
-    const decoding = data.decode_degraded_line_count ? `（退化解码${data.decode_degraded_line_count}行，字节以\\xNN显示）` : data.encoding_fallback ? "（自动回退）" : "";
+    const decoding = data.decode_degraded_line_count ? `（退化解码${data.decode_degraded_line_count}行，字节以\\xNN显示）` : data.encoding_basis === "unlikely_chinese" ? "（编码存疑：内容不像中文，可能是乱码）" : data.encoding_fallback ? `（${data.encoding_basis_label || "自动回退"}）` : "";
     $("source-meta").textContent = `${data.encoding.toUpperCase()}${decoding} · SHA-256 ${data.sha256.slice(0,20)}… · 索引完整原文，分类仅用于定位。`;
     $("source-meta").title = data.sha256;
     $("copy-position").disabled = false;

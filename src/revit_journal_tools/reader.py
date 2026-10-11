@@ -2,16 +2,24 @@
 
 Encoding policy (see docs/architecture.md):
 
-- ``auto`` (default): a BOM decides; otherwise strict UTF-8, then the strict
-  superset of the system ANSI code page (cp936 -> gb18030). Each file is decided
-  on its own. If every candidate fails, the file is still read with the last
+- ``auto`` (default): a BOM decides; otherwise strict UTF-8; then the code page
+  of the UI language the journal declares in its header ("Actual language
+  code=DEU" -> cp1252, CHS -> gb18030, ...; ENU/ENG say nothing about the
+  system); then gb18030, the system ANSI code page (cp936 -> gb18030) and
+  cp1252. Each file is decided on its own and the basis is recorded.
+- gb18030 accepts almost any byte sequence, including cp1252 text from Western
+  systems ("Au\\xdfen" reads as "Au遝n"). It is therefore accepted only when at
+  least half of the decoded non-ASCII characters are common GB2312 characters;
+  real Chinese journals measured 0.83-1.0, cp1252 journals at most 0.003.
+- If every candidate fails, the file is still read with the most plausible
   candidate, but each undecodable byte is shown as ``\\xNN`` and the line is
   flagged ``degraded``; reports carry the count and the line numbers. Bytes are
   never silently replaced or dropped.
 - a single codec name, e.g. ``cp1252``: strict, as before; any undecodable byte
   fails the whole file.
-- a comma-separated chain, e.g. ``utf-8,gb18030,cp1252``: like ``auto`` with
-  these candidates (``auto`` inside a chain expands to its own candidates).
+- a comma-separated chain, e.g. ``utf-8,gb18030,cp1252``: the first candidate
+  that decodes strictly, in the given order, with the same gb18030 check
+  (``auto`` inside a chain expands to its own candidates).
 """
 
 import codecs
@@ -49,6 +57,72 @@ _DEGRADED_ERRORS = "revit-journal-degraded"
 _DEGRADED_SAMPLE = 20
 # Supersets that strictly decode everything the system code page decodes.
 _SUPERSETS = {"gbk": "gb18030", "gb2312": "gb18030", "cp936": "gb18030"}
+# Bump when the auto/chain decision changes: cached indexes are rebuilt.
+DETECTION_VERSION = 2
+# Revit writes the UI language into the journal header. It names the system
+# code page only for localized UIs; English (ENU/ENG) runs on any system.
+_LANGUAGE = re.compile(rb"Actual language code\s*=\s*([A-Za-z]{3})")
+_HEADER_BYTES = 65536
+LANGUAGE_CODE_PAGES = {
+    "CHS": "gb18030", "CHT": "cp950", "JPN": "cp932", "KOR": "cp949", "RUS": "cp1251",
+    "PLK": "cp1250", "CSY": "cp1250", "HUN": "cp1250",
+    "DEU": "cp1252", "FRA": "cp1252", "ITA": "cp1252", "ESP": "cp1252", "PTB": "cp1252", "NLD": "cp1252",
+}
+_CHINESE = {"gb18030", "gbk", "gb2312"}
+_CHINESE_MIN_SHARE = 0.5
+_CHINESE_SAMPLE = 20000  # non-ASCII characters looked at, at most
+_NON_ASCII = re.compile(r"[^\x00-\x7f]")
+ENCODING_BASIS = {
+    "explicit": "按指定编码",
+    "bom": "按BOM",
+    "utf-8": "严格UTF-8",
+    "language_code": "按Journal声明的界面语言{code}",
+    "chinese_text": "内容为常用中文字符",
+    "not_chinese": "gb18030可以解码但内容不像中文，改用后续候选",
+    "candidate": "前面的候选无法严格解码",
+    "unlikely_chinese": "只有gb18030能严格解码，但内容不像中文，可能是乱码",
+    "degraded": "所有候选都无法完整解码",
+}
+
+
+def basis_label(basis: str) -> str:
+    """Readable reason for an encoding decision (see ENCODING_BASIS)."""
+    key, _, code = (basis or "").partition(":")
+    text = ENCODING_BASIS.get(key, "")
+    return text.format(code=code) if text else ""
+
+
+_COMMON: dict[str, bool] = {}
+
+
+def _common_chinese(char: str) -> bool:
+    value = _COMMON.get(char)
+    if value is None:
+        try:
+            char.encode("gb2312")
+            value = True
+        except UnicodeEncodeError:
+            value = False
+        _COMMON[char] = value
+    return value
+
+
+class _ChineseShare:
+    """Share of common (GB2312) characters among the non-ASCII characters seen."""
+
+    def __init__(self):
+        self.seen = 0
+        self.common = 0
+
+    def feed(self, text: str) -> None:
+        if self.seen < _CHINESE_SAMPLE and not text.isascii():
+            chars = _NON_ASCII.findall(text)
+            self.seen += len(chars)
+            self.common += sum(map(_common_chinese, chars))
+
+    def plausible(self) -> bool:
+        """No non-ASCII text at all says nothing against Chinese."""
+        return not self.seen or self.common / self.seen >= _CHINESE_MIN_SHARE
 
 
 def _degraded_handler(error: UnicodeError) -> tuple[str, int]:
@@ -88,11 +162,14 @@ class EncodingPolicy:
     requested: str
     candidates: tuple[str, ...]
     detect: bool  # BOM detection, candidate chain and degraded fallback
+    language: bool = False  # "auto": the journal's declared UI language is a candidate
 
     @property
     def key(self) -> str:
         """Stable description used in cache signatures: what was asked, resolved."""
-        return ("auto:" if self.detect else "strict:") + ",".join(self.candidates)
+        if not self.detect:
+            return "strict:" + ",".join(self.candidates)
+        return f"{'auto' if self.language else 'chain'}{DETECTION_VERSION}:" + ",".join(self.candidates)
 
 
 def resolve_encoding(requested: str) -> EncodingPolicy:
@@ -104,11 +181,14 @@ def resolve_encoding(requested: str) -> EncodingPolicy:
     names: list[str] = []
     for part in parts:
         if part.lower() == "auto":
+            # gb18030 checks itself (common-character share), so it goes before
+            # the system code page; cp1252 covers Western journals on any system.
             fallback = system_fallback_encoding()
-            names.extend(["utf-8", *([fallback] if fallback else [])])
+            names.extend(["utf-8", "gb18030", *([fallback] if fallback else []), "cp1252"])
         else:
             names.append(codecs.lookup(part).name)
-    return EncodingPolicy(requested, tuple(dict.fromkeys(names)), True)
+    language = any(part.lower() == "auto" for part in parts)
+    return EncodingPolicy(requested, tuple(dict.fromkeys(names)), True, language)
 
 
 def _bom_encoding(header: bytes) -> str | None:
@@ -123,16 +203,26 @@ def _bom_encoding(header: bytes) -> str | None:
     return None
 
 
-def _decodes_strictly(raw: io.BufferedReader, encoding: str) -> bool:
+def _decodes_strictly(raw: io.BufferedReader, encoding: str, share: _ChineseShare | None = None) -> bool:
     decoder = codecs.getincrementaldecoder(encoding)("strict")
     raw.seek(0)
     try:
         while chunk := raw.read(1 << 20):
-            decoder.decode(chunk)
+            text = decoder.decode(chunk)
+            if share is not None:
+                share.feed(text)
         decoder.decode(b"", final=True)
     except UnicodeDecodeError:
         return False
     return True
+
+
+def _looks_chinese_leniently(raw: io.BufferedReader, encoding: str, limit: int = 4 << 20) -> bool:
+    """For a file nothing decodes strictly: do its decodable parts read as Chinese?"""
+    raw.seek(0)
+    share = _ChineseShare()
+    share.feed(raw.read(limit).decode(encoding, "replace").replace("\ufffd", ""))
+    return bool(share.seen) and share.plausible()
 
 
 def _signature(stat: os.stat_result) -> tuple[int, int, int, int]:
@@ -174,6 +264,7 @@ class JournalReader:
         self.policy = resolve_encoding(encoding)
         self.max_line_chars = max_line_chars
         self.encoding = ""
+        self.encoding_basis = ""
         self.encoding_fallback = False
         self.degraded = False
         self.degraded_line_count = 0
@@ -182,16 +273,58 @@ class JournalReader:
         self.complete = False
         self._text: io.TextIOWrapper | None = None
 
-    def _choose(self, raw: io.BufferedReader) -> tuple[str, bool]:
-        """Return (encoding, degraded). Explicit single codecs stay strict."""
+    def _choose(self, raw: io.BufferedReader) -> tuple[str, bool, str]:
+        """Return (encoding, degraded, basis). Explicit single codecs stay strict."""
         if not self.policy.detect:
-            return self.policy.candidates[0], False
-        bom = _bom_encoding(raw.read(4))
-        candidates = (bom,) if bom else self.policy.candidates
+            return self.policy.candidates[0], False, "explicit"
+        header = raw.read(_HEADER_BYTES)
+        bom = _bom_encoding(header[:4])
+        if bom:
+            return bom, not _decodes_strictly(raw, bom), "bom"
+        candidates = list(self.policy.candidates)
+        language = page = None
+        found = _LANGUAGE.search(header) if self.policy.language else None
+        if found:
+            language = found.group(1).decode("ascii").upper()
+            page = LANGUAGE_CODE_PAGES.get(language)
+            if page:
+                page = codecs.lookup(page).name
+                # Right after UTF-8: cp1252 would also "decode" UTF-8 bytes, as mojibake.
+                head = [name for name in candidates if name == "utf-8"]
+                candidates = head + [page] + [name for name in candidates if name not in head and name != page]
+        unlikely = None
+        failed_chinese: list[str] = []
         for encoding in candidates:
-            if _decodes_strictly(raw, encoding):
-                return encoding, False
-        return candidates[-1], True
+            share = _ChineseShare() if encoding in _CHINESE else None
+            if not _decodes_strictly(raw, encoding, share):
+                if share is not None:
+                    failed_chinese.append(encoding)
+                continue
+            if share is not None and not share.plausible():
+                unlikely = unlikely or encoding
+                continue
+            if encoding == "utf-8":
+                return encoding, False, "utf-8"
+            if encoding == page:
+                return encoding, False, f"language_code:{language}"
+            if share is not None:
+                return encoding, False, "chinese_text"
+            # cp1252 decodes nearly any bytes; a Chinese journal with a few
+            # corrupt bytes must not turn into mojibake: escape those bytes instead.
+            broken = next((name for name in failed_chinese if _looks_chinese_leniently(raw, name)), None)
+            if broken:
+                return broken, True, "degraded"
+            return encoding, False, "not_chinese" if unlikely else "candidate"
+        if unlikely:
+            return unlikely, False, "unlikely_chinese"
+        # Nothing decodes strictly: escape the undecodable bytes of the most
+        # plausible candidate: a Chinese one when the readable parts are Chinese,
+        # else (auto) the system code page, else the last candidate.
+        chinese = next((name for name in candidates if name in _CHINESE and _looks_chinese_leniently(raw, name)), None)
+        if chinese:
+            return chinese, True, "degraded"
+        system = system_fallback_encoding() if self.policy.language else None
+        return (system if system in candidates else candidates[-1]), True, "degraded"
 
     def __enter__(self) -> "JournalReader":
         if self.path.suffix.lower() == ".dmp":
@@ -199,7 +332,7 @@ class JournalReader:
         raw = self.path.open("rb")
         try:
             self._initial_stat = os.fstat(raw.fileno())
-            self.encoding, self.degraded = self._choose(raw)
+            self.encoding, self.degraded, self.encoding_basis = self._choose(raw)
             first = self.policy.candidates[0]
             self.encoding_fallback = self.degraded or (
                 self.policy.detect and self.encoding not in {first, "utf-8-sig", "utf-16", "utf-32"})
@@ -271,7 +404,7 @@ class JournalReader:
         """Explicit, serializable decoding state for reports and the index."""
         return {
             "encoding": self.encoding, "encoding_requested": self.requested_encoding,
-            "encoding_fallback": self.encoding_fallback,
+            "encoding_fallback": self.encoding_fallback, "encoding_basis": self.encoding_basis,
             "decode_degraded_line_count": self.degraded_line_count,
             "decode_degraded_lines": list(self.degraded_lines),
         }

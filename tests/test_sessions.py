@@ -21,6 +21,8 @@ class NamingTests(unittest.TestCase):
             "journal.0011.0001.dmp": ("journal.0011", "dump"),
             "journal.0011.txt.copy.txt": ("journal.0011", "copy"),
             "JOURNAL.0011.TXT.ABBREV": ("journal.0011", "abbrev"),
+            # Observed in an uploaded case: the abbreviated form of a copy.
+            "journal.0002.txt.copy.txt.abbrev": ("journal.0002", "abbrev"),
             "dump.0001.txt": ("dump.0001.txt", "unrecognized"),
             "notes.txt": ("notes.txt", "unrecognized"),
         }

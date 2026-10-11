@@ -1,6 +1,8 @@
 """Write batch reports incrementally, retaining at most one file report."""
 
 import json
+
+from .reader import basis_label
 from collections.abc import Iterable
 from typing import Any, TextIO
 
@@ -18,7 +20,8 @@ def _write_text(report: dict[str, Any], stream: TextIO) -> None:
     if report.get("decode_degraded_line_count"):
         encoding += f"（退化解码，{report['decode_degraded_line_count']}行含\\xNN字节）"
     elif report.get("encoding_fallback"):
-        encoding += f"（自动回退，请求{report.get('encoding_requested', 'auto')}）"
+        basis = basis_label(report.get("encoding_basis", ""))
+        encoding += f"（{basis or '自动回退'}，请求{report.get('encoding_requested', 'auto')}）"
     stream.write(
         f"扫描完成：{report['line_count']}行 / {report['byte_count']}字节 / {encoding}\n"
         f"SHA-256：{report['sha256']}\n"

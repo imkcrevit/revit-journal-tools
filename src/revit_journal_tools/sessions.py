@@ -3,7 +3,8 @@
 Naming observed in %LOCALAPPDATA%\\Autodesk\\Revit\\Autodesk Revit <year>\\Journals:
 ``journal.NNNN.txt`` (main), ``journal.NNNN.workerN.log`` (worker),
 ``journal.NNNN.NNNN.dmp`` (binary dump), ``journal.NNNN.txt.copy.txt`` (copy),
-``journal.NNNN.txt.abbrev`` (abbreviated) and empty ``dump.NNNN.txt``.
+``journal.NNNN.txt.abbrev`` and ``journal.NNNN.txt.copy.txt.abbrev``
+(abbreviated) and empty ``dump.NNNN.txt``.
 Any other name stays an "unrecognized" single-file session and is still read.
 Byte-identical inputs are indexed once; the others are listed as duplicates.
 """
@@ -14,7 +15,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 _NAME = re.compile(
-    r"^journal\.(?P<number>\d+)(?:(?P<main>\.txt)|(?P<abbrev>\.txt\.abbrev)|(?P<copy>\.txt\.copy\.txt)"
+    r"^journal\.(?P<number>\d+)(?:(?P<main>\.txt)|(?P<abbrev>\.txt(?:\.copy\.txt)?\.abbrev)|(?P<copy>\.txt\.copy\.txt)"
     r"|\.worker(?P<worker>\d+)\.log|\.(?P<dump>\d+)\.dmp)$", re.I,
 )
 ROLE_LABELS = {

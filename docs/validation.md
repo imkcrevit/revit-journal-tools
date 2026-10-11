@@ -1,5 +1,20 @@
 # 当前验证记录
 
+## 上传案例：西文系统Journal与崩溃会话（2026-10-10，Windows）
+
+两份上传（只读复制到`cases/inbox/`，Git忽略，导入清单含SHA-256）：A为英文界面Revit 2025.5的7个会话（21个文件，含3个dmp、副本与`journal.NNNN.txt.copy.txt.abbrev`），B为德文界面Revit 2026.4的1个会话（61.7MB主Journal、333,331行，含dmp）。
+
+发现并修正的问题：
+
+- 编码：B在中文系统上被`auto`按gb18030“严格解码成功”，德文变成看似正常的汉字（如`Außenanlagen`→`Au遝nanlagen`），报告只显示“自动回退”，没有任何退化标记。A的主Journal则按gb18030退化解码。现在`auto`先看Journal头部声明的界面语言，再要求gb18030的解码结果像中文（常用汉字占非ASCII字符一半以上），并记录判定依据。复核：A、B全部按cp1252（或纯ASCII的UTF-8）读取，0行退化；本机95个中文Journal仍为gb18030、8个仍为UTF-8，判定未变。
+- 会话归组：`journal.NNNN.txt.copy.txt.abbrev`曾被当作未识别命名的独立会话，A因此显示10个会话、7个未正常结束；现在归入所属会话：8个会话，5个未正常结束、3个正常结束。
+- 崩溃识别：会话摘要新增“异常与崩溃”（异常代码及其标准含义、异常前最后的`Jrn.Command`、崩溃保护/未处理异常/致命错误对话框/SLOG崩溃记录/CEF初始化失败），会话级候选`session.crash`；新增规则`revit.crash_protection`（fatal）与`revit.cef_init_failed`（error）。致命错误对话框按`TaskDialog_Fatal_Error_Occured`识别，德文界面同样命中。
+- 报告：一行文字重复12万次时，规则候选明细被同一行占满，崩溃前的异常进不了报告；`report`现在每组相同行只保留一条明细（`ScanOptions.max_per_group`，`scan`默认不变）。
+
+各会话结论（候选，按原文行号核对）：A中3个会话正常结束；2个会话在打开Revit Server模型、提示“could not find or read N references”后执行Manage Links（`ID_LINKED_DWG`）时异常（`ExceptionCode=0x80000003`，两次异常地址低16位相同），随后未处理异常并生成dmp；1个会话在启动阶段CEF初始化失败后出现.NET异常`0xe0434352`；1个会话15秒后无结束标记、无异常记录、无dmp，无法从Journal判断。B在删除选择（`ID_BUTTON_DELETE`）后出现.NET异常`0xe0434352`、致命错误对话框，用户选择保存恢复文件后进程终止；该会话中渲染器的`USD: Runtime Error … GL error: invalid enum`重复126,780次。
+
+测试188项全部通过；新增测试只用构造的文本。
+
 ## 支持工单报告、缓存位置、原生Windows控制台与单文件分发（2026-10-10，Windows，阶段4）
 
 - 177项自动化测试全部通过；新增`tests/test_delivery.py`10项，只用构造的Journal片段。

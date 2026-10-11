@@ -10,6 +10,7 @@ from pathlib import Path
 from .blocks import PHASES
 from .categories import CATEGORIES
 from .sessions import ROLE_LABELS, STATUS_LABELS
+from .summary import CRASH_MARKS
 
 SIDECAR_LABELS = {"worker": "Worker日志", "steel_log": "钢连接错误日志", "cer_log": "CER错误报告日志",
                   "dump": "崩溃转储", "duplicate": "字节相同的副本", "empty": "空文件"}
@@ -85,6 +86,21 @@ def summary_lines(session: dict, tail: list[dict] | None = None) -> list[str]:
                  f"（{duration_text(summary.get('duration_seconds'))}）| {end}")
     if summary.get("phases"):
         lines.append("阶段：" + " → ".join(f"{item['label']}L{item['first_line']}" for item in summary["phases"]))
+    marks = (summary.get("crash") or {}).get("marks") or []
+    if marks:
+        counts = summary["crash"].get("counts") or {}
+        lines.append(f"异常与崩溃：{counts.get('exception', 0)}次被捕获的异常"
+                     + ("；有致命错误对话框" if counts.get("fatal_dialog") else "")
+                     + ("；有未处理异常" if counts.get("unhandled") else ""))
+        for mark in marks[:12]:
+            if mark.get("command"):
+                lines.append(f"  第{mark['command']['line_number']}行 [异常前的命令] {mark['command']['text']}")
+            text = f"  第{mark['line_number']}行 [{CRASH_MARKS[mark['kind']]}] {mark['text']}"
+            if mark.get("meaning"):
+                text += f" ← {mark['meaning']}"
+            if mark.get("detail"):
+                text += f" ← {mark['detail']}"
+            lines.append(text)
     license = summary.get("license") or {}
     errors = license.get("errors") or []
     text = f"许可：{license.get('events', 0)}条许可记录"

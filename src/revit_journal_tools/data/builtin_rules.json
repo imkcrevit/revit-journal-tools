@@ -69,6 +69,24 @@
       "explanation": "发现原生异常事件或非零异常代码；代码本身不说明具体故障原因。"
     },
     {
+      "id": "revit.crash_protection",
+      "title": "Revit崩溃路径标记",
+      "severity": "fatal",
+      "pattern": "\\bunhandledExceptionFilter is executed\\b|\\bException occurred during Revit crash protection\\b|\\bTaskDialog_Fatal_Error_Occured\\b|\\bSLOG\\s+\\$[0-9A-Fa-f]+\\b[^\\r\\n]*>Crash\\b",
+      "gate": ["unhandledexceptionfilter is executed", "exception occurred during revit crash protection", "taskdialog_fatal_error_occured", ">crash"],
+      "basis": "case_verified",
+      "explanation": "Revit在崩溃路径上写入的标记：未处理异常过滤器、崩溃保护中再次异常、致命错误对话框（按对话框Id识别，与界面语言无关）或SLOG崩溃记录。已在上传的崩溃案例中核对；会话摘要列出之前的异常代码与最后的命令。"
+    },
+    {
+      "id": "revit.cef_init_failed",
+      "title": "内嵌浏览器CEF初始化失败",
+      "severity": "error",
+      "pattern": "\\bCEF failed to initialize\\b",
+      "gate": ["cef failed to initialize"],
+      "basis": "case_verified",
+      "explanation": "Revit内嵌的Chromium（CEF）没有初始化，下一行通常写明失败原因。已在一个启动阶段崩溃的上传案例中核对（随后出现.NET异常0xe0434352）；常见于运行库或与其他自带CEF的插件冲突，需结合原文判断。"
+    },
+    {
       "id": "revit.assertion",
       "title": "断言失败标记",
       "severity": "error",

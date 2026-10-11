@@ -281,6 +281,16 @@ class RevitRuleTests(unittest.TestCase):
         "revit.addin_conflict": (
             ["' 0:< API_ERROR { : Assembly version conflict in some references in Demo.Plugin.dll assembly"],
             ["'Addin's module Demo.Core of version 2.0.0.0 conflicts with same preloaded module of version 1.0.0.0 }"]),
+        "revit.crash_protection": (
+            ["    ' 0:< unhandledExceptionFilter is executed in a non-main thread (id = 1, tag = <blank> : [was ]).",
+             "' 0:< Exception occurred during Revit crash protection. UI might be locked.",
+             "'Id : TaskDialog_Fatal_Error_Occured",
+             "' 0:< SLOG $0000abcd 2026-10-07 15:16:17.155 >Crash   "],
+            ["' 0:< SLOG $0000abcd 2026-10-07 15:16:17.155 <Crash ", "' 0:< Exception occurred ",
+             "'Id : TaskDialog_Workset_File_Already_Exists", "unhandledExceptionFilter registered"]),
+        "revit.cef_init_failed": (
+            ["' 0:< CEF failed to initialize due to failure: "],
+            ["' 0:< CEF initialized", "'The type initializer for '<Module>' threw an exception."]),
         "revit.ui_warning": (
             ["' 1:< 错误: 不满足约束", "  ' 2:< Error: Can't create Demo. - 3 times", "    ' 1:< ERROR : spaced prompt"],
             ["' 0:< see Error: not a prompt", "' 1:< Warning: not an error prompt", "DBG_ERROR: not a prompt"]),
@@ -348,6 +358,58 @@ class SummaryTests(unittest.TestCase):
         self.assertNotIn("session.no_clean_exit", [item["id"] for item in session_findings(summary, True, [], "j")])
         _, clean = build(SESSION)
         self.assertNotIn("session.no_clean_exit", [item["id"] for item in session_findings(clean, False, [], "j")])
+
+
+class CrashSummaryTests(unittest.TestCase):
+    """Crash path in the shape of the uploaded cases (synthetic text)."""
+
+    CRASH = SESSION[:-2] + [
+        "    'E 05-Oct-2026 15:51:43.527;   0:< ",
+        '    Jrn.Command "Internal"  , "Manage Links , ID_LINKED_DWG" ',
+        "    ' 0:< Exception occurred ",
+        "    'C 05-Oct-2026 15:51:44.446;   0:< ExceptionCode=0x80000003 ExceptionFlags=0x00000000 "
+        "ExceptionAddress=00007FFA00000000 ",
+        "    'C 05-Oct-2026 15:51:45.458;  Revit worker 1 closed cleanly ",
+        "    ' 0:< unhandledExceptionFilter is executed in a non-main thread (id = 1, tag = <blank> : [was ]). ",
+    ]
+
+    def test_crash_marks_keep_the_command_before_the_exception(self):
+        _, summary = build(self.CRASH)
+        marks = summary["crash"]["marks"]
+        self.assertEqual([mark["kind"] for mark in marks], ["exception", "exception_code", "unhandled"])
+        self.assertEqual(marks[0]["command"]["line_number"], 44)
+        self.assertIn("ID_LINKED_DWG", marks[0]["command"]["text"])
+        self.assertEqual((marks[1]["code"], marks[1]["meaning"]), ("0x80000003", "断点/内部断言（程序主动中断）"))
+        findings = session_findings(summary, False, [], "journal.0001.txt")
+        crash = next(item for item in findings if item["id"] == "session.crash")
+        self.assertEqual((crash["severity"], crash["status"]), ("fatal", "candidate"))
+        self.assertIn("ID_LINKED_DWG", crash["explanation"])
+        self.assertEqual(crash["evidence"][0]["line_number"], 44)
+
+    def test_fatal_dialog_by_id_and_cef_detail(self):
+        lines = SESSION[:-2] + [
+            "' 0:< CEF failed to initialize due to failure: ",
+            "'The type initializer for '<Module>' threw an exception. ",
+            "' 0:< TaskDialog \"In Revit ist ein schwerwiegender Fehler aufgetreten. \"",
+            "'Id : TaskDialog_Fatal_Error_Occured",
+        ] + SESSION[-2:]
+        _, summary = build(lines)
+        marks = summary["crash"]["marks"]
+        self.assertEqual([mark["kind"] for mark in marks], ["cef_failed", "fatal_dialog"])
+        self.assertIn("type initializer", marks[0]["detail"])
+        # A clean end does not hide a fatal-error dialog.
+        crash = next(item for item in session_findings(summary, False, [], "j") if item["id"] == "session.crash")
+        self.assertEqual(crash["severity"], "fatal")
+
+    def test_a_recovered_exception_alone_is_an_error_candidate(self):
+        lines = SESSION[:-2] + ["' 0:< Exception occurred ",
+                                "'C 05-Oct-2026 15:51:44.446;   0:< ExceptionCode=0xe0434352 ExceptionFlags=0x81 "]             + SESSION[-2:]
+        _, summary = build(lines)
+        crash = next(item for item in session_findings(summary, False, [], "j") if item["id"] == "session.crash")
+        self.assertEqual(crash["severity"], "error")
+        self.assertIn(".NET托管异常", crash["explanation"])
+        _, clean = build(SESSION)
+        self.assertNotIn("session.crash", [item["id"] for item in session_findings(clean, False, [], "j")])
 
 
 class SidecarTests(unittest.TestCase):
