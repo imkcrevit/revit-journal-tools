@@ -1,6 +1,7 @@
 import json
 import random
 import re
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -42,6 +43,31 @@ class RuleTests(unittest.TestCase):
                 self.write_rule({**self.rule, **changes})
                 with self.assertRaises(RuleConfigError):
                     load_rules(self.path)
+
+    def test_nested_quantifiers_are_rejected_at_load(self):
+        # Exponential backtracking shapes: on 22-23 non-matching characters these
+        # took 0.3s to 158s each (CPython 3.12); one more character doubles that.
+        for pattern in (r"(a+)+b", r"(?:\w+\s?)*$", r"(\d+\.?)+x", r"(?:a|\w+)*!", r"(?:\s*\S+)*x",
+                        r"(?:[a-z]+[A-Z])+", r"((?:a+b)*c)*", r"x(?=(a+)+)"):
+            with self.subTest(pattern=pattern):
+                self.write_rule({**self.rule, "pattern": "CUSTOM_FAILURE " + pattern})
+                with self.assertRaisesRegex(RuleConfigError, "灾难性回溯"):
+                    load_rules(self.path)
+        self.write_rule({**self.rule, "exclude_patterns": [r"(\w+\s*)*:"]})
+        with self.assertRaisesRegex(RuleConfigError, "排除表达式"):
+            load_rules(self.path)
+
+    def test_unambiguous_repeats_are_accepted(self):
+        # A separator outside the repeated class, or a bounded inner repeat, keeps
+        # each iteration unambiguous (the built-in generic.exception uses the first form).
+        patterns = [r"(?:[A-Za-z_][A-Za-z0-9_]*\.)*Exception", r"(?:\s*,\s*\w+)*;", r"(?:\w+\s+)*end",
+                    r"(?:\d{1,3}\.){3}\d{1,3}", r"(?:(?:\w+)?\.)*x", r"(a|ab)*c", r"(?:\w+\s){2,5}"]
+        if sys.version_info >= (3, 11):
+            patterns += [r"(?>a+)+b", r"(?:a++)*b"]
+        for pattern in patterns:
+            with self.subTest(pattern=pattern):
+                self.write_rule({**self.rule, "pattern": "CUSTOM_FAILURE " + pattern})
+                self.assertEqual(load_rules(self.path)[-1].pattern, "CUSTOM_FAILURE " + pattern)
 
     def test_invalid_json_and_schema(self):
         for content in ("{bad", "[]", '{"schema_version": true, "rules": []}', '{"schema_version": 2, "rules": []}'):

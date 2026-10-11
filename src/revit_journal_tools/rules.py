@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import RuleMatch, SEVERITY_RANK
+from .regex_safety import nested_quantifier_risk
 
 
 class RuleConfigError(ValueError):
@@ -59,6 +60,13 @@ class Rule:
             raise RuleConfigError(f"规则{self.id}的正则无效：{error}") from error
         if self._compiled.search("") is not None:
             raise RuleConfigError(f"规则{self.id}不能匹配空字符串")
+        for source in (self.pattern, *self.exclude_patterns):
+            if nested_quantifier_risk(source):
+                what = "正则" if source == self.pattern else f"排除表达式{source!r}"
+                raise RuleConfigError(
+                    f"规则{self.id}的{what}可能灾难性回溯：可重复的组里有无界量词，且其后可能出现的字符与它重叠"
+                    "（如(a+)+、(\\w+\\s?)*）。请改写为前后互斥的形式（如(?:\\w+\\.)*），"
+                    "或使用原子组(?>...)/占有量词a++（Python 3.11+）")
         if any(not isinstance(term, str) or not term for term in self.gate):
             raise RuleConfigError(f"规则{self.id}的gate必须是非空字符串数组")
         object.__setattr__(self, "gate", tuple(dict.fromkeys(fold(term) for term in self.gate)))

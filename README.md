@@ -199,6 +199,7 @@ src/revit_journal_tools/
   reader.py              逐文件编码判定、严格/退化解码、流式读取、哈希与源文件变化检查
   sessions.py            按文件名把主Journal、Worker、副本、dmp归入会话，副本按字节去重
   rules.py               规则加载、验证与匹配
+  regex_safety.py        规则正则加载时的灾难性回溯（嵌套量词）检查
   data/builtin_rules.json 内置规则
   analyzer.py            上下文、计数、有限容量的明细与分组
   models.py              结构化报告
