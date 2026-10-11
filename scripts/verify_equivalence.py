@@ -8,7 +8,8 @@ Modes:
   scan    compare analyze() results (no retention cap) of --old-src and --new-src
   blocks  compare the index tables (lines: category/severity/rules/body hash;
           blocks: range, category, severity, rules, title, boundary, complete,
-          add-in fields) built by --old-src and --new-src
+          add-in fields; phase, fingerprint and session summary when both
+          trees write them) built by --old-src and --new-src
   gates   in --new-src only: gated rule matching vs the same rules without gates
 
 Run from the repository root. Extract the old tree outside the repository, e.g.
@@ -32,6 +33,9 @@ TEXT_SUFFIXES = {".txt", ".log", ".journal"}
 BLOCK_COLUMNS = ("start_line", "end_line", "category", "severity", "rules", "title", "title_line",
                  "boundary", "complete", "addin_origin", "addin_evidence", "addin_name", "addin_class",
                  "addin_identity_truncated")
+# Written by later index versions; compared only when both trees write them.
+OPTIONAL_BLOCK_COLUMNS = ("phase", "fingerprint")
+OPTIONAL_KEYS = {"file": ("summary",), "block": OPTIONAL_BLOCK_COLUMNS}
 
 
 def local_journals():
@@ -105,12 +109,19 @@ def dump_blocks(paths, encoding, out, together=False):
                     continue
                 file_id = row[0]
                 counts = connection.execute("SELECT counts FROM files WHERE id=?", (file_id,)).fetchone()[0]
+                summary = {}
+                if "summary" in {column[1] for column in connection.execute("PRAGMA table_info(files)")}:
+                    summary["summary"] = digest(connection.execute(
+                        "SELECT summary FROM files WHERE id=?", (file_id,)).fetchone()[0])
+                block_columns = {column[1] for column in connection.execute("PRAGMA table_info(blocks)")}
+                columns = BLOCK_COLUMNS + tuple(name for name in OPTIONAL_BLOCK_COLUMNS if name in block_columns)
                 stats = connection.execute("SELECT block_count,counts FROM block_stats WHERE file_id=?",
                                            (file_id,)).fetchone()
                 stream.write(json.dumps({"file": label(path), "kind": "file", "status": row[1],
                                          "line_count": row[2], "sha256": row[3], "counts": json.loads(counts),
                                          "block_count": stats and stats[0],
-                                         "block_counts": stats and json.loads(stats[1])}, sort_keys=True) + "\n")
+                                         "block_counts": stats and json.loads(stats[1]), **summary},
+                                        sort_keys=True) + "\n")
                 for number, body, category, severity, rules in connection.execute(
                         "SELECT line_number,body,category,severity,rules FROM lines WHERE file_id=? "
                         "ORDER BY line_number", (file_id,)):
@@ -118,9 +129,9 @@ def dump_blocks(paths, encoding, out, together=False):
                                              "body": digest(body), "category": category,
                                              "severity": severity, "rules": rules}) + "\n")
                 for values in connection.execute(
-                        "SELECT " + ",".join(BLOCK_COLUMNS) + " FROM blocks WHERE file_id=? ORDER BY start_line",
+                        "SELECT " + ",".join(columns) + " FROM blocks WHERE file_id=? ORDER BY start_line",
                         (file_id,)):
-                    record = dict(zip(BLOCK_COLUMNS, values))
+                    record = dict(zip(columns, values))
                     record["title"] = digest(record["title"])
                     stream.write(json.dumps({"file": label(path), "kind": "block", **record}, sort_keys=True) + "\n")
             finally:
@@ -175,6 +186,10 @@ def compare(old_file, new_file):
         for old_line, new_line in zip(old, new):
             rows += 1
             a, b = json.loads(old_line), json.loads(new_line)
+            for key in OPTIONAL_KEYS.get(a.get("kind"), ()):
+                if (key in a) != (key in b):
+                    a.pop(key, None)
+                    b.pop(key, None)
             counts[a.get("kind", "file")] = counts.get(a.get("kind", "file"), 0) + 1
             if a != b:
                 mismatches += 1

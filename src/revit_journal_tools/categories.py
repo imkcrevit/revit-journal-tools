@@ -38,18 +38,39 @@ def _worst(matches) -> str:
     return max((match.severity for match in matches), key=SEVERITY_RANK.__getitem__)
 
 
+# Outside API_ERROR braces the result and the next state are a function of the
+# text and the two continuation flags; about half of a Journal's lines repeat
+# an earlier (text, flags) pair. Bounded: cleared when full.
+_CACHE_LIMIT = 16_384
+
+
 class Categorizer:
     def __init__(self, rules: tuple[Rule, ...]):
         self.rules = rules
         self._api_depth = 0
         self._operation_continuation = False
         self._dialog_continuation = False
+        self._cache: dict[tuple[str, bool, bool], tuple] = {}
 
     def _matches(self, text: str, folded: str):
         # match_rules skips lines without any gate term of the rule set.
         return match_rules(self.rules, text, folded)
 
     def classify(self, text: str) -> tuple[str, str, str]:
+        if self._api_depth:
+            return self._classify(text)
+        key = (text, self._operation_continuation, self._dialog_continuation)
+        cached = self._cache.get(key)
+        if cached is not None:
+            result, self._api_depth, self._operation_continuation, self._dialog_continuation = cached
+            return result
+        result = self._classify(text)
+        if len(self._cache) >= _CACHE_LIMIT:
+            self._cache.clear()
+        self._cache[key] = (result, self._api_depth, self._operation_continuation, self._dialog_continuation)
+        return result
+
+    def _classify(self, text: str) -> tuple[str, str, str]:
         lower = text.lower()
         is_api_error = "api_error" in lower and bool(_API_ERROR.search(text))
         folded = lower if text.isascii() else fold(text)

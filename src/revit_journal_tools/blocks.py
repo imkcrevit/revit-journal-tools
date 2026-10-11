@@ -39,6 +39,20 @@ _STRONG_GATE = ("error", "exceptioncode", "assertion failed")
 _NATIVE_GATE = ("exception",)
 _NATIVE_CODE_GATE = ("exceptioncode",)
 _EXCEPTION_GATE = ("Exception", "Error")
+
+
+def _union(*gates: tuple[str, ...]) -> tuple[str, ...]:
+    """Folded terms of several gates; a term containing another is redundant."""
+    terms = {term.lower() for gate in gates for term in gate}
+    return tuple(sorted(term for term in terms if not any(other != term and other in term for other in terms)))
+
+
+# Most lines contain none of the terms of any shape gate: one pass rules out
+# every shape test (and the case-sensitive _EXCEPTION_GATE, whose folded terms
+# are included) before the per-shape gates run.
+_SHAPE_GATE = _union(_API_GATE, _METRIC_GATE, _SECTION_GATE, _STRONG_GATE, START_GATE, _NATIVE_GATE,
+                     _NATIVE_CODE_GATE, _EXCEPTION_GATE)
+_ERROR_CATEGORIES = frozenset({"error", "api_error", "warning"})
 _NORMALIZE = re.compile(r"^\s*'(?:[A-Z]\s+\d{1,2}-[A-Za-z]+-\d{4}\s+[\d:.]+;)?\s*(?:\d+\.\d+\s+)?(?:\d+:<+\s*)?")
 _REPEATS = re.compile(r"\s*-\s*\d+\s+times\s*$")
 PHASES = {
@@ -77,6 +91,63 @@ def normalized_from(text: str, content: str) -> str:
     return content
 
 
+def _phase_marker(text: str, folded: str, command: bool) -> str:
+    """The phase a line moves to whatever the current phase ("" for none)."""
+    # Spelled out instead of any(map(...)) where the terms are fixed.
+    if ("exitmanagedinstance" in folded or "finished recording journal file" in folded
+            or "journal exit" in folded or "license shutdown starting" in folded):
+        return "shutdown"
+    if "openfrommodelpath" in folded or (command and any(map(folded.__contains__, _OPEN_COMMANDS))):
+        return "document_open"
+    if command and not _PASSIVE_JRN.match(text):
+        # A user action ends start-up; answering the open dialog (Jrn.Data) does not end opening.
+        return "interactive"
+    return ""
+
+
+def _shape(text: str) -> tuple:
+    """Everything BlockBuilder.feed needs from the text alone (unpacked there in
+    this order). Each shape test runs its regex only when its literal gate is present."""
+    content = payload(text)
+    folded = fold(text)
+    has = folded.__contains__
+    timestamp = _TIMESTAMP.match(text)
+    command = _COMMAND.match(text) is not None
+    api = api_open = api_error = False
+    if any(map(has, _SHAPE_GATE)):
+        match = _API.search(text) if any(map(has, _API_GATE)) else None
+        if match:
+            api, api_open, api_error = True, match.group(2) == "{", match.group(1).upper() == "ERROR"
+        metric = any(map(has, _METRIC_GATE)) and bool(_METRIC.search(content))
+        section = any(map(has, _SECTION_GATE)) and bool(_SECTION.search(content))
+        strong = any(map(has, _STRONG_GATE)) and bool(_STRONG_ERROR.search(content))
+        start_gate = any(map(has, START_GATE))
+        addin_start = start_gate and is_addin_start(text, folded)
+        native_gate = any(map(has, _NATIVE_GATE))
+        native_start = native_gate and bool(_NATIVE_START.search(text))
+        native_detail = native_gate and bool(_NATIVE_DETAIL.search(text))
+        native_code = any(map(has, _NATIVE_CODE_GATE)) and bool(_NATIVE_CODE.search(text))
+        exception = any(map(content.__contains__, _EXCEPTION_GATE)) and bool(_EXCEPTION.search(content))
+    else:
+        metric = section = strong = start_gate = addin_start = False
+        native_start = native_detail = native_code = exception = False
+    return (
+        content, normalized_from(text, content).encode("utf-8", "surrogatepass") + b"\n",
+        timestamp is not None,
+        # Empty 'H/'E records introduce the following command or API block.
+        timestamp is not None and not _RECORD_PREFIX.sub("", timestamp.group(1)).strip(),
+        command, api, api_open, api_error, metric, section, strong, start_gate, addin_start,
+        native_start, native_detail, native_code, exception,
+        _phase_marker(text, folded, command), any(map(has, _LICENSING_MARKS)),
+        text.rstrip().endswith("_"), text.count("{") - text.count("}"), "GUI Resource Usage" in content,
+    )
+
+
+# Like Categorizer results, about half of a Journal's lines repeat an earlier
+# text; _shape is pure, so feed caches it. Bounded: cleared when full.
+_SHAPE_CACHE_LIMIT = 16_384
+
+
 @dataclass
 class JournalBlock:
     start_line: int
@@ -112,27 +183,20 @@ class BlockBuilder:
         self.loading = LoadingEvidence()
         self.phase = "startup"
         self._digest = None
+        self._shapes: dict[str, tuple] = {}
 
     def _open(self, line: JournalLine, category: str, boundary: str) -> None:
         self.current = JournalBlock(line.number, line.number, category, boundary=boundary, phase=self.phase)
         self._digest = hashlib.blake2b(digest_size=8)
 
-    def _advance_phase(self, text: str, folded: str, command, addin_start: bool) -> None:
+    def _advance_phase(self, marker: str, licensing: bool, addin_start: bool) -> None:
         """Session phase from explicit markers; a reading aid, not a diagnosis."""
         phase = self.phase
         if phase == "shutdown":
             return
-        has = folded.__contains__
-        # Spelled out instead of any(map(...)): this runs on every line.
-        if ("exitmanagedinstance" in folded or "finished recording journal file" in folded
-                or "journal exit" in folded or "license shutdown starting" in folded):
-            self.phase = "shutdown"
-        elif "openfrommodelpath" in folded or (command and any(map(has, _OPEN_COMMANDS))):
-            self.phase = "document_open"
-        elif command and not _PASSIVE_JRN.match(text):
-            # A user action ends start-up; answering the open dialog (Jrn.Data) does not end opening.
-            self.phase = "interactive"
-        elif phase == "startup" and any(map(has, _LICENSING_MARKS)):
+        if marker:
+            self.phase = marker
+        elif phase == "startup" and licensing:
             self.phase = "licensing"
         elif phase in ("startup", "licensing") and addin_start:
             self.phase = "addin_loading"
@@ -142,10 +206,15 @@ class BlockBuilder:
             return []
         block = self.current
         block.complete = complete
-        block.addin_origin, block.addin_evidence = self.loading.finish()
-        block.addin_name = self.loading.name
-        block.addin_class = self.loading.class_name
-        block.addin_identity_truncated = self.loading.identity_truncated
+        loading = self.loading
+        if loading.active:
+            # An inactive LoadingEvidence holds nothing (the block keeps its
+            # empty add-in defaults) and is reused for the next block.
+            block.addin_origin, block.addin_evidence = loading.finish()
+            block.addin_name = loading.name
+            block.addin_class = loading.class_name
+            block.addin_identity_truncated = loading.identity_truncated
+            self.loading = LoadingEvidence()
         # Same category and same content apart from timestamps, level prefixes
         # and "- N times" counters: the list folds such blocks into one entry.
         block.fingerprint = hashlib.blake2b(block.category.encode() + b"\0" + self._digest.digest(),
@@ -158,19 +227,19 @@ class BlockBuilder:
         self.has_exception = False
         self.native_pending = False
         self.native_code = False
-        self.loading = LoadingEvidence()
         return [block]
 
     def _add(self, line: JournalLine, category: str, severity: str, rules: str,
-             content: str | None = None, folded: str | None = None) -> None:
-        """content/folded are payload(line.text)/fold(line.text) when the caller has them."""
+             content: str, digest: bytes, start_gate: bool) -> None:
+        """content: payload(line.text); digest: its fold-fingerprint bytes;
+        start_gate: the line contains a START_GATE term."""
         block = self.current
         assert block is not None
         block.end_line = line.number
-        if content is None:
-            content = payload(line.text)
-        self._digest.update(normalized_from(line.text, content).encode("utf-8", "surrogatepass") + b"\n")
-        self.loading.feed(line.number, line.text, folded)
+        self._digest.update(digest)
+        if start_gate or self.loading.active:
+            # Without the gate an inactive LoadingEvidence.feed returns at once.
+            self.loading.feed(line.number, line.text)
         if block.category == "other" and category != "other":
             block.category = category
         elif category == "dialog" and block.category == "operation":
@@ -181,35 +250,28 @@ class BlockBuilder:
         if rules:
             block.rules.update(rule for rule in rules.split(",") if rule)
         if not block.title:
-            if content is None:
-                content = payload(line.text)
             if content:
                 block.title = content[:700]
                 block.title_line = line.number
         elif self.continued and block.title.endswith("_") and len(block.title) < _JOINED_TITLE:
             # "Jrn.Data  _" says nothing; the continuation lines name the record.
-            if content is None:
-                content = payload(line.text)
             block.title = (block.title[:-1].rstrip() + " " + content)[:_JOINED_TITLE]
 
     def feed(self, line: JournalLine, classification: tuple[str, str, str]) -> list[JournalBlock]:
         category, severity, rules = classification
         text = line.text
-        content = payload(text)
-        folded = fold(text)
-        # Each shape test runs its regex only when its literal gate is present;
-        # all of them are pure functions of this line, so evaluating them once
+        # All of these are pure functions of the text, so evaluating them once
         # up front is equivalent to the original lazy, repeated evaluation.
-        has = folded.__contains__
-        timestamp = _TIMESTAMP.match(text)
-        api = _API.search(text) if any(map(has, _API_GATE)) else None
-        command = _COMMAND.match(text)
-        metric = any(map(has, _METRIC_GATE)) and bool(_METRIC.search(content))
-        section = any(map(has, _SECTION_GATE)) and bool(_SECTION.search(content))
-        strong = any(map(has, _STRONG_GATE)) and bool(_STRONG_ERROR.search(content))
-        addin_start = any(map(has, START_GATE)) and is_addin_start(text, folded)
-        native_start = any(map(has, _NATIVE_GATE)) and bool(_NATIVE_START.search(text))
-        self._advance_phase(text, folded, command, addin_start)
+        shape = self._shapes.get(text)
+        if shape is None:
+            shape = _shape(text)
+            if len(self._shapes) >= _SHAPE_CACHE_LIMIT:
+                self._shapes.clear()
+            self._shapes[text] = shape
+        (content, digest, timestamp, empty_record, command, api, api_open, api_error, metric, section, strong,
+         start_gate, addin_start, native_start, native_detail, native_code, exception, marker, licensing,
+         continued, braces, gui_usage) = shape
+        self._advance_phase(marker, licensing, addin_start)
         if self.pending_timestamp and self.current is not None:
             # The empty timestamp record belongs to the command it introduces.
             self.current.phase = self.phase
@@ -218,23 +280,21 @@ class BlockBuilder:
 
         # Native exception records often put the code on a timestamped next
         # line; that timestamp must not break the same exception into two rows.
-        native_code = any(map(has, _NATIVE_CODE_GATE)) and bool(_NATIVE_CODE.search(text))
-        if (self.current and self.native_pending and any(map(has, _NATIVE_GATE)) and _NATIVE_DETAIL.search(text)
-                and not (native_code and self.native_code)):
-            self._add(line, category, severity, rules, content, folded)
+        if self.current and self.native_pending and native_detail and not (native_code and self.native_code):
+            self._add(line, category, severity, rules, content, digest, start_gate)
             self.native_code |= native_code
             return result
 
         # Explicit new records recover an unclosed brace/continuation block.
         if self.current and (self.api_depth or self.continued):
             if not (timestamp or api or command or strong or addin_start):
-                self._add(line, category, severity, rules, content, folded)
+                self._add(line, category, severity, rules, content, digest, start_gate)
                 if self.api_depth:
-                    self.api_depth += text.count("{") - text.count("}")
+                    self.api_depth += braces
                     if self.api_depth <= 0:
                         result += self._flush()
                 else:
-                    self.continued = text.rstrip().endswith("_")
+                    self.continued = continued
                     if not self.continued:
                         result += self._flush()
                 return result
@@ -244,13 +304,11 @@ class BlockBuilder:
             result += self._flush()
             self._open(line, category, "timestamp")
             self.kind = "paragraph"
-            self._add(line, category, severity, rules, content, folded)
+            self._add(line, category, severity, rules, content, digest, start_gate)
             self.native_pending = native_start or native_code
             self.native_code = native_code
-            # Empty 'H/'E records introduce the following command or API block.
-            rest = _RECORD_PREFIX.sub("", timestamp.group(1)).strip()
-            self.pending_timestamp = not rest
-            if not rest:
+            self.pending_timestamp = empty_record
+            if empty_record:
                 self.current.title = ""
             if not api:
                 return result
@@ -260,23 +318,22 @@ class BlockBuilder:
             if self.current is None:
                 self._open(line, "other", "blank")
                 self.kind = "blank"
-            self._add(line, category, severity, rules, content, folded)
+            self._add(line, category, severity, rules, content, digest, start_gate)
             if self.kind != "blank":
                 result += self._flush()
             return result
 
-        exception = any(map(content.__contains__, _EXCEPTION_GATE)) and bool(_EXCEPTION.search(content))
-        stack = bool(_STACK.search(content))
-        indented = bool(_INDENTED.match(text))
+        # The stack and indentation tests only matter after an error record.
         error_followup = bool(
-            self.current and self.current.category in {"error", "api_error", "warning"}
+            self.current and self.current.category in _ERROR_CATEGORIES
             and not api and not command and not strong
-            and (stack or (exception and not self.has_exception) or (indented and category == "other"))
+            and (_STACK.search(content) or (exception and not self.has_exception)
+                 or (category == "other" and _INDENTED.match(text)))
         )
         boundary = "paragraph"
         if api:
-            boundary = "api_braces" if api.group(2) == "{" else "api_record"
-            category = "api_error" if api.group(1).upper() == "ERROR" else "api"
+            boundary = "api_braces" if api_open else "api_record"
+            category = "api_error" if api_error else "api"
         elif command:
             boundary = "journal_command"
         elif metric:
@@ -288,16 +345,16 @@ class BlockBuilder:
             boundary = "addin_load"
         elif category == "dialog":
             boundary = "dialog"
-        elif category in {"error", "api_error", "warning"} and not error_followup:
+        elif category in _ERROR_CATEGORIES and not error_followup:
             boundary = "error_record"
 
         new_record = boundary != "paragraph"
-        if metric and self.kind == "resource_sample" and "GUI Resource Usage" in content:
+        if metric and self.kind == "resource_sample" and gui_usage:
             new_record = False
         if self.current and not self.pending_timestamp:
             changed_category = category != "other" and category != self.current.category
             if (self.kind == "blank" or new_record or (changed_category and not error_followup)
-                    or (self.current.category in {"error", "api_error", "warning"} and not error_followup)):
+                    or (self.current.category in _ERROR_CATEGORIES and not error_followup)):
                 result += self._flush()
 
         if self.current is None:
@@ -310,20 +367,20 @@ class BlockBuilder:
                 self.current.boundary = "timestamp+" + boundary
                 self.kind = boundary
         self.pending_timestamp = False
-        self._add(line, category, severity, rules, content, folded)
+        self._add(line, category, severity, rules, content, digest, start_gate)
         self.has_exception |= exception
         self.native_pending |= native_start or native_code
         self.native_code |= native_code
 
         if api:
-            self.api_depth = max(0, text.count("{") - text.count("}")) if api.group(2) == "{" else 0
-            if not self.api_depth and api.group(2) == "{":
+            self.api_depth = max(0, braces) if api_open else 0
+            if not self.api_depth and api_open:
                 result += self._flush()
         elif command:
-            self.continued = text.rstrip().endswith("_")
+            self.continued = continued
             if not self.continued:
                 result += self._flush()
-        elif self.kind == "resource_sample" and "GUI Resource Usage" in content:
+        elif self.kind == "resource_sample" and gui_usage:
             result += self._flush()
         return result
 

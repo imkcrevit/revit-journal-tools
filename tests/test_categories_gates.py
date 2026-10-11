@@ -31,7 +31,7 @@ REGEX_GATES = [
 UNGATED = {
     "revit_journal_tools.categories": ["_JOURNAL_GATE", "_STARTUP_GATE", "_SYSTEM_GATE", "_DIALOG_GATE"],
     "revit_journal_tools.blocks": ["_API_GATE", "_METRIC_GATE", "_SECTION_GATE", "_STRONG_GATE", "_NATIVE_GATE",
-                                   "_NATIVE_CODE_GATE", "_EXCEPTION_GATE", "START_GATE"],
+                                   "_NATIVE_CODE_GATE", "_EXCEPTION_GATE", "START_GATE", "_SHAPE_GATE"],
     "revit_journal_tools.loading": ["START_GATE"],
 }
 STRUCTURE = [
@@ -98,7 +98,7 @@ def run(lines):
     result.extend(builder.finish())
     blocks_ = [(b.start_line, b.end_line, b.category, b.severity, sorted(b.rules), b.title, b.title_line,
                 b.boundary, b.complete, b.addin_origin, b.addin_evidence, b.addin_name, b.addin_class,
-                b.addin_identity_truncated) for b in result]
+                b.addin_identity_truncated, b.phase, b.fingerprint) for b in result]
     return classes, blocks_
 
 
@@ -118,6 +118,13 @@ class ShapeGateTests(unittest.TestCase):
         # Each regex is exercised by the corpus.
         self.assertTrue(all(matched.values()), matched)
 
+    def test_shape_gate_covers_every_shape_gate(self):
+        # A line without any _SHAPE_GATE term skips every shape test at once.
+        for gate in (blocks._API_GATE, blocks._METRIC_GATE, blocks._SECTION_GATE, blocks._STRONG_GATE,
+                     blocks._NATIVE_GATE, blocks._NATIVE_CODE_GATE, blocks._EXCEPTION_GATE, loading.START_GATE):
+            for term in gate:
+                self.assertTrue(any(shape in fold(term) for shape in blocks._SHAPE_GATE), term)
+
     def test_gated_and_ungated_classification_and_blocks_are_identical(self):
         for number, lines in enumerate(sample_journals()):
             with self.subTest(journal=number):
@@ -134,6 +141,46 @@ class ShapeGateTests(unittest.TestCase):
                 self.assertEqual(gated[0], ungated[0])
                 self.assertEqual(gated[1], ungated[1])
                 self.assertTrue(gated[1])
+
+
+class _NoCache(dict):
+    def get(self, key, default=None):
+        return default
+
+    def __setitem__(self, key, value):
+        pass
+
+
+class LineCacheTests(unittest.TestCase):
+    def test_cached_tiny_and_uncached_results_are_identical(self):
+        # The fuzz journals repeat the same texts in different continuation
+        # states and block contexts; a tiny limit exercises the clearing.
+        original_init = BlockBuilder.__init__
+
+        def uncached_init(self):
+            original_init(self)
+            self._shapes = _NoCache()
+
+        for number, lines in enumerate(sample_journals()):
+            with self.subTest(journal=number):
+                cached = run(lines)
+                with patch.object(categories, "_CACHE_LIMIT", 4), patch.object(blocks, "_SHAPE_CACHE_LIMIT", 4):
+                    tiny = run(lines)
+                with patch.object(Categorizer, "classify", Categorizer._classify), \
+                        patch.object(BlockBuilder, "__init__", uncached_init):
+                    uncached = run(lines)
+                self.assertEqual(cached, uncached)
+                self.assertEqual(tiny, uncached)
+
+    def test_caches_are_bounded(self):
+        lines = fuzz_journal(4, 3000)
+        self.assertLess(len(set(lines)), len(lines))  # repeats exist, so the caches are used
+        categorizer, builder = Categorizer(load_rules()), BlockBuilder()
+        with patch.object(categories, "_CACHE_LIMIT", 50), patch.object(blocks, "_SHAPE_CACHE_LIMIT", 50):
+            for number, text in enumerate(lines, 1):
+                builder.feed(JournalLine(number, text), categorizer.classify(text))
+                self.assertLessEqual(len(categorizer._cache), 50)
+                self.assertLessEqual(len(builder._shapes), 50)
 
 
 if __name__ == "__main__":

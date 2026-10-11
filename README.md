@@ -246,7 +246,7 @@ py -3 scripts/verify_equivalence.py blocks --together --old-src <旧src目录>
 py -3 scripts/windows_console_probe.py <journal.txt> [--host wt] [--ctrl-c]
 ```
 
-本机实测（Windows 10、Python 3.12，2026-10-10）：6.47MB/85,387行真实Journal扫描约0.5s（约13MB/s），建索引约2.2s（约3.8万行/秒）；Revit 2024目录21个文本文件11MB的`browse --print`约2.6s。
+本机实测（Windows 10、Python 3.12，2026-10-10）：6.47MB/85,387行真实Journal扫描约0.4s（约17MB/s），建索引约2.4s（约3.6万行/秒）；Revit 2024目录22个文件约11MB的`browse --print`约2.8s。
 
 安装包后，Windows也可使用`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`运行同一套测试。
 
