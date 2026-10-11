@@ -9,7 +9,10 @@ from importlib.resources import files
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from .blocks import PHASES
 from .categories import CATEGORIES
+from .loading import BLOCK_FILTERS, block_label, block_summary
+from .session_view import main_tail, session_label, summary_lines
 from .viewer_index import ViewerIndex
 
 _ASSETS = {
@@ -17,6 +20,32 @@ _ASSETS = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
+
+
+def session_view(index: ViewerIndex, file_id: int) -> dict:
+    """The session a file belongs to, rendered by the same code as `summary`
+    and the terminal summary panel. Line numbers refer to main_id."""
+    catalog = index.catalog()
+    session = next((item for item in index.sessions(catalog) if file_id in item["files"]), None)
+    if session is None:
+        raise KeyError("文件未在当前工作区中")
+    main = next((item for item in catalog if item["path"] == session.get("main")), None)
+    return {"label": session_label(session, {item["id"]: item for item in catalog}),
+            "main_id": main["id"] if main else None, "end_state": session.get("end_state"),
+            "end_state_label": session.get("end_state_label"),
+            "finding_count": len(session.get("session_findings") or []),
+            "lines": summary_lines(session, main_tail(index, session, catalog, 10))}
+
+
+def _labelled(block: dict) -> dict:
+    """List text as in the terminal: category (and add-in origin) label and summary."""
+    return {**block, "label": block_label(block), "summary": block_summary(block)}
+
+
+def _flag(text: str) -> bool:
+    if text not in ("0", "1"):
+        raise ValueError("fold必须为0或1")
+    return text == "1"
 
 
 def make_server(index: ViewerIndex, port: int = 8765) -> ThreadingHTTPServer:
@@ -55,15 +84,36 @@ def make_server(index: ViewerIndex, port: int = 8765) -> ThreadingHTTPServer:
 
             started = time.perf_counter()
             try:
+                file_id = int(value("file", "0"))
                 if route.path == "/api/files":
-                    result = {"files": index.catalog(), "categories": CATEGORIES}
+                    result = {"files": index.catalog(), "categories": CATEGORIES, "block_filters": BLOCK_FILTERS,
+                              "phases": PHASES}
                 elif route.path == "/api/events":
-                    result = index.events(
-                        int(value("file", "0")), value("category", "all"),
-                        value("q", ""), int(value("after", "0")), int(value("limit", "100")),
-                    )
+                    result = index.events(file_id, value("category", "all"), value("q", ""),
+                                          int(value("after", "0")), int(value("limit", "100")))
                 elif route.path == "/api/context":
-                    result = index.context(int(value("file", "0")), int(value("line", "1")), int(value("radius", "8")))
+                    result = index.context(file_id, int(value("line", "1")), int(value("radius", "8")))
+                elif route.path == "/api/session":
+                    result = session_view(index, file_id)
+                elif route.path == "/api/blocks":
+                    result = index.blocks(file_id, value("category", "all"), value("q", ""),
+                                          int(value("after", "0")), int(value("limit", "100")),
+                                          phase=value("phase", "all"), fold=_flag(value("fold", "1")))
+                    result["items"] = [_labelled(item) for item in result["items"]]
+                elif route.path == "/api/block":
+                    result = index.block_lines(file_id, int(value("start", "1")), int(value("offset", "0")),
+                                               int(value("limit", "200")))
+                    result["block"] = _labelled(result["block"])
+                    # Same provenance fields as /api/context (hash, actual encoding, degraded lines).
+                    source = index.context(file_id, result["block"]["start_line"], 0)
+                    result.update({key: item for key, item in source.items() if key not in ("line", "items")})
+                elif route.path == "/api/block_at":
+                    result = _labelled(index.block_at(file_id, int(value("line", "1"))))
+                elif route.path == "/api/fold":
+                    fingerprint = value("fingerprint", "")
+                    if not 1 <= len(fingerprint) <= 64:
+                        raise ValueError("折叠指纹无效")
+                    result = index.fold_members(file_id, fingerprint)
                 else:
                     self.respond(404, {"error": "资源不存在"})
                     return

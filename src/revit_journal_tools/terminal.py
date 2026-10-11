@@ -14,8 +14,8 @@ from pathlib import Path
 
 from .blocks import PHASES
 from .loading import ADDIN_FILTERS, ADDIN_KEYS, BLOCK_FILTERS, block_label, block_summary
-from .session_view import (duration_text, file_date, phase_label, session_label, sidecar_label, state_text,
-                           summary_lines)
+from .session_view import (duration_text, file_date, main_tail, phase_label, session_label, sidecar_label,
+                           state_text, summary_lines)
 from .reader import basis_label
 from .viewer_index import ViewerIndex
 
@@ -491,11 +491,6 @@ def _session_json(session: dict, sources: dict, tail: list[dict] | None = None) 
     return result
 
 
-def _main_tail(index, session: dict, catalog: list[dict], limit: int) -> list[dict]:
-    main = next((item for item in catalog if item["path"] == session.get("main")), None)
-    return index.tail_blocks(main["id"], limit) if main and main["status"] == "ready" else []
-
-
 def _print_summary(index, format_name, tail_limit=10):
     """`summary`: one entry per session, newest first."""
     catalog = index.catalog()
@@ -504,7 +499,7 @@ def _print_summary(index, format_name, tail_limit=10):
     failed = any(item["status"] != "ready" for item in catalog)
     if format_name == "json":
         print(json.dumps({"schema_version": 1, "sessions": [
-            _session_json(session, sources, _main_tail(index, session, catalog, tail_limit)) for session in sessions],
+            _session_json(session, sources, main_tail(index, session, catalog, tail_limit)) for session in sessions],
             "errors": [{"source": item["path"], "error": item["error"]} for item in catalog
                        if item["status"] != "ready"]}, ensure_ascii=False))
         return 2 if failed else 0
@@ -512,7 +507,7 @@ def _print_summary(index, format_name, tail_limit=10):
     print(f"共{len(sessions)}个会话；未正常结束{unclean}个；会话级发现均为候选，需结合原文复核。")
     for session in sessions:
         print()
-        for text in summary_lines(session, _main_tail(index, session, catalog, tail_limit)):
+        for text in summary_lines(session, main_tail(index, session, catalog, tail_limit)):
             print(safe_text(text))
     for item in catalog:
         if item["status"] != "ready":

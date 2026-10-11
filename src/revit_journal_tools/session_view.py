@@ -70,6 +70,12 @@ def session_label(session: dict, files: dict) -> str:
     return f"{head} | " + " | ".join(facts) + " | " + "、".join(parts)
 
 
+def main_tail(index, session: dict, catalog: list[dict], limit: int) -> list[dict]:
+    """The last operations and dialogs of the session's main journal (summary_lines' tail)."""
+    main = next((item for item in catalog if item["path"] == session.get("main")), None)
+    return index.tail_blocks(main["id"], limit) if main and main["status"] == "ready" else []
+
+
 def summary_lines(session: dict, tail: list[dict] | None = None) -> list[str]:
     """Readable summary of one session; every fact keeps its line number."""
     summary = session.get("summary") or {}

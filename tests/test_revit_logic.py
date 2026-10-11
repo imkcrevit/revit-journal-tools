@@ -7,7 +7,11 @@ import io
 import json
 import os
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
@@ -18,13 +22,16 @@ from revit_journal_tools.blocks import BlockBuilder
 from revit_journal_tools.categories import Categorizer
 from revit_journal_tools.cli import main
 from revit_journal_tools.discovery import journal_folders, parse_years
+from revit_journal_tools.loading import block_summary
 from revit_journal_tools.live import Snapshot, take_snapshot, wants_snapshot
 from revit_journal_tools.reader import JournalLine
+from revit_journal_tools.session_view import main_tail, summary_lines
 from revit_journal_tools.rules import load_rules, match_rules
 from revit_journal_tools.sidecars import (attach_steel_logs, match_cer, match_steel_log, parse_steel_log,
                                           session_window)
 from revit_journal_tools.summary import SessionCollector, session_findings
 from revit_journal_tools.viewer_index import ViewerIndex
+from revit_journal_tools.viewer_server import make_server
 
 SESSION = [
     "' 0:< Initial VM: Avail 100 MB, Used 24 MB",
@@ -553,6 +560,55 @@ class IndexViewTests(unittest.TestCase):
         for width, height in ((100, 25), (40, 12)):
             frame = browser.frame(width, height, False)
             self.assertLessEqual(len(frame.split("\r\n")), height)
+
+    def test_web_api_serves_the_same_paragraphs_session_and_folds(self):
+        # J24: the Web viewer reuses ViewerIndex.blocks/block_lines/fold_members and summary_lines.
+        server = make_server(self.index, 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback, no system proxy
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def url(path, params):
+            return base + path + "?" + urllib.parse.urlencode({"file": self.file_id, **params})
+
+        def get(path, **params):
+            with opener.open(url(path, params)) as response:
+                return json.load(response)
+
+        try:
+            listed = get("/api/blocks", category="warning", fold=1)["items"]
+            expected = self.index.blocks(self.file_id, "warning", limit=100, fold=True)["items"]
+            self.assertEqual([{key: value for key, value in item.items() if key not in ("label", "summary")}
+                              for item in listed], expected)
+            self.assertEqual([item["summary"] for item in listed], [block_summary(item) for item in expected])
+            same = next(item for item in listed if "same thing" in item["title"])
+            self.assertEqual(same["fold_count"], 3)
+            self.assertEqual(get("/api/fold", fingerprint=same["fingerprint"])["start_lines"], [43, 44, 45])
+            opening = get("/api/blocks", phase="document_open", fold=0)["items"]
+            self.assertTrue(opening and all(item["phase"] == "document_open" for item in opening))
+            block = get("/api/block_at", line=30)
+            detail = get("/api/block", start=block["start_line"])
+            self.assertEqual([item["line_number"] for item in detail["items"]],
+                             list(range(block["start_line"], block["end_line"] + 1)))
+            self.assertEqual(detail["sha256"], self.index.catalog()[0]["sha256"])
+            self.assertIn("encoding_basis_label", detail)
+            session = get("/api/session")
+            catalog = self.index.catalog()
+            expected_session, = self.index.sessions(catalog)
+            self.assertEqual(session["lines"],
+                             summary_lines(expected_session, main_tail(self.index, expected_session, catalog, 10)))
+            self.assertEqual((session["main_id"], session["end_state"]), (self.file_id, "clean"))
+            for path, params in (("/api/blocks", {"fold": "yes"}), ("/api/blocks", {"phase": "lunch"}),
+                                 ("/api/fold", {"fingerprint": ""}), ("/api/session", {"file": 999})):
+                with self.subTest(path=path, params=params), self.assertRaises(urllib.error.HTTPError) as raised:
+                    opener.open(url(path, params))
+                self.assertIn(raised.exception.code, (400, 404))
+                raised.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_summary_command_reports_end_state(self):
         output, errors = io.StringIO(), io.StringIO()
