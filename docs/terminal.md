@@ -153,7 +153,7 @@ JSON中的`addin_origin`为`autodesk`、`third_party`、`unknown`，非加载事
 
 ## 索引与边界
 
-索引数据库默认在用户缓存目录：Windows为`%LOCALAPPDATA%\revit-journal-tools\cache\`，其他系统为`$XDG_CACHE_HOME/revit-journal-tools`（缺省`~/.cache`）。`browse`、`summary`、`report`共用`terminal.sqlite3`，Web查看器用`viewer.sqlite3`；环境变量`REVIT_JOURNAL_CACHE`或`--database`可改变位置。缓存含完整Journal文本：`revit-journal cache`显示位置与大小，`revit-journal cache --clear`只删除这两个数据库及其`-wal/-shm`文件。早期版本写在当前目录的`.journal-cache/`不会自动删除，可手工删除。首次建立磁盘索引需要时间与空间；在交互模式下可先查看已完成的文件，再切换到后续文件。输入发生变化时提示退出重开；下次启动按文件状态、编码和索引版本重建相关文件。
+索引数据库默认在用户缓存目录：Windows为`%LOCALAPPDATA%\revit-journal-tools\cache\`，其他系统为`$XDG_CACHE_HOME/revit-journal-tools`（缺省`~/.cache`）。`browse`、`summary`、`report`共用`terminal.sqlite3`，Web查看器用`viewer.sqlite3`；环境变量`REVIT_JOURNAL_CACHE`或`--database`可改变位置。索引默认只保存每行在源Journal中的字节位置（`--store offsets`），查看时按位置从源文件读取原文，因此源文件要保持原位、不被修改；读取前核对大小、修改时间和文件标识，不一致时明确提示重新打开以重建，不会显示错位的文字。`--store text`把全文存入索引（实测为偏移方式的1.7–2.3倍），之后源文件移走也能查看。正在写入的Journal（读快照）和UTF-16等无法按字节定位行的文件总是存全文。`revit-journal cache`显示位置与大小，`revit-journal cache --clear`只删除这两个数据库及其`-wal/-shm`文件。早期版本写在当前目录的`.journal-cache/`不会自动删除，可手工删除。首次建立磁盘索引需要时间与空间；在交互模式下可先查看已完成的文件，再切换到后续文件。输入发生变化时提示退出重开；下次启动按文件状态、编码和索引版本重建相关文件。
 
 Add-in来源筛选升级了索引版本。重新打开时会自动为本次选择的旧缓存文件重建索引，大目录可能需要较长时间；无需手动删除缓存或修改原始Journal。
 

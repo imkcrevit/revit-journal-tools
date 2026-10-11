@@ -572,7 +572,7 @@ def _print_pages(index, category, query, after, limit, color, format_name, addin
 
 def run(paths, database, encoding, *, category="all", query="", color="auto", print_only=False,
         format_name="text", after=0, page_size=100, addin_prefix="", jobs=None, snapshot="auto", phase="all",
-        fold=True, summary_tail=None):
+        fold=True, summary_tail=None, store="offsets"):
     """browse (interactive or one page per file) or, with summary_tail, the session summary."""
     if not 1 <= page_size <= 200 or after < 0 or len(query) > 256 or len(addin_prefix) > 256:
         raise ValueError("分页或搜索参数超出范围")
@@ -582,7 +582,7 @@ def run(paths, database, encoding, *, category="all", query="", color="auto", pr
     interactive = (summary_tail is None and not print_only and format_name == "text"
                    and sys.stdin.isatty() and sys.stdout.isatty())
     use_color = color == "always" or (color == "auto" and sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb")
-    index = ViewerIndex(database, workers=jobs, snapshot=snapshot)
+    index = ViewerIndex(database, workers=jobs, snapshot=snapshot, store=store)
     queued = index.register(paths, encoding)
     stop = threading.Event()
     failures = []

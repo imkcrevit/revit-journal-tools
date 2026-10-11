@@ -72,6 +72,19 @@ def payload(text: str) -> str:
     return _PREFIX.sub("", text).strip()
 
 
+def join_title(title: str, content: str) -> str:
+    """'Jrn.Data  _' says nothing; each continuation line extends the title."""
+    return (title[:-1].rstrip() + " " + content)[:_JOINED_TITLE]
+
+
+def derive_title(texts: list[str]) -> str:
+    """A title_from_line title from its title line and the title_joins lines after it."""
+    title = payload(texts[0])[:700]
+    for text in texts[1:]:
+        title = join_title(title, payload(text))
+    return title
+
+
 def normalized(text: str) -> str:
     """Line content for fold fingerprints: no timestamp, level prefix or repeat counter."""
     text = _NORMALIZE.sub("", text, count=1)
@@ -157,6 +170,10 @@ class JournalBlock:
     rules: set[str] = field(default_factory=set)
     title: str = ""
     title_line: int = 0
+    # The title is derive_title() of title_line and the title_joins lines after
+    # it: an index that does not store line text reads it back from the source (J9).
+    title_from_line: bool = False
+    title_joins: int = 0
     boundary: str = "paragraph"
     complete: bool = True
     addin_origin: str = ""
@@ -253,9 +270,11 @@ class BlockBuilder:
             if content:
                 block.title = content[:700]
                 block.title_line = line.number
+                block.title_from_line = True
         elif self.continued and block.title.endswith("_") and len(block.title) < _JOINED_TITLE:
             # "Jrn.Data  _" says nothing; the continuation lines name the record.
-            block.title = (block.title[:-1].rstrip() + " " + content)[:_JOINED_TITLE]
+            block.title = join_title(block.title, content)
+            block.title_joins += 1
 
     def feed(self, line: JournalLine, classification: tuple[str, str, str]) -> list[JournalBlock]:
         category, severity, rules = classification
@@ -310,6 +329,8 @@ class BlockBuilder:
             self.pending_timestamp = empty_record
             if empty_record:
                 self.current.title = ""
+                self.current.title_from_line = False
+                self.current.title_joins = 0
             if not api:
                 return result
             self.pending_timestamp = True

@@ -11,6 +11,9 @@ Modes:
           add-in fields; phase, fingerprint and session summary when both
           trees write them) built by --old-src and --new-src
   gates   in --new-src only: gated rule matching vs the same rules without gates
+  stores  in --new-src only: index the files with store="text" and store="offsets"
+          and compare every query result (all lines page by page, all blocks with
+          and without folding, block lines, context, tail, searches)
 
 Run from the repository root. Extract the old tree outside the repository, e.g.
   git archive 4ac90a4 src | tar -x -C %TEMP%\\rjt-old
@@ -88,7 +91,10 @@ def dump_blocks(paths, encoding, out, together=False):
     seconds = 0.0
     with tempfile.TemporaryDirectory(prefix="rjt-verify-") as temporary, open(out, "w", encoding="utf-8") as stream:
         database = Path(temporary) / "verify.sqlite3"
-        index = ViewerIndex(database)
+        try:  # line text and full titles in the tables (the stores mode compares store="offsets")
+            index = ViewerIndex(database, store="text")
+        except TypeError:  # trees before the store option keep the text anyway
+            index = ViewerIndex(database)
         if together:
             # One workspace: newer trees build it with worker processes.
             started = time.perf_counter()
@@ -166,6 +172,91 @@ def run_gates(paths, encoding):
     return 1 if mismatches else 0
 
 
+SEARCHES = ("error", "jrn", "exception", "api_error", "dbg_warn", "taskdialog", "错误", "id_", "vm")
+
+
+def run_stores(paths, encoding):
+    import hashlib as _hashlib
+    from revit_journal_tools.viewer_index import ViewerIndex
+
+    differences, first, counts = 0, [], {"lines": 0, "blocks": 0, "calls": 0}
+    sizes = {}
+    started = {}
+
+    def digest_of(value):
+        return _hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    with tempfile.TemporaryDirectory(prefix="rjt-stores-", ignore_cleanup_errors=True) as temporary:
+        indexes = {}
+        for store in ("text", "offsets"):
+            database = Path(temporary) / f"{store}.sqlite3"
+            index = ViewerIndex(database, local_appdata=Path(temporary) / "none", store=store)
+            begin = time.perf_counter()
+            index.build(index.register([Path(p) for p in paths], encoding), encoding)
+            started[store] = round(time.perf_counter() - begin, 2)
+            connection = sqlite3.connect(database)
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.close()
+            sizes[store] = database.stat().st_size
+            indexes[store] = index
+        text, offsets = indexes["text"], indexes["offsets"]
+        catalogs = {item["path"]: item for item in text.catalog()}
+        for item in offsets.catalog():
+            other = catalogs[item["path"]]
+            if item["status"] != "ready" or other["status"] != "ready":
+                if item["status"] != other["status"]:
+                    differences += 1
+                    first.append([label(item["path"]), "status"])
+                continue
+            pairs = []
+
+            def call(name, *args, **kwargs):
+                counts["calls"] += 1
+                pairs.append((name, args, getattr(text, name)(other["id"], *args, **kwargs),
+                              getattr(offsets, name)(item["id"], *args, **kwargs)))
+
+            after = 0
+            while True:  # every line, 200 at a time
+                page_a = text.events(other["id"], after=after, limit=200)
+                page_b = offsets.events(item["id"], after=after, limit=200)
+                counts["lines"] += len(page_a["items"])
+                pairs.append(("events", (after,), page_a, page_b))
+                if not page_a["has_more"]:
+                    break
+                after = page_a["next_after"]
+            for fold in (False, True):
+                after = 0
+                while True:
+                    page_a = text.blocks(other["id"], after=after, limit=200, fold=fold)
+                    page_b = offsets.blocks(item["id"], after=after, limit=200, fold=fold)
+                    counts["blocks"] += len(page_a["items"]) * (not fold)
+                    pairs.append(("blocks", (after, fold), page_a, page_b))
+                    if not page_a["has_more"]:
+                        break
+                    after = page_a["next_after"]
+            starts = [block["start_line"] for block in text.blocks(other["id"], limit=200)["items"]]
+            for start in starts[::7]:
+                call("block_lines", start, 0, 200)
+            for line in range(1, other["line_count"] + 1, max(1, other["line_count"] // 25)):
+                call("context", line, 8)
+                call("block_at", line)
+            call("tail_blocks", 20)
+            for term in SEARCHES:
+                call("events", "all", term, 0, 200)
+                call("blocks", "all", term, 0, 200)
+                call("blocks", "error", term, 0, 200)
+            for name, args, a, b in pairs:
+                if digest_of(a) != digest_of(b):
+                    differences += 1
+                    if len(first) < 20:
+                        first.append([label(item["path"]), name, list(args)])
+    print(json.dumps({"files": len(paths), "lines_compared": counts["lines"], "blocks_compared": counts["blocks"],
+                      "other_calls": counts["calls"], "differences": differences, "first_differences": first,
+                      "build_seconds": started, "database_bytes": sizes,
+                      "source_bytes": sum(Path(p).stat().st_size for p in paths)}, ensure_ascii=False))
+    return 1 if differences else 0
+
+
 # ------------------------------------------------------------------ compare
 
 def spawn_dump(mode, src, paths, encoding, out, together=False):
@@ -204,7 +295,7 @@ def compare(old_file, new_file):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("mode", nargs="?", choices=("scan", "blocks", "gates"))
+    parser.add_argument("mode", nargs="?", choices=("scan", "blocks", "gates", "stores"))
     parser.add_argument("--old-src", help="source tree before the change (outside the repository)")
     parser.add_argument("--new-src", default=str(REPO / "src"))
     parser.add_argument("--encoding", default="gb18030", help="gb18030 works for every local file and old trees")
@@ -224,9 +315,9 @@ def main():
     paths = [Path(p) for p in args.files] if args.files else local_journals()
     if not paths:
         raise SystemExit("No local journals found.")
-    if args.mode == "gates":
+    if args.mode in ("gates", "stores"):
         sys.path.insert(0, str(Path(args.new_src).resolve()))
-        return run_gates(paths, args.encoding)
+        return (run_gates if args.mode == "gates" else run_stores)(paths, args.encoding)
     if not args.old_src or not args.mode:
         parser.error("scan/blocks need --old-src")
     with tempfile.TemporaryDirectory(prefix="rjt-compare-") as temporary:

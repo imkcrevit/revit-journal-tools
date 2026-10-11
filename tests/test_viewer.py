@@ -11,8 +11,17 @@ from unittest.mock import patch
 from revit_journal_tools import viewer_index
 from revit_journal_tools.categories import Categorizer
 from revit_journal_tools.rules import load_rules
-from revit_journal_tools.viewer_index import ViewerIndex
+from revit_journal_tools.viewer_index import ViewerIndex, fts_table
 from revit_journal_tools.viewer_server import make_server
+
+
+def integrity_check(index):
+    """FTS5's own consistency check on every ready file's full-text table."""
+    with index.connect() as connection:
+        for item in index.catalog():
+            if item["status"] == "ready":
+                table = fts_table(item["id"])
+                connection.execute(f"INSERT INTO {table}({table}, rank) VALUES('integrity-check',1)")
 
 
 class CategoryTests(unittest.TestCase):
@@ -89,8 +98,7 @@ class IndexTests(unittest.TestCase):
         self.index.build(queued, "auto")
         self.assertEqual(self.index.events(self.file_id, query="unique_marker")["items"], [])
         self.assertEqual(self.index.events(self.file_id, query="new_marker")["items"][0]["line_number"], 1)
-        with self.index.connect() as connection:
-            connection.execute("INSERT INTO line_search(line_search, rank) VALUES('integrity-check',1)")
+        integrity_check(self.index)
 
     def test_failed_decode_never_exposes_partial_index_as_complete(self):
         bad = self.root / "bad.txt"
@@ -182,7 +190,8 @@ class ParallelBuildTests(unittest.TestCase):
         result = {}
         with index.connect() as connection:
             for item in index.catalog():
-                rows = connection.execute("SELECT line_number,body,category,severity,rules,degraded FROM lines "
+                rows = connection.execute("SELECT line_number,body,category,severity,rules,degraded,byte_offset,"
+                                          "byte_length FROM lines "
                                           "WHERE file_id=? ORDER BY line_number", (item["id"],)).fetchall()
                 blocks = connection.execute("SELECT * FROM blocks WHERE file_id=? ORDER BY start_line",
                                             (item["id"],)).fetchall()
@@ -209,8 +218,7 @@ class ParallelBuildTests(unittest.TestCase):
         # Full-text rows were built for the copied files.
         file_id = next(item["id"] for item in parallel.catalog() if item["name"] == "journal.0001.txt")
         self.assertTrue(parallel.blocks(file_id, query="Vendor")["items"])
-        with parallel.connect() as connection:
-            connection.execute("INSERT INTO line_search(line_search, rank) VALUES('integrity-check',1)")
+        integrity_check(parallel)
 
     def test_rebuild_after_parallel_build_keeps_fts_consistent(self):
         index = self.build(3, "rebuild.sqlite3")
@@ -219,8 +227,7 @@ class ParallelBuildTests(unittest.TestCase):
         file_id = next(item["id"] for item in index.catalog() if item["name"] == "journal.0001.txt")
         self.assertEqual(index.events(file_id, query="replaced_marker")["items"][0]["line_number"], 1)
         self.assertEqual(index.events(file_id, query="Vendor")["items"], [])
-        with index.connect() as connection:
-            connection.execute("INSERT INTO line_search(line_search, rank) VALUES('integrity-check',1)")
+        integrity_check(index)
 
     def test_dead_workers_fall_back_to_serial_instead_of_waiting(self):
         # Workers that exit while starting (as when spawn cannot re-import the
@@ -238,6 +245,138 @@ class ParallelBuildTests(unittest.TestCase):
         stop.set()
         index.build(queued, "utf-8", stop)
         self.assertEqual({item["status"] for item in index.catalog()}, {"queued"})
+
+
+STORE_SAMPLE = [
+    "'C 05-Oct-2026 15:49:53.777;  started recording journal file",
+    "'H 05-Oct-2026 15:50:11.000;   0:< ",
+    "Jrn.Data  _",
+    '        "File Name"  , "IDOK" , _',
+    '        "C:\\demo\\模型.rvt"',
+    "' 1:< 错误: 不满足约束",
+    "API_ERROR { : Assembly version conflict in Demo.dll assembly",
+    "'Addin's module Demo.Core conflicts with same preloaded module }",
+    "'C 05-Oct-2026 15:51:00.000;   0:< DBG_WARN: same thing - 2 times",
+    "'C 05-Oct-2026 15:51:01.000;   0:< DBG_WARN: same thing - 3 times",
+    "Jrn.Command \"Ribbon\"  , \"Delete selection , ID_BUTTON_DELETE\"",
+    "'C 05-Oct-2026 15:51:48.995;  finished recording journal file",
+]
+
+
+@patch("revit_journal_tools.reader.system_fallback_encoding", return_value="gb18030")
+class StoreTests(unittest.TestCase):
+    """J9: store="offsets" keeps byte ranges and reads the unchanged source back."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        examples = Path(__file__).resolve().parent.parent / "examples"
+        self.paths = []
+        for number, source in enumerate(sorted(examples.glob("*.journal.txt")), 1):
+            self.paths.append(self.root / f"journal.{number:04d}.txt")
+            self.paths[-1].write_bytes(source.read_bytes())
+        sample = "\r\n".join(STORE_SAMPLE).encode("gb18030")
+        (self.root / "journal.0011.txt").write_bytes(sample + b"\r\n")
+        # Degraded: an undecodable byte inside a joined title and a lone CR break.
+        (self.root / "journal.0012.txt").write_bytes(sample.replace(b"IDOK", b"ID\xffOK") + b"\rlast")
+        self.paths += [self.root / "journal.0011.txt", self.root / "journal.0012.txt"]
+
+    def build(self, store, name=None, paths=None):
+        index = ViewerIndex(self.root / (name or f"{store}.sqlite3"), workers=1, store=store)
+        index.build(index.register(paths or self.paths, "auto"), "auto")
+        return index
+
+    @staticmethod
+    def answers(index):
+        result = {}
+        for item in index.catalog():
+            file_id, lines, after = item["id"], [], 0
+            while True:
+                page = index.events(file_id, after=after, limit=50)
+                lines += page["items"]
+                if not page["has_more"]:
+                    break
+                after = page["next_after"]
+            blocks = index.blocks(file_id, limit=200)["items"]
+            result[item["name"]] = (
+                item["store"] != "", lines, blocks, index.blocks(file_id, limit=200, fold=True)["items"],
+                [index.block_lines(file_id, block["start_line"], 0, 200)["items"] for block in blocks],
+                [index.block_at(file_id, line) for line in range(1, item["line_count"] + 1)],
+                index.context(file_id, 3, 4)["items"], index.tail_blocks(file_id, 5),
+                index.events(file_id, query="错误")["items"], index.blocks(file_id, query="conflict")["items"],
+                index.blocks(file_id, "warning", "same")["items"])
+        return result
+
+    def test_offsets_and_text_stores_answer_identically(self, _):
+        text, offsets = self.build("text"), self.build("offsets")
+        self.assertEqual(self.answers(offsets), self.answers(text))
+        self.assertEqual({item["store"] for item in offsets.catalog()}, {"offsets"})
+        self.assertEqual({item["store"] for item in text.catalog()}, {"text"})
+        sample = next(item for item in offsets.catalog() if item["name"] == "journal.0012.txt")
+        self.assertEqual(sample["degraded_lines"], 1)
+        with offsets.connect() as connection:
+            # No line text in the offsets index; derivable titles only as a prefix.
+            self.assertEqual(connection.execute("SELECT count(*) FROM lines WHERE body<>''").fetchone()[0], 0)
+            self.assertLessEqual(connection.execute(
+                "SELECT max(length(title)) FROM blocks WHERE title_from_line=1").fetchone()[0], 16)
+            self.assertGreater(connection.execute("SELECT count(*) FROM blocks WHERE title_joins>0").fetchone()[0], 0)
+        joined = next(block for block in offsets.blocks(sample["id"], limit=200)["items"] if block["title_joins"])
+        self.assertIn("ID\\xffOK", joined["title"])  # read back from the source with the same escape
+        integrity_check(offsets)
+
+    def test_changed_or_missing_source_is_an_error_not_wrong_text(self, _):
+        offsets, text = self.build("offsets"), self.build("text")
+        path = self.paths[-2]
+        file_id = next(item["id"] for item in offsets.catalog() if item["name"] == path.name)
+        text_id = next(item["id"] for item in text.catalog() if item["name"] == path.name)
+        path.write_bytes(path.read_bytes() + b"appended\r\n")
+        for call in (lambda: offsets.events(file_id), lambda: offsets.context(file_id, 2),
+                     lambda: offsets.blocks(file_id), lambda: offsets.block_lines(file_id, 1)):
+            with self.assertRaisesRegex(ValueError, "源文件已移动、删除或修改"):
+                call()
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, "源文件"):
+            offsets.events(file_id)
+        self.assertEqual(text.events(text_id)["items"][0]["line_number"], 1)  # the text store keeps the text
+
+    def test_utf16_journals_keep_their_text(self, _):
+        path = self.root / "journal.0013.txt"
+        path.write_bytes("DBG_ERROR: 宽字节\r\nnext".encode("utf-16"))
+        index = self.build("offsets", paths=[path])
+        item, = index.catalog()
+        self.assertEqual((item["store"], item["encoding"]), ("text", "utf-16"))
+        self.assertEqual(index.events(item["id"], "error")["items"][0]["text"], "DBG_ERROR: 宽字节")
+
+    def test_store_switch_rebuilds_and_removes_old_full_text_rows(self, _):
+        path = self.paths[-2]
+        database = self.root / "switch.sqlite3"
+        first = ViewerIndex(database, workers=1, store="text")
+        first.build(first.register([path], "auto"), "auto")
+        file_id = first.catalog()[0]["id"]
+        with first.connect() as connection:
+            # As left by an earlier version: text in the shared line_search table.
+            connection.execute(f"DROP TABLE {fts_table(file_id)}")
+            connection.execute("INSERT INTO line_search(rowid, body) SELECT id, body FROM lines WHERE file_id=?",
+                               (file_id,))
+            connection.execute("UPDATE files SET store='' WHERE id=?", (file_id,))
+        with self.assertRaisesRegex(ValueError, "旧版本"):
+            first.events(file_id)
+        second = ViewerIndex(database, workers=1, store="offsets")
+        self.assertEqual(second.register([path], "auto"), [file_id])  # another store: rebuilt
+        second.build([file_id], "auto")
+        self.assertEqual(second.catalog()[0]["store"], "offsets")
+        self.assertEqual(second.events(file_id, query="错误")["items"][0]["line_number"], 6)
+        with second.connect() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM line_search WHERE line_search MATCH 'conflict'").fetchone()[0], 0)
+            connection.execute("INSERT INTO line_search(line_search, rank) VALUES('integrity-check',1)")
+            self.assertEqual(connection.execute("SELECT count(*) FROM sqlite_master WHERE name=?",
+                                                (fts_table(file_id),)).fetchone()[0], 1)
+        third = ViewerIndex(database, workers=1, store="offsets")
+        self.assertEqual(third.register([path], "auto"), [])  # same store: reused
+        with self.assertRaises(ValueError):
+            ViewerIndex(database, store="compressed")
 
 
 @patch("revit_journal_tools.reader.system_fallback_encoding", return_value="gb18030")

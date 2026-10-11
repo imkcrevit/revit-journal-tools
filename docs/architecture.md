@@ -36,7 +36,9 @@ CLI在扫描前发现文件，对单个文件失败进行隔离。输出先写�
 
 加载事件正文先剥离时间戳、Journal层级和API包装，再检查正文开头的固定加载前缀。`addin_name/addin_class`各保留最多512字符，超限由`addin_identity_truncated`标记；字段可跨行，但不跨事件继承。名称/Class前缀通过带转义的SQL前缀查询筛选，支持与来源及FTS组合，并保留原始起始行分页游标。CLI折叠列表只使用这些元数据；Add-in条目忽略普通段落预览级别，仅在展开时调用`block_lines`读取原文。
 
-`ViewerIndex`写入：每个文件一个事务。先在短事务中删除旧行（同时用`'delete'`命令删除其FTS条目）并标记`indexing`；随后`parse_into`按2万行一批`executemany`写`lines`与`blocks`，文件读完后在同一事务内用`INSERT INTO line_search(rowid, body) SELECT ...`一次性建立该文件的全文索引，再写统计并置`ready`。失败或停止时整个事务回滚，不会留下半个文件。旧版本逐行维护FTS的触发器在打开数据库时删除；“`lines`中每一行都有FTS条目”的不变式由同事务插入/删除保证。连接保持`synchronous=NORMAL`（WAL模式下提交不刷盘，只在检查点刷盘）。
+`ViewerIndex`写入：每个文件一个事务。先在短事务中删除旧行与该文件的全文表并标记`indexing`；随后`parse_into`按2万行一批`executemany`写`lines`与`blocks`，文件读完后在同一事务内用一条`INSERT ... SELECT`建立该文件自己的不存内容的FTS5表`line_search_<id>`（rowid即行号），再写统计并置`ready`。失败或停止时整个事务回滚，不会留下半个文件；重建时直接删表，不需要旧文字。旧版本共用的`line_search`表只在重建旧文件时按旧文字删除其条目，逐行维护FTS的触发器在打开数据库时删除。
+
+存储方式（J9）：默认`store="offsets"`。`JournalReader(track_spans=True)`在读取原始字节的同时用`bytes.splitlines`按块求出每行内容的字节范围（只对CR/LF字节必定是换行、可逐行单独解码的编码，见`reader.span_codec`；UTF-16/32、有状态编码与EBCDIC除外），`lines`只存`byte_offset/byte_length`，文字经TEMP表（并行时为子进程临时库）一次性建入全文表后丢弃。查询时`_Source`先核对源文件的大小、修改时间与文件标识，再按位置读取并用`reader.decode_span`以同样的编码与退化规则解码；纯ASCII行的字节数等于字符数，读取时逐行核对以发现错位。段落标题若由标题行及其后续行拼成（`title_from_line`、`title_joins`，规则见`blocks.derive_title`），只存16个字符的前缀供SQL过滤，显示时从源文件重新拼出。正在写入的Journal读快照（临时副本），与无法按字节定位的编码一样按`store="text"`保存全文。`scripts/verify_equivalence.py stores`对同一批文件分别用两种方式建索引，逐页比较全部行、全部段落和各类查询的结果。连接保持`synchronous=NORMAL`（WAL模式下提交不刷盘，只在检查点刷盘）。
 
 多文件时（至少2个文件、总量不小于`PARALLEL_MIN_BYTES`=2MB），`ViewerIndex`用`multiprocessing`的`spawn`上下文启动进程池：子进程各自加载内置规则，把一个文件解析进系统临时目录中的私有临时库（无索引、无日志），返回元数据；主进程按完成顺序`ATTACH`临时库并以`INSERT ... SELECT`复制，FTS与状态更新同上。只有主进程写共享索引，子进程不持有任何主进程连接。停止时终止进程池，未复制的文件保持`queued`。
 

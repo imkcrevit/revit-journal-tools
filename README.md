@@ -81,7 +81,7 @@ revit-journal browse examples/paragraphs.journal.txt --format json --page-size 2
 
 按`f`打开的文件列表以Revit会话为单位：同一目录下`journal.NNNN.txt`、`journal.NNNN.workerN.log`、`journal.NNNN.txt.copy.txt`和`journal.NNNN.NNNN.dmp`归入同一会话。字节相同的副本只索引一次并在会话下注明，`.dmp`只计数和显示大小，0字节文件（如`dump.0001.txt`）列出但不索引；不符合上述命名的文件作为“未识别命名”单独成组，仍正常读取。`--print`与`--format json`同样按会话输出，JSON新增`sessions`节。
 
-首次启动在后台建索引，可先切换到已完成的文件。索引缓存默认在用户缓存目录（Windows：`%LOCALAPPDATA%\revit-journal-tools\cache\terminal.sqlite3`；Linux：`$XDG_CACHE_HOME`或`~/.cache`下的`revit-journal-tools`），不再写到当前目录；`revit-journal cache`显示位置与大小，`revit-journal cache --clear`删除本工具的索引数据库，也可用环境变量`REVIT_JOURNAL_CACHE`或`--database`改变位置。缓存含完整Journal文本，全文保留在磁盘，段落再大也按页加载原文。搜索命中续行时返回整个段落，不重复列出同一块；统计“块数”与原有扫描的“命中行数”不同。
+首次启动在后台建索引，可先切换到已完成的文件。索引缓存默认在用户缓存目录（Windows：`%LOCALAPPDATA%\revit-journal-tools\cache\terminal.sqlite3`；Linux：`$XDG_CACHE_HOME`或`~/.cache`下的`revit-journal-tools`），不再写到当前目录；`revit-journal cache`显示位置与大小，`revit-journal cache --clear`删除本工具的索引数据库，也可用环境变量`REVIT_JOURNAL_CACHE`或`--database`改变位置。索引默认只保存每行在源Journal中的字节位置（`--store offsets`），查看时按位置从源文件读取原文，因此源文件要保持原位、不被修改；读取前核对大小、修改时间和文件标识，不一致时明确提示重新打开以重建，不会显示错位的文字。`--store text`把全文存入索引（实测为偏移方式的1.7–2.3倍），之后源文件移走也能查看。正在写入的Journal（读快照）和UTF-16等无法按字节定位行的文件总是存全文。段落再大也按页加载原文。搜索命中续行时返回整个段落，不重复列出同一块；统计“块数”与原有扫描的“命中行数”不同。
 
 按`s`看当前会话摘要，`e`看结束前最后的操作与对话框，`P`按阶段（启动、许可、Add-in加载、打开文档、交互操作、退出）筛选，`9`看对话框，`z`切换“相同内容段落折叠为×N”。Revit仍在写入的Journal默认读取完整行的快照（`--snapshot`），并在界面中标注。
 
@@ -99,7 +99,7 @@ revit-journal view --revit 2024 --port 8766
 
 浏览器打开命令显示的本地地址即可。左侧切换文件，上方切换分类；默认按段落列出（与`browse`相同的分段、阶段筛选和重复折叠），可切换为逐行列表。关键词搜索支持词语/词语前缀，列表每页最多100项；点击段落查看它的完整原文（长段落每次加载200行），点击行查看前后文，也可以直接跳到任意有效行号。“会话摘要”显示与`summary`命令相同的内容，其中的行号可点击定位到主Journal。分类包含启动、系统数据、错误、API错误、操作内容、警告、API活动、其他记录和对话框。
 
-首次索引逐文件进行，已经就绪的文件可先浏览。索引缓存位于缓存目录的`viewer.sqlite3`，再次启动会复用未变化文件的索引。缓存包含完整日志文本，不受CLI的500条明细限制，默认不进入Git。文件内容、编码或索引规则变化后会重建相关索引。
+首次索引逐文件进行，已经就绪的文件可先浏览。索引缓存位于缓存目录的`viewer.sqlite3`，再次启动会复用未变化文件的索引。存储方式与`browse`相同（默认`--store offsets`，见上文），不受CLI的500条明细限制，默认不进入Git。文件内容、编码或索引规则变化后会重建相关索引。
 
 Web界面的段落、折叠、阶段与会话摘要直接调用CLI使用的同一组索引查询和摘要渲染，不另写一套逻辑；交互式折叠展开、Add-in名称前缀筛选等仍只在CLI中提供。Web用法见[docs/viewer.md](docs/viewer.md)。
 
@@ -243,11 +243,13 @@ py -3 scripts/benchmark_real.py all --revit 2024          # 扫描、分类分�
 py -3 scripts/verify_equivalence.py gates
 py -3 scripts/verify_equivalence.py blocks --old-src <旧src目录>
 py -3 scripts/verify_equivalence.py blocks --together --old-src <旧src目录>
+# 偏移与全文两种索引方式逐页比较全部行、段落和查询结果
+py -3 scripts/verify_equivalence.py stores --encoding auto
 # 交互界面在原生控制台中的验收（会弹出一个窗口几秒钟）：conhost或Windows Terminal，逐键检查与退出恢复
 py -3 scripts/windows_console_probe.py <journal.txt> [--host wt] [--ctrl-c]
 ```
 
-本机实测（Windows 10、Python 3.12，2026-10-10）：6.47MB/85,387行真实Journal扫描约0.4s（约17MB/s），建索引约2.4s（约3.6万行/秒）；Revit 2024目录22个文件约11MB的`browse --print`约2.8s。
+本机实测（Windows 10、Python 3.12，2026-10-10）：6.47MB/85,387行真实Journal扫描约0.4s（约17MB/s），建索引约2.5s（约3.4万行/秒，索引为源文件的2.2倍；`--store text`约2.4s、3.6倍）；Revit 2024目录22个文件约11MB的`browse --print`约2.8s。
 
 安装包后，Windows也可使用`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`运行同一套测试。
 

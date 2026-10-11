@@ -15,16 +15,20 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .categories import CATEGORIES, Categorizer
-from .blocks import BLOCK_VERSION, PHASES, BlockBuilder
+from .blocks import BLOCK_VERSION, PHASES, BlockBuilder, derive_title
 from .loading import BLOCK_FILTERS, block_filter, matches_filter
 from .live import Snapshot, held_for_writing, wants_snapshot
-from .reader import JournalReader, SourceChangedError, basis_label, resolve_encoding
+from .reader import JournalReader, SourceChangedError, basis_label, decode_span, resolve_encoding
 from .rules import load_rules, ruleset_digest
 from .summary import END_STATES, SessionCollector, end_state, session_findings
 from .sessions import ROLE_LABELS, InputFile, SessionName, describe, plan_inputs, recency_sort
 from .sidecars import BASIS_TEXT, cer_logs, match_cer, match_steel_log, parse_steel_log, revit_year, session_window
 
-INDEX_VERSION = "viewer-5:" + BLOCK_VERSION
+INDEX_VERSION = "viewer-6:" + BLOCK_VERSION
+# offsets (default): `lines` keeps each line's byte range in the source file and
+# the text is read back from it, which must stay where it is and unchanged.
+# text: `lines` keeps the full text (larger, independent of the source).
+STORE_MODES = ("offsets", "text")
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
  id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
@@ -36,7 +40,8 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS lines (
  id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, line_number INTEGER NOT NULL,
  body TEXT NOT NULL, category TEXT NOT NULL, severity TEXT NOT NULL, rules TEXT NOT NULL,
- degraded INTEGER NOT NULL DEFAULT 0
+ degraded INTEGER NOT NULL DEFAULT 0, byte_offset INTEGER NOT NULL DEFAULT 0,
+ byte_length INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS lines_position ON lines(file_id, line_number);
 CREATE INDEX IF NOT EXISTS lines_category ON lines(file_id, category, line_number);
@@ -48,6 +53,7 @@ CREATE TABLE IF NOT EXISTS blocks (
  addin_evidence TEXT NOT NULL DEFAULT '[]', addin_name TEXT NOT NULL DEFAULT '',
  addin_class TEXT NOT NULL DEFAULT '', addin_identity_truncated INTEGER NOT NULL DEFAULT 0,
  phase TEXT NOT NULL DEFAULT '', fingerprint TEXT NOT NULL DEFAULT '',
+ title_from_line INTEGER NOT NULL DEFAULT 0, title_joins INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(file_id,start_line)
 );
 CREATE INDEX IF NOT EXISTS blocks_category ON blocks(file_id,category,start_line);
@@ -64,12 +70,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS line_search USING fts5(
 DROP TRIGGER IF EXISTS lines_insert;
 DROP TRIGGER IF EXISTS lines_delete;
 """
-# Full-text rows are maintained per file, not per line: a file's lines and its
-# FTS rows are inserted in the same transaction (one per file) and deleted
-# together, so every row in `lines` always has its FTS entry. Earlier versions
-# kept the same invariant with per-row triggers, which cost ~80% of the
-# SQLite time; they are dropped on open.
+# Full-text search: one contentless FTS5 table per file (fts_table(id), rowid =
+# line number), created with the file's rows in one transaction and dropped
+# with them, so rebuilding never needs the old text. The shared line_search
+# table only still holds entries of files indexed by earlier versions (store
+# ''); they are deleted when such a file is rebuilt. Per-row triggers of even
+# earlier versions cost ~80% of the SQLite time; they are dropped on open.
 _BATCH = 20_000
+_FTS = "CREATE VIRTUAL TABLE {name} USING fts5(body, content='', columnsize=0)"
+# store="offsets" collects the text in a plain table (TEMP, or the worker's
+# scratch database) and builds the full-text table from it in one statement.
+_TEXTS = "CREATE {temp}TABLE {name}(line_number INTEGER PRIMARY KEY, body TEXT NOT NULL)"
+# A title the source can give back (title_from_line) keeps only this prefix,
+# enough for SQL filters such as tail_blocks' "Jrn.Directive".
+_TITLE_PREFIX = 16
+
+
+def fts_table(file_id: int) -> str:
+    return f"line_search_{int(file_id)}"
 
 
 def _stamp(path: Path) -> str:
@@ -77,17 +95,21 @@ def _stamp(path: Path) -> str:
     return json.dumps([info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns])
 
 
-_INSERT_LINES = ("INSERT INTO lines(file_id,line_number,body,category,severity,rules,degraded) "
-                 "VALUES(?,?,?,?,?,?,?)")
+_INSERT_LINES = ("INSERT INTO lines(file_id,line_number,body,category,severity,rules,degraded,byte_offset,byte_length) "
+                 "VALUES(?,?,?,?,?,?,?,?,?)")
 _INSERT_BLOCKS = (
     "INSERT INTO blocks(file_id,start_line,end_line,category,severity,rules,title,title_line,boundary,complete,"
-    "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated,phase,fingerprint) "
-    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated,phase,fingerprint,title_from_line,"
+    "title_joins) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 
-def _insert_batch(connection, file_id, lines, blocks, block_counts) -> None:
+def _insert_batch(connection, file_id, lines, blocks, block_counts, texts=None, text_table="") -> None:
+    """texts: (line number, text) rows for text_table (store="offsets"); their
+    titles that the source gives back are stored as a prefix only."""
     connection.executemany(_INSERT_LINES, lines)
+    if texts is not None:
+        connection.executemany(f"INSERT INTO {text_table}(rowid, body) VALUES(?,?)", texts)
     for block in blocks:
         block_counts[block.category] += 1
         if block.addin_origin:
@@ -95,57 +117,78 @@ def _insert_batch(connection, file_id, lines, blocks, block_counts) -> None:
             block_counts["addin"] += 1
     connection.executemany(_INSERT_BLOCKS, [
         (file_id, b.start_line, b.end_line, b.category, b.severity, ",".join(sorted(b.rules)),
-         b.title, b.title_line, b.boundary, int(b.complete), b.addin_origin,
+         b.title[:_TITLE_PREFIX] if texts is not None and b.title_from_line else b.title,
+         b.title_line, b.boundary, int(b.complete), b.addin_origin,
          json.dumps(b.addin_evidence, ensure_ascii=False) if b.addin_evidence else "[]", b.addin_name, b.addin_class,
-         int(b.addin_identity_truncated), b.phase, b.fingerprint) for b in blocks])
+         int(b.addin_identity_truncated), b.phase, b.fingerprint, int(b.title_from_line), b.title_joins)
+        for b in blocks])
 
 
-def parse_into(connection, file_id, path, encoding, rules, stop=None, progress=None) -> dict | None:
+def parse_into(connection, file_id, path, encoding, rules, stop=None, progress=None,
+               text_table: tuple[str, str] | None = None) -> dict | None:
     """Read, classify and group one file into `lines`/`blocks` of an open
-    transaction (no commit). Returns the file metadata, or None when stopped."""
+    transaction (no commit). Returns the file metadata, or None when stopped.
+    text_table: (name, CREATE statement) for store="offsets": `lines` gets each
+    line's byte range in the source and the text goes only to that table (rowid
+    = line number). Encodings whose lines are not byte-addressable (UTF-16/32)
+    keep the text in `lines` (meta store="text")."""
     counts: Counter[str] = Counter()
     block_counts: Counter[str] = Counter()
     categorizer, builder, collector = Categorizer(rules), BlockBuilder(), SessionCollector()
     classify, feed, collect = categorizer.classify, builder.feed, collector.feed
     batch: list[tuple] = []
     block_batch: list = []
-    with JournalReader(path, encoding) as reader:
+    with JournalReader(path, encoding, track_spans=text_table is not None) as reader:
+        texts: list[tuple] | None = None
+        if reader.span_codec is not None:
+            texts = []
+            connection.execute(text_table[1])
         for line in reader:
             classification = classify(line.text)
             counts[classification[0]] += 1
-            batch.append((file_id, line.number, line.text, *classification, line.degraded))  # bool binds as 0/1
+            if texts is None:
+                batch.append((file_id, line.number, line.text, *classification, line.degraded, 0, 0))  # bool binds as 0/1
+            else:
+                batch.append((file_id, line.number, "", *classification, line.degraded, *reader.span))
+                texts.append((line.number, line.text))
             collect(line.number, line.text, classification)
             block_batch.extend(feed(line, classification))
             if len(batch) >= _BATCH:
                 collector.add_blocks(block_batch)
-                _insert_batch(connection, file_id, batch, block_batch, block_counts)
+                _insert_batch(connection, file_id, batch, block_batch, block_counts, texts, text_table and text_table[0])
                 batch.clear()
                 block_batch.clear()
+                if texts is not None:
+                    texts.clear()
                 if progress:
                     progress(reader.byte_count, reader.line_count)
                 if stop and stop.is_set():
                     return None
         block_batch.extend(builder.finish())
         collector.add_blocks(block_batch)
-        _insert_batch(connection, file_id, batch, block_batch, block_counts)
+        _insert_batch(connection, file_id, batch, block_batch, block_counts, texts, text_table and text_table[0])
         return {**reader.decoding_summary(), "sha256": reader.sha256, "line_count": reader.line_count,
                 "byte_count": reader.byte_count, "counts": dict(counts), "block_counts": dict(block_counts),
-                "summary": collector.finish(), "live": False, "snapshot": None}
+                "summary": collector.finish(), "live": False, "snapshot": None,
+                "store": "text" if texts is None else "offsets", "span_codec": reader.span_codec or ""}
 
 
 def parse_file(connection, file_id, path, encoding, rules, stop=None, progress=None,
-               snapshot: str = "auto") -> dict | None:
+               snapshot: str = "auto", text_table: tuple[str, str] | None = None) -> dict | None:
     """parse_into on the file itself, or on a snapshot when Revit is still
-    writing it (or it changed while read and snapshot is not "never")."""
+    writing it (or it changed while read and snapshot is not "never"). A
+    snapshot is a temporary copy, so its text is always stored (store="text")."""
     if not wants_snapshot(path, snapshot):
         try:
-            return parse_into(connection, file_id, path, encoding, rules, stop, progress)
+            return parse_into(connection, file_id, path, encoding, rules, stop, progress, text_table)
         except SourceChangedError:
             if snapshot == "never":
                 raise
-            # Discard the rows of the attempt (no FTS rows exist yet) and retry.
+            # Discard the rows of the attempt and retry.
             connection.execute("DELETE FROM lines WHERE file_id=?", (file_id,))
             connection.execute("DELETE FROM blocks WHERE file_id=?", (file_id,))
+            if text_table is not None:
+                connection.execute(f"DROP TABLE IF EXISTS {text_table[0]}")
     with Snapshot(path) as info:
         meta = parse_into(connection, file_id, Path(info["path"]), encoding, rules, stop, progress)
     if meta is not None:
@@ -161,7 +204,7 @@ _SCRATCH_SCHEMA = """
 CREATE TABLE lines (
  id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, line_number INTEGER NOT NULL,
  body TEXT NOT NULL, category TEXT NOT NULL, severity TEXT NOT NULL, rules TEXT NOT NULL,
- degraded INTEGER NOT NULL DEFAULT 0
+ degraded INTEGER NOT NULL DEFAULT 0, byte_offset INTEGER NOT NULL, byte_length INTEGER NOT NULL
 );
 CREATE TABLE blocks (
  file_id INTEGER NOT NULL, start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
@@ -169,11 +212,12 @@ CREATE TABLE blocks (
  title TEXT NOT NULL, title_line INTEGER NOT NULL, boundary TEXT NOT NULL,
  complete INTEGER NOT NULL, addin_origin TEXT NOT NULL, addin_evidence TEXT NOT NULL,
  addin_name TEXT NOT NULL, addin_class TEXT NOT NULL, addin_identity_truncated INTEGER NOT NULL,
- phase TEXT NOT NULL, fingerprint TEXT NOT NULL
+ phase TEXT NOT NULL, fingerprint TEXT NOT NULL, title_from_line INTEGER NOT NULL, title_joins INTEGER NOT NULL
 );
 """
 _BLOCK_COLUMNS = ("start_line,end_line,category,severity,rules,title,title_line,boundary,complete,"
-                  "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated,phase,fingerprint")
+                  "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated,phase,fingerprint,"
+                  "title_from_line,title_joins")
 # Below this much work, starting processes costs more than it saves.
 PARALLEL_MIN_BYTES = 2 * 1024 * 1024
 _OWN_FORMAT_ROLES = {"steel_log"}
@@ -183,7 +227,7 @@ _worker_rules = None
 def _parse_to_scratch(task: tuple) -> tuple[int, dict | None, str | None]:
     """Runs in a child process. Returns (file_id, metadata or None, error or None)."""
     global _worker_rules
-    file_id, path, encoding, stamp, scratch, snapshot = task
+    file_id, path, encoding, stamp, scratch, snapshot, store = task
     try:
         if _worker_rules is None:
             _worker_rules = load_rules()
@@ -192,7 +236,11 @@ def _parse_to_scratch(task: tuple) -> tuple[int, dict | None, str | None]:
             connection.execute("PRAGMA journal_mode=OFF")
             connection.execute("PRAGMA synchronous=OFF")
             connection.executescript(_SCRATCH_SCHEMA)
-            meta = parse_file(connection, file_id, Path(path), encoding, _worker_rules, snapshot=snapshot)
+            # store="offsets": the text goes to a plain scratch table, from which
+            # the parent fills the file's full-text table.
+            texts = ("texts", _TEXTS.format(temp="", name="texts")) if store == "offsets" else None
+            meta = parse_file(connection, file_id, Path(path), encoding, _worker_rules, snapshot=snapshot,
+                              text_table=texts)
             connection.commit()
         finally:
             connection.close()
@@ -229,6 +277,75 @@ def _kind(path: Path) -> str:
     return ROLE_LABELS[role]
 
 
+class _Source:
+    """Line text read back from its source file (store="offsets"), which must be
+    unchanged since it was indexed: same size, modification time and file id."""
+
+    def __init__(self, file):
+        path = Path(file["path"])
+        try:
+            changed = _stamp(path) != file["stamp"]
+        except OSError:
+            changed = True
+        if changed:
+            raise ValueError("源文件已移动、删除或修改，无法按索引中的位置读取原文；重新打开即可重建索引"
+                             "（--store text会把全文保存在索引中）")
+        self.codec = file["span_codec"]
+        self.stream = path.open("rb")
+
+    def text(self, offset: int, length: int, degraded) -> str:
+        self.stream.seek(offset)
+        data = self.stream.read(length)
+        if len(data) != length:
+            raise ValueError("源文件比索引时短，无法读取原文；请重新索引")
+        return decode_span(data, self.codec, bool(degraded))
+
+    def close(self) -> None:
+        self.stream.close()
+
+
+def _with_text(file, rows, limit: int) -> list[dict]:
+    """Rows as dicts with text (first `limit` characters) and text_length; for
+    store="offsets" both come from the source file."""
+    items = [dict(row) for row in rows]
+    source = _Source(file) if file["store"] == "offsets" and items else None
+    try:
+        for item in items:
+            offset, length = item.pop("byte_offset"), item.pop("byte_length")
+            if source is not None:
+                text = source.text(offset, length, item["degraded"])
+                item["text"], item["text_length"] = text[:limit], len(text)
+    finally:
+        if source is not None:
+            source.close()
+    return items
+
+
+def _with_titles(connection, file, items: list[dict]) -> list[dict]:
+    """Titles stored as a prefix (store="offsets", title_from_line) are derived
+    again from their title line and joined continuation lines in the source."""
+    derived = [item for item in items if item["title_from_line"]]
+    if file["store"] != "offsets" or not derived:
+        return items
+    wanted = sorted({number for item in derived
+                     for number in range(item["title_line"], item["title_line"] + item["title_joins"] + 1)})
+    rows = []
+    for start in range(0, len(wanted), 500):  # within every SQLite's parameter limit
+        chunk = wanted[start:start + 500]
+        rows += connection.execute(
+            f"SELECT line_number,byte_offset,byte_length,degraded FROM lines WHERE file_id=? "
+            f"AND line_number IN ({','.join('?' * len(chunk))})", (file["id"], *chunk)).fetchall()
+    source = _Source(file)
+    try:
+        texts = {row[0]: source.text(row[1], row[2], row[3]) for row in rows}
+    finally:
+        source.close()
+    for item in derived:
+        first = item["title_line"]
+        item["title"] = derive_title([texts[number] for number in range(first, first + item["title_joins"] + 1)])
+    return items
+
+
 # Added after the first release; existing databases get them via ALTER TABLE.
 _FILE_COLUMNS = {
     "encoding_request": "TEXT", "encoding_requested": "TEXT",
@@ -236,15 +353,21 @@ _FILE_COLUMNS = {
     "degraded_lines": "INTEGER NOT NULL DEFAULT 0", "degraded_sample": "TEXT NOT NULL DEFAULT '[]'",
     "live": "INTEGER NOT NULL DEFAULT 0", "snapshot": "TEXT NOT NULL DEFAULT ''",
     "summary": "TEXT NOT NULL DEFAULT '{}'",
+    # '' for files indexed by earlier versions (text in the shared line_search).
+    "store": "TEXT NOT NULL DEFAULT ''", "span_codec": "TEXT NOT NULL DEFAULT ''",
 }
 
 
 class ViewerIndex:
     def __init__(self, database: str | Path, workers: int | None = None, snapshot: str = "auto",
-                 local_appdata: str | Path | None = None):
+                 local_appdata: str | Path | None = None, store: str = "offsets"):
         """workers: processes for multi-file builds (default: cores-1, at most 8; 1 = serial).
         snapshot: auto/always/never for journals Revit is still writing (live.py).
-        local_appdata: root for CER logs (default %LOCALAPPDATA%)."""
+        local_appdata: root for CER logs (default %LOCALAPPDATA%).
+        store: offsets/text, see STORE_MODES; changing it rebuilds the files."""
+        if store not in STORE_MODES:
+            raise ValueError("store必须为offsets或text")
+        self.store = store
         self.workers = default_workers() if workers is None else max(1, workers)
         # (initializer, args) run in each worker process; tests replace it.
         self.worker_init: tuple = (_ignore_interrupts, ())
@@ -254,7 +377,7 @@ class ViewerIndex:
         self.database = Path(database).resolve()
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.rules = load_rules()
-        self.signature = INDEX_VERSION + ":" + ruleset_digest(self.rules)
+        self.signature = INDEX_VERSION + ":" + store + ":" + ruleset_digest(self.rules)
         self.file_ids: list[int] = []
         self.sidecars: list[dict] = []
         self.overrides: dict[str, SessionName] = {}
@@ -272,8 +395,10 @@ class ViewerIndex:
             for name, definition in _FILE_COLUMNS.items():
                 if name not in file_columns:
                     connection.execute(f"ALTER TABLE files ADD COLUMN {name} {definition}")
-            if "degraded" not in {row["name"] for row in connection.execute("PRAGMA table_info(lines)")}:
-                connection.execute("ALTER TABLE lines ADD COLUMN degraded INTEGER NOT NULL DEFAULT 0")
+            line_columns = {row["name"] for row in connection.execute("PRAGMA table_info(lines)")}
+            for name in ("degraded", "byte_offset", "byte_length"):
+                if name not in line_columns:
+                    connection.execute(f"ALTER TABLE lines ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(blocks)")}
             if "addin_origin" not in columns:
                 connection.execute("ALTER TABLE blocks ADD COLUMN addin_origin TEXT NOT NULL DEFAULT ''")
@@ -282,8 +407,9 @@ class ViewerIndex:
             for name in ("addin_name", "addin_class", "phase", "fingerprint"):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE blocks ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
-            if "addin_identity_truncated" not in columns:
-                connection.execute("ALTER TABLE blocks ADD COLUMN addin_identity_truncated INTEGER NOT NULL DEFAULT 0")
+            for name in ("addin_identity_truncated", "title_from_line", "title_joins"):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE blocks ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
             connection.execute("CREATE INDEX IF NOT EXISTS blocks_addin ON blocks(file_id,addin_origin,start_line)")
             connection.execute("CREATE INDEX IF NOT EXISTS blocks_addin_names ON blocks(file_id,addin_name COLLATE NOCASE) WHERE addin_origin<>''")
             connection.execute("CREATE INDEX IF NOT EXISTS blocks_addin_classes ON blocks(file_id,addin_class COLLATE NOCASE) WHERE addin_origin<>''")
@@ -406,7 +532,7 @@ class ViewerIndex:
             order.remove(self.preferred_id)
             order.insert(0, self.preferred_id)
         tasks = [(file_id, rows[file_id]["path"], self.encoding_overrides.get(file_id, encoding),
-                  rows[file_id]["stamp"], str(scratch_dir / f"{file_id}.sqlite3"), self.snapshot)
+                  rows[file_id]["stamp"], str(scratch_dir / f"{file_id}.sqlite3"), self.snapshot, self.store)
                  for file_id in order]
         context = multiprocessing.get_context("spawn")  # Windows-safe; no inherited connections
         remaining = list(order)
@@ -464,12 +590,12 @@ class ViewerIndex:
             connection.execute("ATTACH DATABASE ? AS scratch", (str(scratch),))
             try:
                 connection.execute(
-                    "INSERT INTO lines(file_id,line_number,body,category,severity,rules,degraded) "
-                    "SELECT ?,line_number,body,category,severity,rules,degraded FROM scratch.lines ORDER BY id",
-                    (file_id,))
+                    "INSERT INTO lines(file_id,line_number,body,category,severity,rules,degraded,byte_offset,byte_length) "
+                    "SELECT ?,line_number,body,category,severity,rules,degraded,byte_offset,byte_length "
+                    "FROM scratch.lines ORDER BY id", (file_id,))
                 connection.execute(f"INSERT INTO blocks(file_id,{_BLOCK_COLUMNS}) "
                                    f"SELECT ?,{_BLOCK_COLUMNS} FROM scratch.blocks ORDER BY rowid", (file_id,))
-                self._finish_file(connection, file_id, meta)
+                self._finish_file(connection, file_id, meta, "scratch.texts")
                 connection.commit()
             finally:
                 connection.rollback()
@@ -482,8 +608,11 @@ class ViewerIndex:
     def _start_file(self, connection, file_id: int):
         """Short committed transaction: drop the old rows (with their FTS entries)."""
         row = connection.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-        connection.execute("INSERT INTO line_search(line_search, rowid, body) "
-                           "SELECT 'delete', id, body FROM lines WHERE file_id=?", (file_id,))
+        if not row["store"]:
+            # Indexed by an earlier version: its full-text rows are in the shared table.
+            connection.execute("INSERT INTO line_search(line_search, rowid, body) "
+                               "SELECT 'delete', id, body FROM lines WHERE file_id=?", (file_id,))
+        connection.execute(f"DROP TABLE IF EXISTS {fts_table(file_id)}")
         connection.execute("DELETE FROM lines WHERE file_id=?", (file_id,))
         connection.execute("DELETE FROM blocks WHERE file_id=?", (file_id,))
         connection.execute("DELETE FROM block_stats WHERE file_id=?", (file_id,))
@@ -496,9 +625,16 @@ class ViewerIndex:
         return row
 
     @staticmethod
-    def _finish_file(connection, file_id: int, meta: dict) -> None:
-        """Same transaction as the rows: full-text rows, folds, statistics, ready state."""
-        connection.execute("INSERT INTO line_search(rowid, body) SELECT id, body FROM lines WHERE file_id=?", (file_id,))
+    def _finish_file(connection, file_id: int, meta: dict, texts: str = "") -> None:
+        """Same transaction as the rows: full-text rows, folds, statistics, ready state.
+        texts: the table holding the text when meta["store"] == "offsets"."""
+        table = fts_table(file_id)
+        connection.execute(_FTS.format(name=table))
+        if meta["store"] == "offsets":
+            connection.execute(f"INSERT INTO {table}(rowid, body) SELECT line_number, body FROM {texts}")
+        else:
+            connection.execute(f"INSERT INTO {table}(rowid, body) SELECT line_number, body FROM lines WHERE file_id=?",
+                               (file_id,))
         # Only fingerprints that repeat; the list shows their first block with the count.
         connection.execute(
             "INSERT INTO block_folds(file_id,fingerprint,first_line,last_line,count) "
@@ -509,13 +645,13 @@ class ViewerIndex:
                            (file_id, sum(block_counts.get(key, 0) for key in CATEGORIES), json.dumps(block_counts)))
         connection.execute(
             "UPDATE files SET status='ready',encoding=?,sha256=?,line_count=?,indexed_bytes=?,counts=?,"
-            "encoding_fallback=?,encoding_basis=?,degraded_lines=?,degraded_sample=?,live=?,snapshot=?,summary=? "
-            "WHERE id=?",
+            "encoding_fallback=?,encoding_basis=?,degraded_lines=?,degraded_sample=?,live=?,snapshot=?,summary=?,"
+            "store=?,span_codec=? WHERE id=?",
             (meta["encoding"], meta["sha256"], meta["line_count"], meta["byte_count"], json.dumps(meta["counts"]),
              int(meta["encoding_fallback"]), meta["encoding_basis"], meta["decode_degraded_line_count"],
              json.dumps(meta["decode_degraded_lines"]), int(meta["live"]),
              json.dumps(meta["snapshot"]) if meta["snapshot"] else "",
-             json.dumps(meta["summary"], ensure_ascii=False), file_id),
+             json.dumps(meta["summary"], ensure_ascii=False), meta["store"], meta["span_codec"], file_id),
         )
 
     def _build_file(self, file_id: int, encoding: str, stop: threading.Event | None) -> None:
@@ -529,14 +665,16 @@ class ViewerIndex:
 
             # One transaction for the whole file: a failure or stop rolls back
             # every row, so a file is either complete and ready or absent.
-            meta = parse_file(connection, file_id, path, encoding, self.rules, stop, progress, self.snapshot)
+            name = f"texts_{int(file_id)}"  # TEMP: gone with this connection
+            texts = ("temp." + name, _TEXTS.format(temp="TEMP ", name=name)) if self.store == "offsets" else None
+            meta = parse_file(connection, file_id, path, encoding, self.rules, stop, progress, self.snapshot, texts)
             if meta is None:
                 connection.rollback()
                 connection.execute("UPDATE files SET status='queued' WHERE id=?", (file_id,))
                 return
             if not meta["live"] and _stamp(path) != row["stamp"]:
                 raise ValueError("源文件自任务创建后发生变化，请重新索引")
-            self._finish_file(connection, file_id, meta)
+            self._finish_file(connection, file_id, meta, texts and texts[0])
 
     def describe(self, path: str | Path) -> SessionName:
         """Session of a workspace file, honouring sidecar logs attached by time."""
@@ -658,6 +796,8 @@ class ViewerIndex:
         row = connection.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
         if row["status"] != "ready":
             raise ValueError("文件尚未完成索引，请查看文件列表中的进度或错误")
+        if not row["store"]:
+            raise ValueError("该文件的索引来自旧版本，请重新打开以重建")
         return row
 
     def events(self, file_id: int, category: str = "all", query: str = "", after: int = 0, limit: int = 100) -> dict:
@@ -673,16 +813,18 @@ class ViewerIndex:
         if query.strip():
             # Treat input as one literal token phrase, with a prefix on the last token.
             phrase = '"' + query.strip().replace('"', '""') + '"*'
-            where.append("l.id IN (SELECT rowid FROM line_search WHERE line_search MATCH ?)")
+            table = fts_table(file_id)
+            where.append(f"l.line_number IN (SELECT rowid FROM {table} WHERE {table} MATCH ?)")
             values.append(phrase)
         with self.connect() as connection:
-            self._ready(connection, file_id)
+            file = self._ready(connection, file_id)
             rows = connection.execute(
-                "SELECT l.line_number,l.category,l.severity,l.rules,substr(l.body,1,700) AS text,length(l.body) AS text_length,l.degraded FROM lines l WHERE "
+                "SELECT l.line_number,l.category,l.severity,l.rules,substr(l.body,1,700) AS text,length(l.body) AS text_length,l.degraded,"
+                "l.byte_offset,l.byte_length FROM lines l WHERE "
                 + " AND ".join(where) + " ORDER BY l.line_number LIMIT ?",
                 [*values, limit + 1],
             ).fetchall()
-        items = [dict(row) for row in rows[:limit]]
+        items = _with_text(file, rows[:limit], 700)
         return {"items": items, "has_more": len(rows) > limit, "next_after": items[-1]["line_number"] if items else after}
 
     def context(self, file_id: int, line: int, radius: int = 8) -> dict:
@@ -693,14 +835,15 @@ class ViewerIndex:
             if line > file["line_count"]:
                 raise ValueError("行号超过文件范围")
             rows = connection.execute(
-                "SELECT line_number,category,severity,rules,substr(body,1,16384) AS text,length(body) AS text_length,degraded FROM lines WHERE file_id=? AND line_number BETWEEN ? AND ? ORDER BY line_number",
+                "SELECT line_number,category,severity,rules,substr(body,1,16384) AS text,length(body) AS text_length,degraded,"
+                "byte_offset,byte_length FROM lines WHERE file_id=? AND line_number BETWEEN ? AND ? ORDER BY line_number",
                 (file_id, max(1, line - radius), line + radius),
             ).fetchall()
         return {"line": line, "sha256": file["sha256"], "encoding": file["encoding"],
                 "encoding_fallback": bool(file["encoding_fallback"]), "encoding_basis": file["encoding_basis"],
                 "encoding_basis_label": basis_label(file["encoding_basis"]),
                 "decode_degraded_line_count": file["degraded_lines"],
-                "source": file["path"], "items": [dict(row) for row in rows]}
+                "source": file["path"], "items": _with_text(file, rows, 16384)}
 
     @staticmethod
     def _block_conditions(file_id, category, after, addin_prefix):
@@ -733,7 +876,7 @@ class ViewerIndex:
             where.append("b.phase=?")
             values.append(phase)
         with self.connect() as connection:
-            self._ready(connection, file_id)
+            file = self._ready(connection, file_id)
             if query.strip():
                 phrase = '"' + query.strip().replace('"', '""') + '"*'
                 rows = self._search_blocks(connection, file_id, category, phrase, after, limit + 1, addin_prefix,
@@ -758,7 +901,7 @@ class ViewerIndex:
             else:
                 rows = connection.execute("SELECT b.* FROM blocks b WHERE " + " AND ".join(where)
                                           + " ORDER BY b.start_line LIMIT ?", [*values, limit + 1]).fetchall()
-        items = [self._block_dict(row) for row in rows[:limit]]
+            items = _with_titles(connection, file, [self._block_dict(row) for row in rows[:limit]])
         return {"items": items, "has_more": len(rows) > limit,
                 "next_after": items[-1]["start_line"] if items else after}
 
@@ -779,59 +922,46 @@ class ViewerIndex:
         if not 1 <= limit <= 200:
             raise ValueError("分页或搜索参数超出范围")
         with self.connect() as connection:
-            self._ready(connection, file_id)
+            file = self._ready(connection, file_id)
             rows = connection.execute(
                 f"SELECT * FROM blocks WHERE file_id=? AND category IN ({','.join('?' * len(categories))}) "
                 "AND title NOT LIKE 'Jrn.Directive%' ORDER BY start_line DESC LIMIT ?",
                 (file_id, *categories, limit)).fetchall()
-        return [self._block_dict(row) for row in reversed(rows)]
+            return _with_titles(connection, file, [self._block_dict(row) for row in reversed(rows)])
 
     @staticmethod
     def _search_blocks(connection, file_id, category, phrase, after, limit, addin_prefix="", phase="all"):
+        table = fts_table(file_id)  # rowid = line number
         condition, value = block_filter(category)
         phase_sql, phase_values = (" AND b.phase=?", [phase]) if phase != "all" else ("", [])
-        first = connection.execute("SELECT id FROM lines WHERE file_id=? AND line_number>? "
-                                   "ORDER BY line_number LIMIT 1", (file_id, after)).fetchone()
-        if first is None:
-            return []
-        last_id = connection.execute("SELECT id FROM lines WHERE file_id=? ORDER BY line_number DESC LIMIT 1", (file_id,)).fetchone()[0]
+        hit_inside = f"EXISTS (SELECT 1 FROM {table} WHERE {table} MATCH ? AND rowid BETWEEN b.start_line AND b.end_line)"
         if addin_prefix:
             where, values = ViewerIndex._block_conditions(file_id, category, after, addin_prefix)
             return connection.execute(
-                "SELECT b.* FROM blocks b WHERE " + " AND ".join(where) + phase_sql
-                + " AND EXISTS (SELECT 1 FROM lines l INDEXED BY lines_position WHERE l.file_id=b.file_id "
-                "AND l.line_number BETWEEN b.start_line AND b.end_line AND l.id IN "
-                "(SELECT rowid FROM line_search WHERE line_search MATCH ? AND rowid>=? AND rowid<=?)) "
-                "ORDER BY b.start_line LIMIT ?", [*values, *phase_values, phrase, first[0], last_id, limit],
-            ).fetchall()
-        cursor, result, previous = first[0] - 1, [], None
+                "SELECT b.* FROM blocks b WHERE " + " AND ".join(where) + phase_sql + " AND " + hit_inside
+                + " ORDER BY b.start_line LIMIT ?", [*values, *phase_values, phrase, limit]).fetchall()
+        cursor, result, previous = after, [], None
         while True:
-            # Force FTS to drive the join. The opposite plan scanned millions
-            # of source lines even when only nine lines matched the term.
-            hits = connection.execute(
-                "SELECT l.id,l.line_number FROM line_search s CROSS JOIN lines l ON l.id=s.rowid "
-                "WHERE line_search MATCH ? AND s.rowid>? AND s.rowid<=? AND l.file_id=? "
-                "ORDER BY s.rowid LIMIT 512", (phrase, cursor, last_id, file_id),
-            ).fetchall()
-            if category != "all" and cursor == first[0] - 1 and len(hits) == 512:
+            # The full-text hits drive the search: a few hits in millions of
+            # lines are mapped to their blocks without scanning the lines.
+            hits = [row[0] for row in connection.execute(
+                f"SELECT rowid FROM {table} WHERE {table} MATCH ? AND rowid>? ORDER BY rowid LIMIT 512",
+                (phrase, cursor))]
+            if category != "all" and cursor == after and len(hits) == 512:
                 stats = connection.execute("SELECT counts FROM block_stats WHERE file_id=?", (file_id,)).fetchone()
                 if stats and json.loads(stats[0]).get(category, 0) <= 5000:
                     # For a common word and a small category, test only those
                     # blocks instead of mapping every matching ordinary line.
                     return connection.execute(
                         f"SELECT b.* FROM blocks b WHERE b.file_id=? AND {condition} AND b.start_line>?{phase_sql} "
-                        "AND EXISTS (SELECT 1 FROM lines l INDEXED BY lines_position WHERE l.file_id=b.file_id "
-                        "AND l.line_number BETWEEN b.start_line AND b.end_line AND l.id IN "
-                        "(SELECT rowid FROM line_search WHERE line_search MATCH ? AND rowid>? AND rowid<=?)) "
-                        "ORDER BY b.start_line LIMIT ?", (file_id, value, after, *phase_values, phrase, cursor,
-                                                          last_id, limit),
-                    ).fetchall()
-            for hit in hits:
-                if previous is not None and previous["start_line"] <= hit["line_number"] <= previous["end_line"]:
+                        f"AND {hit_inside} ORDER BY b.start_line LIMIT ?",
+                        (file_id, value, after, *phase_values, phrase, limit)).fetchall()
+            for line in hits:
+                if previous is not None and previous["start_line"] <= line <= previous["end_line"]:
                     continue
                 previous = connection.execute(
                     "SELECT * FROM blocks WHERE file_id=? AND start_line<=? ORDER BY start_line DESC LIMIT 1",
-                    (file_id, hit["line_number"]),
+                    (file_id, line),
                 ).fetchone()
                 if (previous and previous["start_line"] > after and matches_filter(previous, category)
                         and (phase == "all" or previous["phase"] == phase)):
@@ -842,8 +972,7 @@ class ViewerIndex:
                 return result
             # Skip the rest of the last mapped block, even if it contains
             # millions of repetitions; it has already been accepted/rejected.
-            cursor = connection.execute("SELECT id FROM lines WHERE file_id=? AND line_number=?",
-                                        (file_id, previous["end_line"])).fetchone()[0]
+            cursor = max(hits[-1], previous["end_line"])
 
     @staticmethod
     def _block_dict(row) -> dict:
@@ -858,9 +987,9 @@ class ViewerIndex:
                 raise ValueError("行号超过文件范围")
             row = connection.execute("SELECT * FROM blocks WHERE file_id=? AND start_line<=? "
                                      "ORDER BY start_line DESC LIMIT 1", (file_id, line)).fetchone()
-        if row is None or row["end_line"] < line:
-            raise ValueError("段落索引不完整，请重新索引")
-        return self._block_dict(row)
+            if row is None or row["end_line"] < line:
+                raise ValueError("段落索引不完整，请重新索引")
+            return _with_titles(connection, file, [self._block_dict(row)])[0]
 
     def block_lines(self, file_id: int, start_line: int, offset: int = 0, limit: int = 50) -> dict:
         """Bound detail reads so expanding an enormous paragraph stays cheap."""
@@ -871,10 +1000,11 @@ class ViewerIndex:
             raise ValueError("请提供段落起始行")
         begin = start_line + offset
         with self.connect() as connection:
+            file = self._ready(connection, file_id)
             rows = connection.execute(
-                "SELECT line_number,substr(body,1,16384) AS text,length(body) AS text_length,degraded "
-                "FROM lines WHERE file_id=? AND line_number BETWEEN ? AND ? ORDER BY line_number",
+                "SELECT line_number,substr(body,1,16384) AS text,length(body) AS text_length,degraded,"
+                "byte_offset,byte_length FROM lines WHERE file_id=? AND line_number BETWEEN ? AND ? ORDER BY line_number",
                 (file_id, begin, min(block["end_line"], begin + limit - 1)),
             ).fetchall()
-        return {"block": block, "items": [dict(row) for row in rows],
+        return {"block": block, "items": _with_text(file, rows, 16384),
                 "has_more": begin + limit <= block["end_line"]}

@@ -160,6 +160,7 @@ class SnapshotTests(unittest.TestCase):
             index.build(index.register([source], "auto"), "auto")
             item, = index.catalog()
             self.assertEqual((item["status"], item["live"], item["writing"]), ("ready", True, True))
+            self.assertEqual(item["store"], "text")  # a snapshot is temporary: its text is kept
             session, = index.sessions()
             self.assertEqual(session["end_state"], "live")  # still being written: not a crash candidate
             self.assertNotIn("session.no_clean_exit", [item["id"] for item in session["session_findings"]])

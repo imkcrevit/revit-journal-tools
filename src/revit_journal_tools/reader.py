@@ -28,6 +28,8 @@ import io
 import locale
 import os
 import re
+from collections import deque
+from itertools import accumulate, repeat
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -145,6 +147,82 @@ def _visible(match: re.Match) -> str:
     return "\\x%02x" % (ord(match.group()) - _ESCAPE_BASE)
 
 
+def span_codec(encoding: str) -> str | None:
+    """Codec that decodes one line's bytes on its own, or None when lines cannot
+    be addressed by byte ranges: CR/LF bytes inside characters (UTF-16/32),
+    stateful codecs, or a different newline encoding (EBCDIC)."""
+    try:
+        name = codecs.lookup(encoding).name
+    except LookupError:
+        return None
+    if name == "utf-8-sig":
+        return "utf-8"  # the BOM is skipped by the first line's offset
+    if name.startswith(("utf-16", "utf-32", "utf-7", "iso2022")) or name == "hz":
+        return None
+    try:
+        return name if "\r\n".encode(name) == b"\r\n" else None
+    except UnicodeError:
+        return None
+
+
+def decode_span(data: bytes, codec: str, degraded: bool) -> str:
+    """One line's text from its bytes, exactly as JournalReader produced it."""
+    if not degraded:
+        return data.decode(codec)
+    return _ESCAPED.sub(_visible, data.decode(codec, _DEGRADED_ERRORS))
+
+
+class _LineSpans:
+    """(offset, length) of each line's content without its CR, LF or CRLF, found
+    in the raw bytes as they are read. Valid for span_codec encodings, where these
+    bytes are always line breaks. bytes.splitlines splits on exactly the CR, LF
+    and CRLF of the universal-newline text layer; whole chunks are measured with
+    C-level iterators."""
+
+    def __init__(self, start: int):
+        """start: bytes before the first line (a UTF-8 BOM)."""
+        self.spans: deque[tuple[int, int]] = deque()
+        self.line_start = start
+        self.skip = start
+        self.carry = 0  # content bytes of the current, unfinished line
+        self.pending_cr = False  # it ended a chunk with CR: CRLF or a lone CR?
+
+    def feed(self, chunk: bytes) -> None:
+        if self.skip:
+            chunk, self.skip = chunk[self.skip:], max(0, self.skip - len(chunk))
+        if self.pending_cr:
+            terminator = 2 if chunk[:1] == b"\n" else 1
+            self.spans.append((self.line_start, self.carry))
+            self.line_start += self.carry + terminator
+            self.carry, self.pending_cr = 0, False
+            chunk = chunk[terminator - 1:]
+        parts = chunk.splitlines(True)
+        if not parts:
+            return
+        tail = parts[-1]
+        if tail.endswith(b"\n"):
+            tail = None
+        else:
+            parts.pop()  # unfinished, or a CR that may be followed by LF
+        if parts:
+            sizes = list(map(len, parts))
+            contents = list(map(len, map(bytes.rstrip, parts, repeat(b"\r\n"))))
+            sizes[0] += self.carry
+            contents[0] += self.carry
+            self.spans.extend(zip(accumulate(sizes[:-1], initial=self.line_start), contents))
+            self.line_start += sum(sizes)
+            self.carry = 0
+        if tail is not None:
+            self.pending_cr = tail.endswith(b"\r")
+            self.carry += len(tail) - self.pending_cr
+
+    def finish(self) -> None:
+        if self.pending_cr or self.carry:  # the last line, with a CR or no line break
+            self.spans.append((self.line_start, self.carry))
+            self.line_start += self.carry + self.pending_cr
+            self.carry, self.pending_cr = 0, False
+
+
 def system_fallback_encoding() -> str | None:
     """Strict superset of the system ANSI code page, or None when it is UTF-8/ASCII."""
     getter = getattr(locale, "getencoding", None)  # Python 3.11+: ignores UTF-8 mode
@@ -235,6 +313,7 @@ class _DigestReader(io.RawIOBase):
         self.raw = raw
         self.digest = hashlib.sha256()
         self.byte_count = 0
+        self.spans: _LineSpans | None = None
 
     def readable(self) -> bool:
         return True
@@ -244,6 +323,10 @@ class _DigestReader(io.RawIOBase):
         if count:
             self.digest.update(memoryview(buffer)[:count])
             self.byte_count += count
+            if self.spans is not None:
+                self.spans.feed(bytes(memoryview(buffer)[:count]))
+        elif self.spans is not None:
+            self.spans.finish()
         return count
 
     def close(self) -> None:
@@ -255,8 +338,11 @@ class _DigestReader(io.RawIOBase):
 
 class JournalReader:
     def __init__(
-        self, path: str | Path, encoding: str = "auto", max_line_chars: int = 1_048_576
+        self, path: str | Path, encoding: str = "auto", max_line_chars: int = 1_048_576,
+        track_spans: bool = False,
     ):
+        """track_spans: record each line's byte range in ``span`` (offset, length)
+        when the chosen encoding allows it (``span_codec``)."""
         if max_line_chars < 1:
             raise ValueError("max_line_chars必须大于0")
         self.path = Path(path).resolve()
@@ -272,6 +358,9 @@ class JournalReader:
         self.line_count = 0
         self.complete = False
         self._text: io.TextIOWrapper | None = None
+        self.track_spans = track_spans
+        self.span_codec: str | None = None
+        self.span: tuple[int, int] | None = None
 
     def _choose(self, raw: io.BufferedReader) -> tuple[str, bool, str]:
         """Return (encoding, degraded, basis). Explicit single codecs stay strict."""
@@ -338,6 +427,12 @@ class JournalReader:
                 self.policy.detect and self.encoding not in {first, "utf-8-sig", "utf-16", "utf-32"})
             raw.seek(0)
             self._reader = _DigestReader(raw)
+            if self.track_spans:
+                self.span_codec = span_codec(self.encoding)
+                if self.span_codec is not None:
+                    bom = self.encoding == "utf-8-sig" and raw.read(3) == codecs.BOM_UTF8
+                    raw.seek(0)
+                    self._reader.spans = _LineSpans(3 if bom else 0)
             self._text = io.TextIOWrapper(
                 io.BufferedReader(self._reader), encoding=self.encoding,
                 errors=_DEGRADED_ERRORS if self.degraded else "strict", newline=None,
@@ -360,6 +455,7 @@ class JournalReader:
         if self.complete:
             raise RuntimeError("读取器只能遍历一次")
         degraded_mode = self.degraded
+        spans = self._reader.spans
         try:
             while True:
                 value = self._text.readline(self.max_line_chars + 2)
@@ -385,6 +481,13 @@ class JournalReader:
                         f"第{self.line_count}行含NUL字符，可能是二进制或编码不符；"
                         "无BOM的UTF-16请显式指定--encoding utf-16-le或utf-16-be"
                     )
+                if spans is not None:
+                    # An ASCII line has as many bytes as characters: a cheap check
+                    # that the byte ranges stay aligned with the decoded lines.
+                    span = spans.spans.popleft() if spans.spans else (0, -1)
+                    if span[1] != len(text) and (span[1] < 0 or (text.isascii() and not flagged)):
+                        raise JournalReadError(f"第{self.line_count}行的字节位置与解码结果不一致；请改用--store text")
+                    self.span = span
                 yield JournalLine(self.line_count, text, flagged) if flagged else JournalLine(self.line_count, text)
         except UnicodeError as error:
             raise JournalReadError(

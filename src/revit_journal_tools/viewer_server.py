@@ -128,10 +128,10 @@ def make_server(index: ViewerIndex, port: int = 8765) -> ThreadingHTTPServer:
 
 
 def serve(paths: list[Path], database: Path, encoding: str, port: int, jobs: int | None = None,
-          snapshot: str = "auto") -> None:
+          snapshot: str = "auto", store: str = "offsets") -> None:
     if not 1 <= port <= 65535:
         raise ValueError("端口必须在1到65535之间")
-    index = ViewerIndex(database, workers=jobs, snapshot=snapshot)
+    index = ViewerIndex(database, workers=jobs, snapshot=snapshot, store=store)
     queued = index.register(paths, encoding)
     server = make_server(index, port)
     stop = threading.Event()

@@ -53,6 +53,10 @@ def _workspace_options(command: argparse.ArgumentParser, index: bool) -> None:
                              help="多文件建索引的进程数；默认逻辑核数减1、最多8，1为顺序")
         command.add_argument("--database", type=Path, default=None,
                              help="索引数据库；默认在缓存目录（revit-journal cache查看位置）")
+        command.add_argument("--store", choices=("offsets", "text"), default="offsets",
+                             help="offsets（默认）索引只存每行在源文件中的位置，查看时从源文件读取原文，"
+                                  "源文件须保持原位不变；text把全文存入索引（实测为offsets的1.7–2.3倍，不依赖源文件）。"
+                                  "正在写入的Journal总是存全文")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -236,7 +240,7 @@ def _report(args, years: list[int], rules) -> int:
     protected = [*inputs, *([args.rules] if args.rules is not None else [])]
     for target in (args.database, Path(str(args.database) + "-wal"), Path(str(args.database) + "-shm"), args.output):
         _protect_inputs(target, protected)
-    index = ViewerIndex(args.database, workers=args.jobs, snapshot=args.snapshot)
+    index = ViewerIndex(args.database, workers=args.jobs, snapshot=args.snapshot, store=args.store)
     index.build(index.register(planned, args.encoding), args.encoding)
     # The report lists one finding per repeat group: retain one per group, and
     # enough of them to fill the list after UI prompts are set aside.
@@ -286,15 +290,16 @@ def main(argv: list[str] | None = None) -> int:
                     if not 1 <= args.tail <= 200:
                         raise ValueError("--tail需要在1到200之间")
                     return run(planned, args.database, args.encoding, format_name=args.format, print_only=True,
-                               jobs=args.jobs, snapshot=args.snapshot, summary_tail=args.tail)
+                               jobs=args.jobs, snapshot=args.snapshot, summary_tail=args.tail, store=args.store)
                 return run(planned, args.database, args.encoding, category=args.category, query=args.query,
                            addin_prefix=args.addin_prefix,
                            color=args.color, print_only=args.print_only, format_name=args.format,
                            after=args.after, page_size=args.page_size, jobs=args.jobs, snapshot=args.snapshot,
-                           phase=args.phase, fold=args.fold)
+                           phase=args.phase, fold=args.fold, store=args.store)
             from .viewer_server import serve
 
-            serve(planned, args.database, args.encoding, args.port, jobs=args.jobs, snapshot=args.snapshot)
+            serve(planned, args.database, args.encoding, args.port, jobs=args.jobs, snapshot=args.snapshot,
+                  store=args.store)
             return 0
         options = ScanOptions(
             encoding=args.encoding, context=args.context, min_severity=args.min_severity,

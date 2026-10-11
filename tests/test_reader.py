@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from revit_journal_tools import reader as reader_module
-from revit_journal_tools.reader import JournalReader, JournalReadError, resolve_encoding
+from revit_journal_tools.reader import JournalReader, JournalReadError, decode_span, resolve_encoding, span_codec
 
 
 class ReaderTests(unittest.TestCase):
@@ -268,6 +268,50 @@ class LanguageAndChineseTextTests(unittest.TestCase):
         self.path.write_bytes((self.GERMAN + "\r\n").encode("cp1252"))
         report = analyze(self.path, options=ScanOptions(encoding="utf-8,gb18030"))
         self.assertTrue(any(warning.startswith("编码存疑") for warning in report.warnings))
+
+
+@patch("revit_journal_tools.reader.system_fallback_encoding", return_value="gb18030")
+class SpanTests(unittest.TestCase):
+    """J9: each line's byte range in the source decodes back to exactly the same text."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name) / "journal.txt"
+
+    def spans(self, data, encoding="auto"):
+        self.path.write_bytes(data)
+        with JournalReader(self.path, encoding, track_spans=True) as reader:
+            result = [(line.text, line.degraded, reader.span) for line in reader]
+        return reader, result
+
+    def round_trip(self, data, encoding="auto"):
+        reader, result = self.spans(data, encoding)
+        self.assertEqual([decode_span(data[offset:offset + length], reader.span_codec, degraded)
+                          for _, degraded, (offset, length) in result], [text for text, _, _ in result])
+        return reader, result
+
+    def test_line_breaks_bom_and_buffer_boundaries(self, _):
+        # The text layer reads 8192-byte chunks: these CRLFs are split between two.
+        for data in (b"a\r\nb\rc\n\r\n\rlast", b"\xef\xbb\xbffirst\r\nsecond\r\n", b"x\r", b"\n\n\r\r\n",
+                     b"x" * 8191 + b"\r\n" + b"y" * 8190 + b"\r\nz", "错误: 不满足约束\r\n第二行".encode("gb18030")):
+            with self.subTest(data=data[:12]):
+                reader, result = self.round_trip(data)
+                self.assertEqual(len(result), len(data.decode(reader.encoding).splitlines()))
+
+    def test_degraded_bytes_read_back_as_the_same_escapes(self, _):
+        reader, result = self.round_trip("正常\r\n".encode("gb18030") + b"bad\xff\rnext\r\nlead\x81\nend")
+        self.assertTrue(reader.degraded)
+        self.assertEqual([text for text, _, _ in result], ["正常", "bad\\xff", "next", "lead\\x81", "end"])
+
+    def test_codecs_without_byte_addressable_lines(self, _):
+        self.assertEqual([span_codec(name) for name in ("utf-8-sig", "gb18030", "cp1252", "cp932")],
+                         ["utf-8", "gb18030", "cp1252", "cp932"])
+        for name in ("utf-16", "utf-32-le", "iso2022_jp", "cp037", "utf-7", "no-such-codec"):
+            self.assertIsNone(span_codec(name), name)  # CR/LF bytes inside characters, state, EBCDIC
+        reader, result = self.spans("a\r\nb".encode("utf-16"))
+        self.assertIsNone(reader.span_codec)
+        self.assertEqual([span for *_, span in result], [None, None])
 
 
 class SystemFallbackTests(unittest.TestCase):
