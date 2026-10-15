@@ -244,9 +244,13 @@ def end_state(summary: dict, live: bool) -> str:
     return "live" if live else "no_clean_exit"
 
 
-def session_findings(summary: dict, live: bool, sidecars: list[dict], source: str) -> list[dict]:
-    """Session-level candidates with evidence; never a diagnosis."""
+def session_findings(summary: dict, live: bool, sidecars: list[dict], source: str, lang: str = "zh") -> list[dict]:
+    """Session-level candidates with evidence; never a diagnosis. lang: zh, or en
+    for the viewer page (titles and explanations only; evidence is journal text)."""
+    from .i18n import EN
+
     findings = []
+    en = lang == "en"
 
     def add(finding_id, severity, title, explanation, evidence):
         findings.append({"id": finding_id, "severity": severity, "title": title, "explanation": explanation,
@@ -255,25 +259,32 @@ def session_findings(summary: dict, live: bool, sidecars: list[dict], source: st
     state = end_state(summary, live)
     last = summary.get("last_lines") or []
     if state == "no_clean_exit":
-        add("session.no_clean_exit", "warning", "未正常结束",
+        add("session.no_clean_exit", "warning", "Did not end normally" if en else "未正常结束",
+            "No “finished recording journal file” end marker: Revit may have crashed, been forced to close or "
+            "lost power; check the last operations and dialogs before the end, dmp files and CER logs." if en else
             "没有“finished recording journal file”结束标记：Revit可能崩溃、被强制结束或断电；"
             "请结合结束前最后的操作、对话框、dmp与CER日志判断。",
             [{"source": source, **last[-1]}] if last else [])
     errors = summary.get("license", {}).get("errors") or []
     if errors:
-        add("session.license_error", "warning", "许可验证错误",
-            f"会话中有{len(errors)}条许可SDK错误；许可问题通常早于其他现象出现。",
+        add("session.license_error", "warning", "License validation errors" if en else "许可验证错误",
+            f"{len(errors)} licensing SDK error{'' if len(errors) == 1 else 's'} in the session; license problems usually "
+            "appear before other symptoms."
+            if en else f"会话中有{len(errors)}条许可SDK错误；许可问题通常早于其他现象出现。",
             [{"source": source, **item} for item in errors[:5]])
     failures = summary.get("open_failures") or []
     if failures:
-        add("session.model_open_failed", "error", "模型打开或载入失败",
-            "打开/载入模型时报告异常或未完成；原因见原文中的异常文字。",
+        add("session.model_open_failed", "error", "Model open or load failed" if en else "模型打开或载入失败",
+            "Opening or loading a model reported an exception or did not finish; the exception text in the journal "
+            "gives the reason." if en else "打开/载入模型时报告异常或未完成；原因见原文中的异常文字。",
             [{"source": source, **item} for item in failures[:5]])
     conflicts = summary.get("addins", {}).get("conflicts") or []
     if conflicts:
         total = summary["addins"]["conflict_lines"]
-        add("session.addin_conflict", "warning", "Add-in程序集版本冲突",
-            f"{len(conflicts)}个程序集共{total}条冲突记录（按程序集聚合）；多数情况下Add-in仍能加载。",
+        add("session.addin_conflict", "warning", "Add-in assembly version conflicts" if en else "Add-in程序集版本冲突",
+            f"{total} conflict record{'' if total == 1 else 's'} in {len(conflicts)} "
+            f"{'assembly' if len(conflicts) == 1 else 'assemblies'} (grouped by assembly); in most cases the add-ins "
+            "still load." if en else f"{len(conflicts)}个程序集共{total}条冲突记录（按程序集聚合）；多数情况下Add-in仍能加载。",
             [{"source": source, "line_number": item["first_line"],
               "text": f"{item['assembly']} ×{item['count']}"} for item in conflicts[:10]])
     steel = summary.get("steel_localdb") or []
@@ -283,7 +294,10 @@ def session_findings(summary: dict, live: bool, sidecars: list[dict], source: st
         for log in steel_logs:
             evidence.extend({"source": log["path"], "line_number": entry["line_number"],
                              "text": f"[{entry['time']}] {entry['text']}"} for entry in log["entries"][:10])
-        add("session.steel_localdb", "error", "钢结构连接/LocalDB错误",
+        add("session.steel_localdb", "error", "Steel connection / LocalDB errors" if en else "钢结构连接/LocalDB错误",
+            "Steel Connections depends on SQL Server Express LocalDB; the steel connection error log or the journal has "
+            "LocalDB or steel connection exceptions. The standalone repair tool RevitLocalDbFix (not a Revit add-in) "
+            "can check and repair the LocalDB instance." if en else
             "Steel Connections依赖SQL Server Express LocalDB；钢连接错误日志或Journal中有LocalDB/钢连接异常。"
             "可使用独立修复工具RevitLocalDbFix（不是Revit插件）检查和修复LocalDB实例。", evidence)
     crash = summary.get("crash") or {}
@@ -293,26 +307,49 @@ def session_findings(summary: dict, live: bool, sidecars: list[dict], source: st
         severe = state == "no_clean_exit" or any(
             counts.get(kind) for kind in ("crash_protection_failed", "unhandled", "fatal_dialog", "crash_log"))
         first = marks[0]
-        parts = [f"第{first['line_number']}行起记录到{CRASH_MARKS[first['kind']]}"]
+        meanings = EN["exception_code"] if en else EXCEPTION_CODES
         codes = list(dict.fromkeys(mark["code"] for mark in marks if mark.get("code")))
-        if codes:
-            parts.append("异常代码" + "、".join(
-                code + (f"（{EXCEPTION_CODES[code]}）" if code in EXCEPTION_CODES else "") for code in codes))
         command = next((mark["command"] for mark in marks if mark.get("command")), None)
-        if command:
-            parts.append(f"异常前最后的命令在第{command['line_number']}行：{command['text']}")
-        if severe:
-            parts.append("随后出现致命错误、未处理异常或会话没有正常结束：Revit很可能在此崩溃")
+        if en:
+            parts = [f"{EN['crash_mark'][first['kind']]} recorded from line {first['line_number']}"]
+            if codes:
+                parts.append("exception code " + ", ".join(
+                    code + (f" ({meanings[code]})" if code in meanings else "") for code in codes))
+            if command:
+                parts.append(f"the last command before the exception is on line {command['line_number']}: {command['text']}")
+            if severe:
+                parts.append("then a fatal error, an unhandled exception or no normal end of the session: "
+                             "Revit most likely crashed here")
+            explanation = ("; ".join(parts) + ". An exception code tells the kind of failure, not its cause; check "
+                           "the operations before the exception, dmp files and CER logs.")
+        else:
+            parts = [f"第{first['line_number']}行起记录到{CRASH_MARKS[first['kind']]}"]
+            if codes:
+                parts.append("异常代码" + "、".join(
+                    code + (f"（{meanings[code]}）" if code in meanings else "") for code in codes))
+            if command:
+                parts.append(f"异常前最后的命令在第{command['line_number']}行：{command['text']}")
+            if severe:
+                parts.append("随后出现致命错误、未处理异常或会话没有正常结束：Revit很可能在此崩溃")
+            explanation = "；".join(parts) + "。异常代码只说明故障类别，不说明具体原因；请结合异常前的操作、dmp与CER日志判断。"
+
+        def meaning(mark):
+            text = meanings.get(mark.get("code", ""), mark["meaning"]) if en else mark["meaning"]
+            return f" ← {text}"
+
         evidence = ([{"source": source, **command}] if command else []) + [
             {"source": source, "line_number": mark["line_number"],
-             "text": mark["text"] + (f" ← {mark['meaning']}" if mark.get("meaning") else "")
+             "text": mark["text"] + (meaning(mark) if mark.get("meaning") else "")
              + (f" ← {mark['detail']}" if mark.get("detail") else "")} for mark in marks[:8]]
-        add("session.crash", "fatal" if severe else "error", "Revit异常与崩溃记录",
-            "；".join(parts) + "。异常代码只说明故障类别，不说明具体原因；请结合异常前的操作、dmp与CER日志判断。",
-            evidence)
+        add("session.crash", "fatal" if severe else "error", "Revit exceptions and crash records" if en
+            else "Revit异常与崩溃记录", explanation, evidence)
     dumps = [item for item in sidecars if item.get("status") == "binary"]
     if dumps:
-        add("session.crash_dump", "warning", "同一会话存在崩溃转储",
+        add("session.crash_dump", "warning", "Crash dumps in the same session" if en else "同一会话存在崩溃转储",
+            f"The session folder has {len(dumps)} journal.NNNN.NNNN.dmp file{'' if len(dumps) == 1 else 's'}; dmp files are "
+            "usually written on an "
+            "exception; this tool does not read them." if en else
             f"会话目录中有{len(dumps)}个journal.NNNN.NNNN.dmp；dmp通常在异常时生成，本工具不解析其内容。",
-            [{"source": item["path"], "line_number": None, "text": f"{item['size']}字节"} for item in dumps])
+            [{"source": item["path"], "line_number": None,
+              "text": f"{item['size']} bytes" if en else f"{item['size']}字节"} for item in dumps])
     return findings

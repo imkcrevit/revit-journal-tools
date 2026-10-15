@@ -159,6 +159,55 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertFalse(output.exists())
 
+    def test_search_lists_hits_of_every_file_by_session(self):
+        other = self.root / "other.log"
+        other.write_text("synthetic start\nnormal\n", encoding="utf-8")
+        database = self.root / "index" / "search.sqlite3"
+        code, stdout, stderr = self.run_cli("search", "synthetic", self.root, "--recursive",
+                                            "--database", database, "--jobs", 1)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(f"{self.journal.resolve()} | 命中1行\n  2: DBG_ERROR: synthetic\n", stdout)
+        self.assertIn(f"{other.resolve()} | 命中1行\n  1: synthetic start\n", stdout)
+        # Two unrecognized file names: two sessions, each with its own header line.
+        self.assertEqual(sum(line.startswith("== ") for line in stdout.splitlines()), 2)
+        self.assertTrue(stdout.endswith("共命中2行 / 2个文件\n"))
+        # Every word must occur in the line, in any order; the last one is also a prefix.
+        code, stdout, stderr = self.run_cli("search", "synthetic DBG_ERR", self.root, "--database", database,
+                                            "--jobs", 1)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("  2: DBG_ERROR: synthetic\n", stdout)
+        self.assertNotIn(str(other.resolve()), stdout)
+        self.assertTrue(stdout.endswith("共命中1行 / 1个文件\n"))
+
+    def test_search_json_and_failed_files(self):
+        database = self.root / "search.sqlite3"
+        code, stdout, stderr = self.run_cli("search", "synthetic", self.journal, "--database", database,
+                                            "--format", "json")
+        self.assertEqual(code, 0, stderr)
+        data = json.loads(stdout)
+        self.assertEqual((data["schema_version"], data["query"], data["total_lines"], data["file_count"]),
+                         (1, "synthetic", 1, 1))
+        self.assertEqual(data["terms"], ["synthetic"])
+        self.assertEqual([item["line_number"] for item in data["files"][0]["items"]], [2])
+        self.assertEqual((data["skipped"], data["errors"]), (0, []))
+        bad = self.root / "bad.txt"
+        bad.write_bytes(b"synthetic\xff\n")
+        code, stdout, stderr = self.run_cli("search", "synthetic", self.journal, bad, "--database", database,
+                                            "--encoding", "utf-8", "--jobs", 1)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("跳过1个未就绪或失败的文件", stdout)
+        self.assertIn(f"索引失败：{bad.resolve()}", stdout)
+
+    def test_search_rejects_punctuation_only_query_before_indexing(self):
+        database = self.root / "search.sqlite3"
+        code, stdout, stderr = self.run_cli("search", "}", self.journal, "--database", database)
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("标点和符号不参与分词", stderr)
+        self.assertFalse(database.exists())
+        code, _, stderr = self.run_cli("search", "synthetic", self.journal, "--database", database, "--per-file", 0)
+        self.assertEqual(code, 2)
+        self.assertIn("--per-file", stderr)
+
     def test_module_entrypoint(self):
         result = subprocess.run(
             [sys.executable, "-m", "revit_journal_tools", "scan", str(self.journal), "--format", "json"],

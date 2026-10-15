@@ -3,6 +3,7 @@
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -12,6 +13,7 @@ from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from .categories import CATEGORIES, Categorizer
@@ -22,7 +24,8 @@ from .reader import JournalReader, SourceChangedError, basis_label, decode_span,
 from .rules import load_rules, ruleset_digest
 from .summary import END_STATES, SessionCollector, end_state, session_findings
 from .sessions import ROLE_LABELS, InputFile, SessionName, describe, plan_inputs, recency_sort
-from .sidecars import BASIS_TEXT, cer_logs, match_cer, match_steel_log, parse_steel_log, revit_year, session_window
+from .sidecars import (BASIS_TEXT, cer_logs, match_cer, match_steel_log, parse_steel_log, revit_version, revit_year,
+                       session_window)
 
 INDEX_VERSION = "viewer-6:" + BLOCK_VERSION
 # offsets (default): `lines` keeps each line's byte range in the source file and
@@ -88,6 +91,60 @@ _TITLE_PREFIX = 16
 
 def fts_table(file_id: int) -> str:
     return f"line_search_{int(file_id)}"
+
+
+NO_SEARCH_TOKENS = "搜索词不含可检索的字母或数字；标点和符号不参与分词"
+CJK_HINT = "中文、日文等连续文字按整段匹配，只能从段首开始查找"
+EMPTY_QUERY = "请输入搜索词"
+# A "phrase" (to the closing quote, or to the end when it is missing) or a word.
+_QUERY_PART = re.compile(r'"([^"]*)(?:"|$)|([^\s"]+)')
+# Kana, CJK ideographs (with extension A, compatibility and the supplementary
+# planes) and Hangul: unicode61 keeps a run of them as one token.
+_CJK = re.compile("[\u3040-\u30ff\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff"
+                  "\uff66-\uff9f\U00020000-\U0003134f]")
+
+
+@dataclass
+class SearchQuery:
+    """A keyword query (parse_query). match: FTS5 MATCH expression ('' when
+    there is no query); terms: the words and phrases as typed, in order, for
+    highlighting; cjk: a term contains CJK text (matched per run, see CJK_HINT)."""
+    match: str
+    terms: list[str]
+    cjk: bool
+
+
+def parse_query(query: str) -> SearchQuery:
+    """Keyword input to an FTS5 expression. Every whitespace-separated word must
+    occur in a line, in any order (AND); "quoted text" is one phrase whose words
+    must be adjacent. A word with punctuation is a phrase of its tokens
+    (Jrn.Command: jrn followed by command). The last unquoted word also matches
+    as a prefix (search while typing). Words without a letter or digit have no
+    tokens (unicode61) and are left out; if nothing is left: ValueError. Blank
+    input is no query (match '')."""
+    parts = []
+    for found in _QUERY_PART.finditer(query):
+        phrase, word = found.groups()
+        text, quoted = (phrase.strip(), True) if word is None else (word, False)
+        if any(character.isalnum() for character in text):
+            parts.append((text, quoted))
+    if not parts:
+        if query.strip():
+            raise ValueError(NO_SEARCH_TOKENS)
+        return SearchQuery("", [], False)
+    last = max((number for number, (_, quoted) in enumerate(parts) if not quoted), default=-1)
+    match = " AND ".join('"' + text.replace('"', '""') + '"' + ("*" if number == last else "")
+                         for number, (text, _) in enumerate(parts))
+    terms = [text for text, _ in parts]
+    return SearchQuery(match, terms, any(_CJK.search(term) for term in terms))
+
+
+def _search_fields(search: SearchQuery, hit_lines: int) -> dict:
+    """Keys a result with a keyword query adds: terms, hit_lines and (CJK) hint."""
+    fields = {"terms": list(search.terms), "hit_lines": hit_lines}
+    if search.cjk:
+        fields["hint"] = CJK_HINT
+    return fields
 
 
 def _stamp(path: Path) -> str:
@@ -706,7 +763,8 @@ class ViewerIndex:
             name = self.describe(item["path"])
             item["kind"] = ROLE_LABELS[name.role] if name.role != "unrecognized" else _kind(Path(item["path"]))
             item.update(session=name.key, session_label=name.label, session_directory=name.directory,
-                        role=name.role, mtime_ns=json.loads(item["stamp"])[3])
+                        role=name.role, mtime_ns=json.loads(item["stamp"])[3],
+                        revit_year=revit_version(Path(item["path"]), item["summary"]))
             # Revit still holds the file open for writing right now (read-only probe).
             item["writing"] = held_for_writing(item["path"])
             try:
@@ -774,7 +832,8 @@ class ViewerIndex:
                 window = session_window(Path(main["path"])) if main else None
                 basis = match_steel_log(Path(item["path"]), entries, window) if window else ""
                 sidecars.append({"kind": "steel_log", "path": item["path"], "size": item["size"],
-                                 "entries": entries, "basis": BASIS_TEXT.get(basis, "同一Revit版本，按时间关联")})
+                                 "entries": entries, "basis": BASIS_TEXT.get(basis, "同一Revit版本，按时间关联"),
+                                 "basis_key": basis})
         for item in group["sidecars"]:
             sidecars.append({"kind": "dump" if item["status"] == "binary" else item["status"],
                              "path": item["path"], "size": item["size"], "status": item["status"],
@@ -800,32 +859,114 @@ class ViewerIndex:
             raise ValueError("该文件的索引来自旧版本，请重新打开以重建")
         return row
 
-    def events(self, file_id: int, category: str = "all", query: str = "", after: int = 0, limit: int = 100) -> dict:
-        if category != "all" and category not in CATEGORIES:
-            raise ValueError("未知分类")
-        if not 1 <= limit <= 200 or after < 0 or len(query) > 256:
-            raise ValueError("分页或搜索参数超出范围")
+    @staticmethod
+    def _line_rows(connection, file_id: int, category: str, match: str, after: int, limit: int) -> list:
+        """Lines after `after` (category "all" or a line category; match: FTS5
+        expression or '' for every line), for _with_text(..., 700)."""
         where = ["l.file_id=?", "l.line_number>?"]
         values: list = [file_id, after]
         if category != "all":
             where.append("l.category=?")
             values.append(category)
-        if query.strip():
-            # Treat input as one literal token phrase, with a prefix on the last token.
-            phrase = '"' + query.strip().replace('"', '""') + '"*'
+        if match:
             table = fts_table(file_id)
-            where.append(f"l.line_number IN (SELECT rowid FROM {table} WHERE {table} MATCH ?)")
-            values.append(phrase)
+            if category == "all":
+                # The hits in line order are the page: no need to visit every
+                # hit of a common word, as the IN (subquery) form would.
+                numbers = [row[0] for row in connection.execute(
+                    f"SELECT rowid FROM {table} WHERE {table} MATCH ? AND rowid>? ORDER BY rowid LIMIT ?",
+                    (match, after, limit))]
+                where.append(f"l.line_number IN ({','.join('?' * len(numbers))})")
+                values.extend(numbers)
+            else:
+                where.append(f"l.line_number IN (SELECT rowid FROM {table} WHERE {table} MATCH ?)")
+                values.append(match)
+        return connection.execute(
+            "SELECT l.line_number,l.category,l.severity,l.rules,substr(l.body,1,700) AS text,length(l.body) AS text_length,l.degraded,"
+            "l.byte_offset,l.byte_length FROM lines l WHERE "
+            + " AND ".join(where) + " ORDER BY l.line_number LIMIT ?",
+            [*values, limit],
+        ).fetchall()
+
+    @staticmethod
+    def _hit_lines(connection, file_id: int, category: str, match: str) -> int:
+        """Matching lines of a file; with a line category only lines of it."""
+        table = fts_table(file_id)
+        if category in CATEGORIES:
+            return connection.execute(
+                f"SELECT COUNT(*) FROM lines l WHERE l.file_id=? AND l.category=? "
+                f"AND l.line_number IN (SELECT rowid FROM {table} WHERE {table} MATCH ?)",
+                (file_id, category, match)).fetchone()[0]
+        return connection.execute(f"SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?", (match,)).fetchone()[0]
+
+    def events(self, file_id: int, category: str = "all", query: str = "", after: int = 0, limit: int = 100) -> dict:
+        """Lines in file order. With a query (parse_query) also terms, hit_lines
+        (matching lines of the category in the whole file) and, for CJK, hint."""
+        if category != "all" and category not in CATEGORIES:
+            raise ValueError("未知分类")
+        if not 1 <= limit <= 200 or after < 0 or len(query) > 256:
+            raise ValueError("分页或搜索参数超出范围")
+        search = parse_query(query) if query.strip() else None
         with self.connect() as connection:
             file = self._ready(connection, file_id)
-            rows = connection.execute(
-                "SELECT l.line_number,l.category,l.severity,l.rules,substr(l.body,1,700) AS text,length(l.body) AS text_length,l.degraded,"
-                "l.byte_offset,l.byte_length FROM lines l WHERE "
-                + " AND ".join(where) + " ORDER BY l.line_number LIMIT ?",
-                [*values, limit + 1],
-            ).fetchall()
+            rows = self._line_rows(connection, file_id, category, search.match if search else "", after, limit + 1)
+            hit_lines = 0
+            if search:
+                # A first page that holds every hit is its own count.
+                hit_lines = (len(rows) if after == 0 and len(rows) <= limit
+                             else self._hit_lines(connection, file_id, category, search.match))
         items = _with_text(file, rows[:limit], 700)
-        return {"items": items, "has_more": len(rows) > limit, "next_after": items[-1]["line_number"] if items else after}
+        result = {"items": items, "has_more": len(rows) > limit,
+                  "next_after": items[-1]["line_number"] if items else after}
+        if search:
+            result.update(_search_fields(search, hit_lines))
+        return result
+
+    def search_workspace(self, query: str, category: str = "all", per_file: int = 3) -> dict:
+        """One keyword query (parse_query) over every file of the workspace, in
+        catalog order: per file its hit_lines and first `per_file` matching lines
+        (rows as in events); only files with hits are listed. Files that cannot
+        be searched now (not ready, indexed by an earlier version, source changed
+        for store="offsets") are counted in `skipped`."""
+        if category != "all" and category not in CATEGORIES:
+            raise ValueError("未知分类")
+        if not 1 <= per_file <= 20 or len(query) > 256:
+            raise ValueError("分页或搜索参数超出范围")
+        search = parse_query(query)
+        if not search.match:
+            raise ValueError(EMPTY_QUERY)
+        catalog = self.catalog()
+        files, total, skipped = [], 0, 0
+        with self.connect() as connection:
+            # One read snapshot (WAL) for every file: a file rebuilt meanwhile
+            # keeps the state read here instead of losing its table mid-search.
+            connection.execute("BEGIN")
+            rows_by_id = {row["id"]: row for row in connection.execute("SELECT * FROM files")}
+            for item in catalog:
+                file = rows_by_id.get(item["id"])
+                if (file is None or file["status"] != "ready" or not file["store"]
+                        or (file["store"] == "offsets" and item["source_changed"])):
+                    skipped += 1
+                    continue
+                rows = self._line_rows(connection, file["id"], category, search.match, 0, per_file + 1)
+                if not rows:
+                    continue
+                hit_lines = (len(rows) if len(rows) <= per_file
+                             else self._hit_lines(connection, file["id"], category, search.match))
+                try:
+                    lines = _with_text(file, rows[:per_file], 700)
+                except ValueError:  # The source changed after catalog() looked at it.
+                    skipped += 1
+                    continue
+                total += hit_lines
+                files.append({"id": item["id"], "name": item["name"], "path": item["path"], "role": item["role"],
+                              "session": item["session"], "session_label": item["session_label"],
+                              "hit_lines": hit_lines, "items": lines})
+        result = {"terms": list(search.terms)}
+        if search.cjk:
+            result["hint"] = CJK_HINT
+        result.update(total_lines=total, file_count=len(files), skipped=skipped, files=files)
+        return result
 
     def context(self, file_id: int, line: int, radius: int = 8) -> dict:
         if line < 1 or not 0 <= radius <= 50:
@@ -863,7 +1004,11 @@ class ViewerIndex:
         """Page by entire event; FTS hits anywhere inside it select the event once.
         fold: blocks with the same fingerprint (same category and content apart
         from timestamps/counters) are listed once, at their first occurrence,
-        with fold_count; a keyword search never folds."""
+        with fold_count; a keyword search never folds.
+        With a query (parse_query) every block has hit_line (its first matching
+        line) and the result has terms, hint (CJK) and hit_lines: matching LINES
+        (not blocks) of the whole file; with a line category only lines of that
+        category, while add-in filters, the phase and addin_prefix are ignored."""
         if category != "all" and category not in BLOCK_FILTERS:
             raise ValueError("未知分类")
         if phase != "all" and phase not in PHASES:
@@ -871,16 +1016,18 @@ class ViewerIndex:
         if not 1 <= limit <= 200 or after < 0 or len(query) > 256 or len(addin_prefix) > 256:
             raise ValueError("分页或搜索参数超出范围")
         addin_prefix = addin_prefix.strip()
+        search = parse_query(query) if query.strip() else None
         where, values = self._block_conditions(file_id, category, after, addin_prefix)
         if phase != "all":
             where.append("b.phase=?")
             values.append(phase)
         with self.connect() as connection:
             file = self._ready(connection, file_id)
-            if query.strip():
-                phrase = '"' + query.strip().replace('"', '""') + '"*'
-                rows = self._search_blocks(connection, file_id, category, phrase, after, limit + 1, addin_prefix,
-                                           phase)
+            found: list[tuple] = []
+            if search:
+                found = self._search_blocks(connection, file_id, category, search.match, after, limit + 1,
+                                            addin_prefix, phase)
+                rows = [row for row, _ in found]
             elif fold and phase == "all":
                 # Precomputed groups are exact here: category and add-in fields are
                 # part of the content, so every filter keeps or drops a group whole.
@@ -902,8 +1049,39 @@ class ViewerIndex:
                 rows = connection.execute("SELECT b.* FROM blocks b WHERE " + " AND ".join(where)
                                           + " ORDER BY b.start_line LIMIT ?", [*values, limit + 1]).fetchall()
             items = _with_titles(connection, file, [self._block_dict(row) for row in rows[:limit]])
-        return {"items": items, "has_more": len(rows) > limit,
-                "next_after": items[-1]["start_line"] if items else after}
+            if search:
+                table = fts_table(file_id)
+                for item, (_, hit_line) in zip(items, found):
+                    if hit_line is None:  # Selected by an EXISTS test: look the first hit up.
+                        hit_line = connection.execute(
+                            f"SELECT rowid FROM {table} WHERE {table} MATCH ? AND rowid BETWEEN ? AND ? "
+                            "ORDER BY rowid LIMIT 1", (search.match, item["start_line"], item["end_line"])).fetchone()[0]
+                    item["hit_line"] = hit_line
+                hit_lines = self._hit_lines(connection, file_id, category, search.match)
+        result = {"items": items, "has_more": len(rows) > limit,
+                  "next_after": items[-1]["start_line"] if items else after}
+        if search:
+            result.update(_search_fields(search, hit_lines))
+        return result
+
+    def block_hits(self, file_id: int, start_line: int, end_line: int, query: str, limit: int = 200) -> list[int]:
+        """Matching line numbers (parse_query) between start_line and end_line,
+        ascending, at most `limit`: next/previous hit inside an expanded block."""
+        if start_line < 1 or end_line < start_line:
+            raise ValueError("行号或上下文范围无效")
+        if not 1 <= limit <= 200 or len(query) > 256:
+            raise ValueError("分页或搜索参数超出范围")
+        search = parse_query(query)
+        with self.connect() as connection:
+            file = self._ready(connection, file_id)
+            if end_line > file["line_count"]:
+                raise ValueError("行号超过文件范围")
+            if not search.match:
+                return []
+            table = fts_table(file_id)
+            return [row[0] for row in connection.execute(
+                f"SELECT rowid FROM {table} WHERE {table} MATCH ? AND rowid BETWEEN ? AND ? ORDER BY rowid LIMIT ?",
+                (search.match, start_line, end_line, limit))]
 
     def fold_members(self, file_id: int, fingerprint: str, limit: int = 50) -> dict:
         """Start lines of every block sharing a fingerprint (expanding a folded entry)."""
@@ -931,15 +1109,17 @@ class ViewerIndex:
 
     @staticmethod
     def _search_blocks(connection, file_id, category, phrase, after, limit, addin_prefix="", phase="all"):
+        """(block row, first matching line in it) pairs; the line is None where
+        an EXISTS test selected the block (blocks() looks it up)."""
         table = fts_table(file_id)  # rowid = line number
         condition, value = block_filter(category)
         phase_sql, phase_values = (" AND b.phase=?", [phase]) if phase != "all" else ("", [])
         hit_inside = f"EXISTS (SELECT 1 FROM {table} WHERE {table} MATCH ? AND rowid BETWEEN b.start_line AND b.end_line)"
         if addin_prefix:
             where, values = ViewerIndex._block_conditions(file_id, category, after, addin_prefix)
-            return connection.execute(
+            return [(row, None) for row in connection.execute(
                 "SELECT b.* FROM blocks b WHERE " + " AND ".join(where) + phase_sql + " AND " + hit_inside
-                + " ORDER BY b.start_line LIMIT ?", [*values, *phase_values, phrase, limit]).fetchall()
+                + " ORDER BY b.start_line LIMIT ?", [*values, *phase_values, phrase, limit])]
         cursor, result, previous = after, [], None
         while True:
             # The full-text hits drive the search: a few hits in millions of
@@ -952,10 +1132,10 @@ class ViewerIndex:
                 if stats and json.loads(stats[0]).get(category, 0) <= 5000:
                     # For a common word and a small category, test only those
                     # blocks instead of mapping every matching ordinary line.
-                    return connection.execute(
+                    return [(row, None) for row in connection.execute(
                         f"SELECT b.* FROM blocks b WHERE b.file_id=? AND {condition} AND b.start_line>?{phase_sql} "
                         f"AND {hit_inside} ORDER BY b.start_line LIMIT ?",
-                        (file_id, value, after, *phase_values, phrase, limit)).fetchall()
+                        (file_id, value, after, *phase_values, phrase, limit))]
             for line in hits:
                 if previous is not None and previous["start_line"] <= line <= previous["end_line"]:
                     continue
@@ -963,9 +1143,11 @@ class ViewerIndex:
                     "SELECT * FROM blocks WHERE file_id=? AND start_line<=? ORDER BY start_line DESC LIMIT 1",
                     (file_id, line),
                 ).fetchone()
+                # Hits come in order, and earlier hits in this block would have
+                # mapped to it already: `line` is its first hit.
                 if (previous and previous["start_line"] > after and matches_filter(previous, category)
                         and (phase == "all" or previous["phase"] == phase)):
-                    result.append(previous)
+                    result.append((previous, line))
                     if len(result) >= limit:
                         return result
             if len(hits) < 512:

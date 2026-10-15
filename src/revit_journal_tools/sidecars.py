@@ -197,12 +197,22 @@ def match_cer(summary: dict, year: int | None, logs: list[dict]) -> list[dict]:
     for log in logs:
         if log["release"] != year:
             continue
-        basis = ""
+        basis = key = ""
         if summary.get("pid") and log["pid"] == summary["pid"]:
-            basis = f"进程号{log['pid']}与Journal中的Session{log['pid']}一致"
+            basis, key = f"进程号{log['pid']}与Journal中的Session{log['pid']}一致", "pid"
         elif not summary.get("pid") and start and end and log["first_time"]:
             if log["first_time"] <= end and log["modified"] >= start:
-                basis = "时间范围重叠（Journal中没有进程号）"
+                basis, key = "时间范围重叠（Journal中没有进程号）", "time"
         if basis:
-            result.append({**log, "kind": "cer_log", "basis": basis})
+            result.append({**log, "kind": "cer_log", "basis": basis, "basis_key": key})
     return result
+
+
+def revit_version(path: Path, summary: dict) -> int | None:
+    """Revit year of a journal: its "Autodesk Revit <year>" folder, else the
+    branch/release in its header (copies of journals live in other folders)."""
+    year = revit_year(path)
+    if year is None:
+        match = re.search(r"20\d\d", f"{summary.get('branch') or ''} {summary.get('release') or ''}")
+        year = int(match.group()) if match else None
+    return year

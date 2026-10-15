@@ -17,11 +17,16 @@ from .loading import ADDIN_FILTERS, ADDIN_KEYS, BLOCK_FILTERS, block_label, bloc
 from .session_view import (duration_text, file_date, main_tail, phase_label, session_label, sidecar_label,
                            state_text, summary_lines)
 from .reader import basis_label
-from .viewer_index import ViewerIndex
+from .viewer_index import EMPTY_QUERY, ViewerIndex, parse_query
 
 COLORS = {"startup": 34, "system": 36, "error": 31, "api_error": 35,
           "operation": 32, "warning": 33, "api": 34, "other": 90, "dialog": 96}
 PHASE_CYCLE = ["all", *PHASES]
+PROMPTS = {"search": "搜索关键词: ", "workspace": "全部文件搜索关键词: ", "goto": "跳到原始行: ",
+           "prefix": "名称/Class前缀: "}
+HIT_CONTEXT = 3  # Lines shown above a search hit when a block opens at it.
+WORKSPACE_PER_FILE = 3  # Hit lines listed per file by the all-files search (?).
+SEARCH_EXCERPT = 200  # Cells of a hit line printed by the search subcommand.
 
 
 def safe_text(text: str) -> str:
@@ -83,6 +88,26 @@ def colored(text: str, category: str, enabled: bool, selected: bool = False) -> 
         return text
     style = f"{COLORS.get(category, 0)}" + (";7" if selected else "")
     return f"\x1b[{style}m{text}\x1b[0m"
+
+
+def query_error(query: str) -> str:
+    """Why a keyword query cannot be searched (parse_query: punctuation only), or ''."""
+    try:
+        parse_query(query)
+    except ValueError as error:
+        return str(error)
+    return ""
+
+
+def check_search(query: str, per_file: int) -> None:
+    """Reject a search subcommand the index cannot answer before any file is read."""
+    if not 1 <= per_file <= 20:
+        raise ValueError("--per-file需要在1到20之间")
+    if len(query) > 256:
+        raise ValueError("分页或搜索参数超出范围")
+    if not query.strip():
+        raise ValueError(EMPTY_QUERY)
+    parse_query(query)
 
 
 @contextmanager
@@ -161,7 +186,7 @@ class Browser:
         if self.addin_prefix and self.category == "all":
             self.category = "addin"
         self.phase, self.fold = phase, fold
-        self.view = "blocks"  # blocks | summary | tail
+        self.view = "blocks"  # blocks | summary | tail | workspace
         self.sessions: list[dict] = []
         self.catalog = index.catalog()
         # Newest main journal first (J11); otherwise the first non-empty file.
@@ -179,6 +204,17 @@ class Browser:
         self.mode = "blocks"
         self.prompt = ""
         self.message = "Enter展开/折叠；字体缩放使用终端自身快捷键。"
+        # Keyword search in the current file: terms and hit_lines of the last
+        # blocks() result, and the query last applied (a query that cannot be
+        # searched falls back to it). hit_cursor: current hit line (h/H).
+        self.terms: list[str] = []
+        self.hit_lines: int | None = None
+        self.applied_query = ""
+        self.hit_cursor: int | None = None
+        # Search over every file (?): its result and the selected hit row.
+        self.workspace: dict | None = None
+        self.workspace_query = ""
+        self.workspace_cursor = 0
         self.refresh()
 
     @property
@@ -233,21 +269,150 @@ class Browser:
     def refresh(self):
         self.catalog = self.index.catalog()
         self.sessions = self.index.sessions(self.catalog)
-        self.items, self.has_more = [], False
+        items, has_more, terms, hit_lines = [], False, [], None
         if self.file and self.file["status"] == "ready":
             if self.view == "tail":
-                self.items = self.index.tail_blocks(self.file["id"], min(200, self.page_size))
+                items = self.index.tail_blocks(self.file["id"], min(200, self.page_size))
             else:
-                result = self.index.blocks(self.file["id"], self.category, self.query, self.after, self.page_size,
-                                           addin_prefix=self.addin_prefix, phase=self.phase, fold=self.fold)
-                self.items, self.has_more = result["items"], result["has_more"]
+                try:
+                    result = self.index.blocks(self.file["id"], self.category, self.query, self.after,
+                                               self.page_size, addin_prefix=self.addin_prefix, phase=self.phase,
+                                               fold=self.fold)
+                except ValueError as error:
+                    if not query_error(self.query):
+                        raise
+                    # Nothing to search (punctuation only): the query is not
+                    # applied; the previous query and its list stay.
+                    self.message = safe_text(str(error))
+                    self.query = self.applied_query
+                    return
+                items, has_more = result["items"], result["has_more"]
+                terms, hit_lines = result.get("terms", []), result.get("hit_lines")
+                if result.get("hint") and self.query != self.applied_query:
+                    self.message = result["hint"]
+                self.applied_query = self.query
+        self.items, self.has_more, self.terms, self.hit_lines = items, has_more, terms, hit_lines
         self.selected = min(self.selected, max(0, len(self.items) - 1))
 
     def reset(self):
         self.after, self.selected, self.detail_offset, self.horizontal = 0, 0, 0, 0
         self.history.clear()
-        self.expanded = False
+        self.expanded, self.hit_cursor = False, None
         self.refresh()
+
+    def apply_query(self, value: str) -> None:
+        """/ : search the current file. A query without searchable tokens
+        (punctuation only) is rejected; the current query and list stay."""
+        error = query_error(value)
+        if error:
+            self.message = safe_text(error)
+            return
+        self.query = value
+        self.message = "Enter展开到命中行；h/H段内下一个/上一个命中。" if value.strip() else "已清除搜索。"
+        self.reset()
+
+    def goto_line(self, file_id: int | None, line: int, query: str = "") -> None:
+        """Open a file (None: the current one) at a source line, like g: its block
+        expanded with the line on top. Category, phase, prefix and folding are
+        cleared; query is the new keyword search ('' clears it, as g does)."""
+        file_id = self.file["id"] if file_id is None else file_id
+        position = next((number for number, item in enumerate(self.catalog) if item["id"] == file_id), None)
+        if position is None:
+            raise ValueError("文件不在当前工作区中")
+        target = self.index.block_at(file_id, line)  # Fails before anything changes.
+        self.file_position = self.file_cursor = position
+        self.category, self.query = "all", query
+        self.addin_prefix, self.phase, self.view = "", "all", "blocks"
+        if self.fold:
+            self.fold = False  # The target may be a later copy of a folded block.
+            self.message = "已关闭折叠以显示原位置；z重新折叠。"
+        self.reset()
+        self.after = target["start_line"] - 1
+        self.refresh()
+        self.expanded = True
+        self.detail_offset = line - target["start_line"]
+        self.hit_cursor = line if query.strip() else None
+
+    def block_hit_lines(self, block: dict) -> list[int]:
+        """Matching lines inside a block for the current query (cached)."""
+        key = (self.file["id"], block["start_line"], self.query)
+        if getattr(self, "_hits_key", None) != key:
+            self._hits = self.index.block_hits(self.file["id"], block["start_line"], block["end_line"], self.query)
+            self._hits_key = key
+        return self._hits
+
+    def jump_hit(self, step: int) -> None:
+        """h/H: next/previous hit inside the selected block, which opens if needed."""
+        block = self.block
+        if not block or not self.query.strip() or self.view == "tail":
+            self.message = "没有搜索条件：先按/搜索，再用h/H在段内跳到命中行。"
+            return
+        hits = self.block_hit_lines(block)
+        if not hits:
+            self.message = "当前段落内没有命中行。"
+            return
+        top = block["start_line"] + self.detail_offset
+        if not self.expanded:
+            self.expanded, self.horizontal = True, 0
+            after, before = block["start_line"] - 1, block["end_line"] + 1
+        elif self.hit_cursor is not None:
+            after = before = self.hit_cursor
+        else:
+            after, before = top - 1, top
+        found = [line for line in hits if line > after] if step > 0 else [line for line in hits if line < before]
+        if not found:
+            self.message = f"已是段内{'最后' if step > 0 else '第'}一个命中（共{len(hits)}个）。"
+            return
+        self.hit_cursor = found[0] if step > 0 else found[-1]
+        self.detail_offset = max(0, self.hit_cursor - block["start_line"] - HIT_CONTEXT)
+        more = "+" if len(hits) >= 200 else ""
+        self.message = f"段内第{hits.index(self.hit_cursor) + 1}/{len(hits)}{more}个命中：L{self.hit_cursor}"
+
+    def workspace_hits(self) -> list[tuple[int, int]]:
+        """(file id, line number) of every listed hit of the all-files search."""
+        return [(file["id"], item["line_number"]) for file in (self.workspace or {}).get("files", [])
+                for item in file["items"]]
+
+    def search_all(self, value: str) -> None:
+        """? : one query over every indexed file (search_workspace)."""
+        try:
+            result = self.index.search_workspace(value, "all", WORKSPACE_PER_FILE)
+        except ValueError as error:  # Blank or punctuation only: stay where we were.
+            self.message = safe_text(str(error))
+            return
+        again = self.workspace is not None and value == self.workspace_query
+        self.workspace, self.workspace_query, self.view = result, value, "workspace"
+        count = len(self.workspace_hits())
+        self.workspace_cursor = min(self.workspace_cursor, max(0, count - 1)) if again else 0
+        self.message = result.get("hint") or ("↑↓选择命中行，Enter打开并定位；Esc返回段落列表。" if count
+                                              else "全部文件中没有命中。")
+
+    def workspace_key(self, key: str, height: int) -> bool:
+        """Keys of the all-files result list. False: handle the key as usual;
+        keys of the paragraph list first return to it."""
+        hits = self.workspace_hits()
+        if key in ("UP", "DOWN", "j", "k", "PGUP", "PGDN"):
+            direction = -1 if key in ("UP", "k", "PGUP") else 1
+            step = max(1, height - 10) if key in ("PGUP", "PGDN") else 1
+            self.workspace_cursor = max(0, min(len(hits) - 1, self.workspace_cursor + direction * step))
+        elif key in ("\r", "\n", " "):
+            if hits:
+                file_id, line = hits[min(self.workspace_cursor, len(hits) - 1)]
+                folded = self.fold
+                self.goto_line(file_id, line, self.workspace_query)
+                self.message = (f"已打开{self.file['name']} L{line}；h/H段内下一个/上一个命中，?回车返回全部文件结果"
+                                + ("；已关闭折叠，z恢复。" if folded else "。"))
+        elif key == "\x1b":
+            self.view = "blocks"
+            self.message = "已返回段落列表；?可再次搜索全部文件。"
+        elif key in ("n", "p", "h", "H"):
+            pass  # One result page; hits inside a block need an opened file.
+        elif key in ("q", "?", "LEFT", "RIGHT"):
+            return False
+        else:
+            self.view = "blocks"
+            return False
+        return True
 
     def next_page(self):
         if self.has_more and self.items:
@@ -265,15 +430,16 @@ class Browser:
     def handle(self, key: str, height=24) -> bool:
         if key in ("\x03", "\x04"):
             return False
-        if self.mode in {"search", "goto", "prefix"}:
+        if self.mode in PROMPTS:
             if key == "\x1b":
                 self.mode = "blocks"
             elif key in ("\r", "\n"):
                 mode, value = self.mode, self.prompt
                 self.mode = "blocks"
                 if mode == "search":
-                    self.query = value
-                    self.reset()
+                    self.apply_query(value)
+                elif mode == "workspace":
+                    self.search_all(value)
                 elif mode == "prefix":
                     self.addin_prefix = value.strip()
                     if self.addin_prefix and self.category == "all":
@@ -282,17 +448,7 @@ class Browser:
                 else:
                     if not value.isdecimal() or not self.file:
                         raise ValueError("请输入有效原始行号")
-                    target = self.index.block_at(self.file["id"], int(value))
-                    self.category, self.query = "all", ""
-                    self.addin_prefix, self.phase, self.view = "", "all", "blocks"
-                    if self.fold:
-                        self.fold = False  # The target may be a later copy of a folded block.
-                        self.message = "已关闭折叠以显示原位置；z重新折叠。"
-                    self.reset()
-                    self.after = target["start_line"] - 1
-                    self.refresh()
-                    self.expanded = True
-                    self.detail_offset = int(value) - target["start_line"]
+                    self.goto_line(None, int(value))
             elif key in ("\x7f", "\b"):
                 self.prompt = self.prompt[:-1]
             elif len(key) == 1 and key.isprintable() and len(self.prompt) < 256:
@@ -313,6 +469,8 @@ class Browser:
                 self.mode = "blocks"
                 self.reset()
             return True
+        if self.view == "workspace" and self.workspace_key(key, height):
+            return True
         if key == "q":
             return False
         if key == "f":
@@ -322,6 +480,10 @@ class Browser:
             self.reset()
         elif key == "/":
             self.mode, self.prompt = "search", self.query
+        elif key == "?":
+            self.mode, self.prompt = "workspace", self.workspace_query or self.query
+        elif key in ("h", "H"):
+            self.jump_hit(1 if key == "h" else -1)
         elif key == "v":
             self.mode, self.prompt = "prefix", self.addin_prefix
         elif key == "g":
@@ -348,7 +510,12 @@ class Browser:
             self.reset()
         elif key in ("\r", "\n", " ") and self.block:
             self.expanded = not self.expanded
-            self.detail_offset, self.horizontal = 0, 0
+            self.detail_offset, self.horizontal, self.hit_cursor = 0, 0, None
+            hit = self.block.get("hit_line")
+            if self.expanded and hit and self.query.strip():
+                # Open at the first hit, with a few lines of context above it.
+                self.hit_cursor = hit
+                self.detail_offset = max(0, hit - self.block["start_line"] - HIT_CONTEXT)
         elif key == "\x1b":
             self.expanded = False
         elif key in ("+", "=", "-"):
@@ -358,7 +525,7 @@ class Browser:
             self.horizontal = max(0, self.horizontal + (16 if key == "RIGHT" else -16))
         elif key in ("n", "p"):
             (self.next_page if key == "n" else self.previous_page)()
-            self.detail_offset = 0
+            self.detail_offset, self.hit_cursor = 0, None
         elif key in ("UP", "DOWN", "j", "k", "PGUP", "PGDN"):
             direction = -1 if key in ("UP", "k", "PGUP") else 1
             step = max(1, height - 8) if key in ("PGUP", "PGDN") else 1
@@ -392,9 +559,15 @@ class Browser:
             f"{self.file['line_count']:,}行 / {self.file['block_count']:,}块 | {encoding_label(self.file)}"
             + (f" | 会话：{state}" if state else ""), "warning" if session.get("end_state") == "no_clean_exit" else "other")
         add(self.file["path"])
-        add(f"分类: {BLOCK_FILTERS.get(self.category, '全部')} | 阶段: {phase_label(self.phase)} | "
-            f"折叠: {'开' if self.fold else '关'} | 搜索: {self.query or '无'} | {'展开原文' if self.expanded else '折叠段落'}")
-        addin_view = self.category in ADDIN_FILTERS or bool(self.addin_prefix)
+        if self.view == "workspace":
+            add(f"全部文件搜索: {self.workspace_query} | 每个文件最多列出{WORKSPACE_PER_FILE}行 | Esc返回段落列表")
+        else:
+            searched = self.query or "无"
+            if self.query.strip() and self.hit_lines is not None:
+                searched += f" 命中{self.hit_lines}行"  # Matching lines, not blocks.
+            add(f"分类: {BLOCK_FILTERS.get(self.category, '全部')} | 阶段: {phase_label(self.phase)} | "
+                f"折叠: {'开' if self.fold else '关'} | 搜索: {searched} | {'展开原文' if self.expanded else '折叠段落'}")
+        addin_view = (self.category in ADDIN_FILTERS or bool(self.addin_prefix)) and self.view != "workspace"
         if addin_view and height >= 13:
             counts = self.file["block_counts"]
             add(f"当前日志Add-in: {counts.get('addin', 0)}条加载记录 | Autodesk {counts.get('addin_autodesk', 0)} / 第三方{counts.get('addin_third_party', 0)} / 待定{counts.get('addin_unknown', 0)}")
@@ -409,6 +582,36 @@ class Browser:
                     add(text, "system")
                 else:
                     add(text, selected=number == self.file_cursor)
+        elif self.view == "workspace":
+            found = self.workspace or {}
+            head = f"全部文件命中{found.get('total_lines', 0)}行 / {found.get('file_count', 0)}个文件"
+            if found.get("skipped"):
+                head += f"（跳过{found['skipped']}个未就绪）"
+            add(head, "startup")
+            if found.get("hint"):
+                add(found["hint"], "warning")
+            # Rows: (text, category, hit number or None for a file header).
+            listing: list[tuple[str, str, int | None]] = []
+            number = 0
+            folders = {item["id"]: item["session_directory"] for item in self.catalog}
+            for file in found.get("files", []):
+                # Revit version folder and session (journal.NNNN) tell same-numbered journals apart.
+                names = [folders.get(file["id"], ""), file["session_label"], file["name"]]
+                names = [name for position, name in enumerate(names) if name and name not in names[position + 1:]]
+                shown = f"，列出前{len(file['items'])}行" if file["hit_lines"] > len(file["items"]) else ""
+                listing.append((" | ".join(names) + f" | 命中{file['hit_lines']}行{shown}", "system", None))
+                for item in file["items"]:
+                    prefix = f"  L{item['line_number']}  "
+                    listing.append((prefix + crop(item["text"], max(1, width - len(prefix)), self.horizontal),
+                                    item["category"], number))
+                    number += 1
+            if not listing:
+                add(f"全部文件中没有命中：{self.workspace_query}")
+            visible = max(1, content_rows - (2 if found.get("hint") else 1))
+            cursor_row = next((row for row, entry in enumerate(listing) if entry[2] == self.workspace_cursor), 0)
+            start = max(0, cursor_row - visible + 1)
+            for text, category, number in listing[start:start + visible]:
+                add(text, category, number == self.workspace_cursor)
         elif self.view == "summary":
             lines = summary_lines(session, self.summary_tail()) if session else ["当前文件不属于任何会话"]
             self.detail_offset = min(self.detail_offset, max(0, len(lines) - content_rows))
@@ -431,12 +634,16 @@ class Browser:
                 add("Class: " + crop(block.get("addin_class") or "未提供", width - 7, self.horizontal), block["category"])
                 extra += 1
             detail = self.index.block_lines(self.file["id"], block["start_line"], self.detail_offset, min(200, max(1, content_rows - 1 - extra)))
+            terms = [term.casefold() for term in self.terms]
             for line in detail["items"]:
                 text = line["text"] + (" [单行预览截断]" if line["text_length"] > len(line["text"]) else "")
                 text += " [含无法解码字节，以\\xNN显示]" if line.get("degraded") else ""
+                # Search hits: selected style plus a mark (> the current one), not color alone.
+                current = line["line_number"] == self.hit_cursor
+                hit = current or any(term in line["text"].casefold() for term in terms)
                 # Keep source line numbers fixed while scrolling the body.
-                prefix = f"{line['line_number']:>8}  "
-                add(prefix + crop(text, width - len(prefix), self.horizontal), block["category"])
+                prefix = f"{line['line_number']:>8}{'>' if current else '*' if hit else ' '} "
+                add(prefix + crop(text, width - len(prefix), self.horizontal), block["category"], hit)
         elif self.items:
             if self.view == "tail":
                 add(f"结束前最后{len(self.items)}个操作与对话框（e返回段落列表）", "startup")
@@ -461,9 +668,9 @@ class Browser:
         while len(rows) < height - 5:
             add("")
         rows = rows[:height - 5]
-        add("0全部 1启动 2系统 3错误 4API错误 5操作 6警告 7API 8其他 9对话框")
-        add("i Add-in列表 a Autodesk加载 t第三方加载 u来源待定加载 v前缀 | s摘要 e结束前 P阶段 z折叠")
-        add("↑↓选择/滚动 Enter展开/折叠 n/p翻页 /搜索 g行号 f文件 +/-预览")
+        add("0全部 1启动 2系统 3错误 4API错误 5操作 6警告 7API 8其他 9对话框 | P阶段 z折叠")
+        add("i Add-in列表 a Autodesk加载 t第三方加载 u来源待定加载 v前缀 | s摘要 e结束前")
+        add("↑↓选择 Enter展开 n/p翻页 /搜索 ?全部文件 h/H段内命中 g行号 f文件 +/-预览")
         if self.file.get("writing") or self.file.get("live"):
             notice = "实时Journal：显示的是建立索引时的快照，之后写入的内容需重新打开browse读取。"
         elif self.file["source_changed"]:
@@ -471,12 +678,15 @@ class Browser:
         else:
             notice = self.message
         add(notice, "warning" if self.file["source_changed"] else "other")
-        if self.mode in {"search", "goto", "prefix"}:
-            label = {"search": "搜索关键词: ", "goto": "跳到原始行: ", "prefix": "名称/Class前缀: "}[self.mode]
-            add(label + self.prompt + "_", "operation")
+        if self.mode in PROMPTS:
+            add(PROMPTS[self.mode] + self.prompt + "_", "operation")
+        elif self.view == "workspace":
+            count = len(self.workspace_hits())
+            add(f"第{min(self.workspace_cursor + 1, count)}/{count}条命中 | ↑↓选择 Enter打开并定位 | ?修改搜索 Esc返回")
         else:
             if self.expanded and self.block:
-                add(f"段内第{self.detail_offset + 1}/{self.block['end_line'] - self.block['start_line'] + 1}行 | PgUp/PgDn翻原文 | Enter折叠")
+                add(f"段内第{self.detail_offset + 1}/{self.block['end_line'] - self.block['start_line'] + 1}行 | "
+                    f"PgUp/PgDn翻原文 | {'h/H段内命中 | ' if self.query.strip() else ''}Enter折叠")
             else:
                 add(f"本页{len(self.items)}块 | {'还有下一页(n)' if self.has_more else '已到末页'} | 错误为候选，需结合原文判断")
         return "\r\n".join(rows)
@@ -570,16 +780,64 @@ def _print_pages(index, category, query, after, limit, color, format_name, addin
     return 2 if failed else 0
 
 
+def _excerpt(item: dict) -> str:
+    """A hit line for plain output: terminal-safe, at most SEARCH_EXCERPT cells."""
+    text = crop(item["text"], SEARCH_EXCERPT)
+    if text != safe_text(item["text"]) or item["text_length"] > len(item["text"]):
+        text += " [截断]"
+    return text
+
+
+def _print_search(index, query, category, per_file, format_name):
+    """`search`: one keyword query over every workspace file, grouped by session."""
+    catalog = index.catalog()
+    failed = [item for item in catalog if item["status"] != "ready"]
+    result = index.search_workspace(query, category, per_file)
+    if format_name == "json":
+        print(json.dumps({"schema_version": 1, "query": query, **result,
+                          "errors": [{"source": item["path"], "error": item["error"] or item["status"]}
+                                     for item in failed]}, ensure_ascii=False))
+        return 2 if failed else 0
+    if result.get("hint"):
+        print("提示：" + result["hint"])
+    by_id = {item["id"]: item for item in catalog}
+    files = list(result["files"])
+    for session in index.sessions(catalog):
+        members = [file for file in files if file["session"] == session["session"]]
+        if not members:
+            continue
+        print(safe_text("== " + session_label(session, by_id)))
+        for file in members:
+            files.remove(file)
+            shown = f"，列出前{len(file['items'])}行" if file["hit_lines"] > len(file["items"]) else ""
+            print(safe_text(f"{file['path']} | 命中{file['hit_lines']}行{shown}"))
+            for item in file["items"]:
+                print(f"  {item['line_number']}: " + _excerpt(item))
+    for file in files:  # Not in any session (not expected): still listed.
+        print(safe_text(f"{file['path']} | 命中{file['hit_lines']}行"))
+        for item in file["items"]:
+            print(f"  {item['line_number']}: " + _excerpt(item))
+    print(f"共命中{result['total_lines']}行 / {result['file_count']}个文件")
+    if result["skipped"]:
+        print(f"跳过{result['skipped']}个未就绪或失败的文件")
+    for item in failed:
+        print(safe_text(f"  索引失败：{item['path']}：{item['error'] or item['status']}"))
+    return 2 if failed else 0
+
+
 def run(paths, database, encoding, *, category="all", query="", color="auto", print_only=False,
         format_name="text", after=0, page_size=100, addin_prefix="", jobs=None, snapshot="auto", phase="all",
-        fold=True, summary_tail=None, store="offsets"):
-    """browse (interactive or one page per file) or, with summary_tail, the session summary."""
+        fold=True, summary_tail=None, store="offsets", per_file=None):
+    """browse (interactive or one page per file), with summary_tail the session
+    summary, or with per_file the search subcommand (query over every file)."""
     if not 1 <= page_size <= 200 or after < 0 or len(query) > 256 or len(addin_prefix) > 256:
         raise ValueError("分页或搜索参数超出范围")
+    if per_file is not None:
+        check_search(query, per_file)  # Before any file is read or indexed.
     addin_prefix = addin_prefix.strip()
     if addin_prefix and category == "all":
         category = "addin"
-    interactive = (summary_tail is None and not print_only and format_name == "text"
+    interactive = (summary_tail is None and per_file is None and not print_only and format_name == "text"
                    and sys.stdin.isatty() and sys.stdout.isatty())
     use_color = color == "always" or (color == "auto" and sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb")
     index = ViewerIndex(database, workers=jobs, snapshot=snapshot, store=store)
@@ -603,6 +861,8 @@ def run(paths, database, encoding, *, category="all", query="", color="auto", pr
                 raise ValueError(failures[0])
             if summary_tail is not None:
                 return _print_summary(index, format_name, summary_tail)
+            if per_file is not None:
+                return _print_search(index, query, category, per_file, format_name)
             return _print_pages(index, category, query, after, page_size, use_color, format_name, addin_prefix,
                                 phase, fold)
         browser = Browser(index, category, query, page_size, after, addin_prefix, phase, fold)

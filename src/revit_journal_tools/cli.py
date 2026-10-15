@@ -15,6 +15,7 @@ from typing import Any, TextIO
 from . import __version__
 from .analyzer import ScanOptions, analyze
 from .blocks import PHASES
+from .categories import CATEGORIES
 from .discovery import cache_dir, cache_files, journal_folders, parse_years
 from .live import SNAPSHOT_MODES
 from .models import SEVERITY_RANK
@@ -80,7 +81,8 @@ def _parser() -> argparse.ArgumentParser:
     _workspace_options(browse, index=True)
     browse.add_argument("--category", choices=("all", *BLOCK_FILTERS), default="all")
     browse.add_argument("--phase", choices=("all", *PHASES), default="all", help="只看某个会话阶段的段落")
-    browse.add_argument("--query", default="", help="搜索段落内任意行；词语/末词前缀")
+    browse.add_argument("--query", default="",
+                        help="搜索段落内任意行：各词都须出现（顺序不限），\"引号\"内为相邻短语，末词兼作前缀")
     browse.add_argument("--addin-prefix", default="", help="按Add-in名称或Class前缀筛选，如ATFTranslationServer")
     browse.add_argument("--no-fold", dest="fold", action="store_false", help="不折叠内容相同的段落")
     browse.add_argument("--color", choices=("auto", "always", "never"), default="auto")
@@ -89,6 +91,14 @@ def _parser() -> argparse.ArgumentParser:
     browse.add_argument("--page-size", type=int, default=100, help="每页1到200个完整段落")
     browse.add_argument("--after", type=int, default=0, help="从此起始行之后的段落继续分页")
     browse.set_defaults(rules=None)
+    search = commands.add_parser("search", help="在全部文件中搜索关键词，按会话列出命中行与行号")
+    search.add_argument("query", help="关键词：各词都须出现在同一行（顺序不限），\"引号\"内为相邻短语，末词兼作前缀；"
+                                      "纯标点不能搜索")
+    _workspace_options(search, index=True)
+    search.add_argument("--category", choices=("all", *CATEGORIES), default="all", help="只看某个行分类的命中")
+    search.add_argument("--per-file", type=int, default=3, metavar="N", help="每个文件最多列出N条命中行，1到20")
+    search.add_argument("--format", choices=("text", "json"), default="text")
+    search.set_defaults(rules=None)
     summary = commands.add_parser("summary", help="会话摘要：怎么结束的、最后在做什么、许可/插件/对话框/侧车日志")
     _workspace_options(summary, index=True)
     summary.add_argument("--format", choices=("text", "json"), default="text")
@@ -98,6 +108,9 @@ def _parser() -> argparse.ArgumentParser:
     _workspace_options(view, index=True)
     view.add_argument("--port", type=int, default=8765)
     view.set_defaults(rules=None)
+    gui = commands.add_parser("gui", help="打开桌面查看器：在窗口中打开本地文件或文件夹，按段落查看原文")
+    _workspace_options(gui, index=True)
+    gui.set_defaults(rules=None)
     report = commands.add_parser("report", help="生成可贴进支持工单的Markdown报告（SHA-256、编码、会话摘要、规则候选、侧车、声明）")
     _workspace_options(report, index=True)
     report.add_argument("--format", choices=("markdown", "json"), default="markdown")
@@ -147,30 +160,36 @@ def _discover(paths: list[Path], recursive: bool) -> tuple[list[Path], list[dict
     return sorted(found), errors, sorted(dumps - found)
 
 
-def _workspace(args, years: list[int], attach: bool) -> tuple[list[InputFile], list[dict[str, Any]], list[Path]]:
+def plan_workspace(given: list[Path], recursive: bool = False, years: list[int] | tuple = (), latest: int = 0,
+                   attach: bool = True) -> tuple[list[InputFile], list[dict[str, Any]], list[Path]]:
     """Plan the inputs: explicit paths, or every local Revit Journals folder.
     Returns (planned files, input errors, every input path to protect)."""
-    paths = list(args.paths)
+    given, years = list(given), list(years)
+    paths = given
     if not paths:
         folders = journal_folders(years)
         if not folders:
             where = "、".join(map(str, years)) if years else "任何版本"
             raise ValueError(f"没有找到{where}的Revit Journals目录（%LOCALAPPDATA%\\Autodesk\\Revit\\Autodesk Revit <year>\\Journals）；请传入文件或目录")
         paths = [folder for _, folder in folders]
-    files, errors, dumps = _discover(paths, args.recursive)
-    if years and args.paths:
+    files, errors, dumps = _discover(paths, recursive)
+    if years and given:
         files = [path for path in files if revit_year(path) in years]
         dumps = [path for path in dumps if revit_year(path) in years]
     attached = attach_steel_logs(files) if attach else {}
     planned = plan_inputs([*files, *dumps], attached)
-    if args.latest:
+    if latest:
         keep = []
         for item in planned:  # planned is newest session first
             if item.session.key not in keep:
                 keep.append(item.session.key)
-        keep = set(keep[:args.latest])
+        keep = set(keep[:latest])
         planned = [item for item in planned if item.session.key in keep]
-    return planned, errors, [*files, *dumps, *attached, *args.paths]
+    return planned, errors, [*files, *dumps, *attached, *given]
+
+
+def _workspace(args, years: list[int], attach: bool) -> tuple[list[InputFile], list[dict[str, Any]], list[Path]]:
+    return plan_workspace(args.paths, args.recursive, years, args.latest, attach)
 
 
 def _duplicate(item: InputFile) -> dict[str, Any]:
@@ -274,18 +293,40 @@ def main(argv: list[str] | None = None) -> int:
         if getattr(args, "jobs", None) is not None and args.jobs < 1:
             raise ValueError("--jobs必须大于0")
         if getattr(args, "database", "") is None:
-            args.database = cache_dir() / ("viewer.sqlite3" if args.command == "view" else "terminal.sqlite3")
+            names = {"view": "viewer.sqlite3", "gui": "desktop.sqlite3"}
+            args.database = cache_dir() / names.get(args.command, "terminal.sqlite3")
         if args.command == "report":
             return _report(args, years, rules)
-        if args.command in {"view", "browse", "summary"}:
+        if args.command == "gui":
+            from .desktop import run as run_desktop
+
+            planned: list[InputFile] = []
+            # Without paths or local Journals folders the window opens empty.
+            if args.paths or journal_folders(years):
+                planned, errors, inputs = _workspace(args, years, attach=True)
+                if errors:
+                    raise ValueError("；".join(item["error"] for item in errors))
+                for target in (args.database, Path(str(args.database) + "-wal"), Path(str(args.database) + "-shm")):
+                    _protect_inputs(target, inputs)
+            return run_desktop(planned, args.database, args.encoding, jobs=args.jobs, snapshot=args.snapshot,
+                               store=args.store, years=years)
+        if args.command in {"view", "browse", "summary", "search"}:
+            if args.command == "search":
+                from .terminal import check_search
+
+                check_search(args.query, args.per_file)  # Before planning or indexing any file.
             planned, errors, inputs = _workspace(args, years, attach=True)
             if errors:
                 raise ValueError("；".join(item["error"] for item in errors))
             for target in (args.database, Path(str(args.database) + "-wal"), Path(str(args.database) + "-shm")):
                 _protect_inputs(target, inputs)
-            if args.command in {"browse", "summary"}:
+            if args.command in {"browse", "summary", "search"}:
                 from .terminal import run
 
+                if args.command == "search":
+                    return run(planned, args.database, args.encoding, category=args.category, query=args.query,
+                               format_name=args.format, print_only=True, jobs=args.jobs, snapshot=args.snapshot,
+                               store=args.store, per_file=args.per_file)
                 if args.command == "summary":
                     if not 1 <= args.tail <= 200:
                         raise ValueError("--tail需要在1到200之间")

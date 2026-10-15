@@ -6,7 +6,7 @@ Add-in加载支持Autodesk、第三方和来源待定筛选，按同一事件内
 
 按`i`打开当前日志的Add-in列表，默认只显示名称、来源、错误标记和原始行号。程序从加载事件前缀提取名称和Class；按`v`可输入名称或Class前缀，例如`ATFTranslationServer`。Enter展开后才按页读取原始数据，再按Enter或Esc折叠。
 
-当前优先迭代CLI终端查看器和可复用解析模块，原有Web查看器继续可用。使用Python 3.10及以上版本和启用FTS5的SQLite，无运行时第三方依赖。日志数据全部在本机处理。真实案例可以同步放入`cases/inbox/`，逐步校准规则。
+当前优先迭代CLI终端查看器和可复用解析模块，另有桌面窗口（`gui`，内嵌WebView2）和浏览器查看器（`view`），两者使用同一个页面。使用Python 3.10及以上版本和启用FTS5的SQLite；核心功能无运行时第三方依赖，桌面窗口另需可选依赖pywebview（`[desktop]`）。日志数据全部在本机处理。真实案例可以同步放入`cases/inbox/`，逐步校准规则。
 
 ## 快速开始
 
@@ -71,9 +71,15 @@ revit-journal browse examples/addin-loading.journal.txt
 # 非交互摘要和可复用的段落元数据
 revit-journal browse examples/paragraphs.journal.txt --print --color always
 revit-journal browse examples/paragraphs.journal.txt --format json --page-size 20
+
+# 在全部文件中搜索关键词：按会话列出命中行，与browse共用索引缓存
+revit-journal search "Command Jrn" --latest
+revit-journal search ExceptionCode cases/inbox --recursive --format json --per-file 10
 ```
 
-上下键选择段落，Enter展开/折叠；展开后用上下键或PgUp/PgDn滚动原文，左右键横向滚动长行。按`0`显示全部，`1`至`8`切换分类，`/`搜索，`g`跳到原始行，`f`选择文件，`n`/`p`前后翻页，`q`退出。`+`/`-`调整段落预览行数；字体放大/缩小使用终端自身的缩放功能，窗口调整后自动重排。
+上下键选择段落，Enter展开/折叠；展开后用上下键或PgUp/PgDn滚动原文，左右键横向滚动长行。按`0`显示全部，`1`至`8`切换分类，`/`搜索当前文件，`?`搜索全部文件，`h`/`H`在段内跳到下一个/上一个命中行，`g`跳到原始行，`f`选择文件，`n`/`p`前后翻页，`q`退出。`+`/`-`调整段落预览行数；字体放大/缩小使用终端自身的缩放功能，窗口调整后自动重排。
+
+关键词搜索（`/`、`?`、`browse --query`与`search`子命令）使用同一种语法：以空白分隔的各个词必须出现在同一行中，顺序不限；`"引号"`内的部分是相邻短语；最后一个未加引号的词同时按前缀匹配（`DBG_ERR`能找到`DBG_ERROR`）。匹配基于FTS5分词，不是子串或正则搜索；只含标点的搜索词（如`}`）会给出错误提示而不是空结果。状态行的“命中N行”统计的是行数，不是段落数。有搜索时按Enter展开的段落直接滚动到第一个命中行，命中行反色并在行号后标`*`，当前命中标`>`。按`?`搜索全部已索引文件时，结果按文件列出命中行数和前3个命中行，Enter打开该文件并定位到该行，Esc返回。`search`子命令输出按会话分组，每个文件一行`路径 | 命中N行`，其下为`  行号: 原文`，末行为总数；`--category`只看某个行分类，`--per-file`设置每个文件列出的行数（1–20），`--format json`输出结构化结果；有文件索引失败时退出码为2。在PowerShell 5.1中，关键词里的双引号需写成`'\"open command\" Ribbon'`。
 
 按`a`筛选Autodesk加载，`t`筛选第三方加载，`u`筛选来源待定；`c`可循环切换全部分类。Autodesk来源依据为Vendor中的`ADSK`或`autodesk.com`及其子域名；其他明确厂商归入第三方，缺失、冲突或不完整的信息保留为来源待定。名称/Class前缀只用于筛选，不替代Vendor来源判断。来源标签不证明该组件由Revit默认安装，也不代表加载成功。仅有DLL名称或安装路径中的Autodesk字样不作为厂商依据。更新后首次打开旧缓存会自动重建所选文件的索引。
 
@@ -87,6 +93,22 @@ revit-journal browse examples/paragraphs.journal.txt --format json --page-size 2
 
 详细分段规则、按键和限制见[docs/terminal.md](docs/terminal.md)。
 
+## 桌面窗口
+
+```powershell
+# 一次性安装：本包与可选依赖pywebview（Windows使用系统自带的WebView2运行时）
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[desktop]"
+
+# 打开窗口：不传路径时打开本机各版本Revit的Journals；也可以传文件或目录
+.\.venv\Scripts\revit-journal-gui.exe
+.\.venv\Scripts\revit-journal.exe gui cases\inbox --recursive
+```
+
+窗口标题为`revit-journal-tool`，窗口与页面使用`web/icon.ico`、`web/icon.png`图标（取自ImagePusher的`selfpush.ico`）。窗口内嵌WebView2，显示与`view`相同的页面，另有“打开文件…”“打开文件夹…”“本机Journals”三个按钮（Ctrl+O打开文件）。新打开的文件替换当前工作区：先停止正在进行的索引，再开始新的。左侧工作区与右侧内容之间、段落列表与原文之间的分隔条都可以拖动（方向键微调，双击恢复默认），宽度和主题（浅色/深色/跟随系统）会被记住。页面只从本机`127.0.0.1`读取，原文件只读。
+
+`revit-journal-gui.exe`没有控制台窗口，启动前的错误（如编码参数无效）以对话框显示。没有安装pywebview时，`gui`会提示安装命令，也可以改用`view`在浏览器中查看。索引缓存为缓存目录中的`desktop.sqlite3`；窗口的布局与主题保存在缓存目录的`webview`子目录（WebView2用户数据，约10MB），`cache --clear`不删除它。
+
 ## Web查看器
 
 ```bash
@@ -97,11 +119,11 @@ revit-journal view cases/inbox --recursive --encoding cp1252
 revit-journal view --revit 2024 --port 8766
 ```
 
-浏览器打开命令显示的本地地址即可。左侧切换文件，上方切换分类；默认按段落列出（与`browse`相同的分段、阶段筛选和重复折叠），可切换为逐行列表。关键词搜索支持词语/词语前缀，列表每页最多100项；点击段落查看它的完整原文（长段落每次加载200行），点击行查看前后文，也可以直接跳到任意有效行号。“会话摘要”显示与`summary`命令相同的内容，其中的行号可点击定位到主Journal。分类包含启动、系统数据、错误、API错误、操作内容、警告、API活动、其他记录和对话框。
+浏览器打开命令显示的本地地址即可。左侧切换文件，上方切换分类；默认按段落列出（与`browse`相同的分段、阶段筛选和重复折叠），可切换为逐行列表。关键词搜索与CLI同一语法（多词同时包含、引号为相邻短语、末词前缀），搜索框旁的“当前文件/全部文件”切换范围：当前文件下列表底部显示“命中N行”，点击段落结果时右侧从首个命中行开始显示；全部文件在所有已就绪的文件中搜索（`/api/search`），每个文件显示命中行数和前3条命中行，点击即切换到该文件并定位，搜索词保留。列表、段落原文和上下文中每个搜索词的每次出现都会高亮。列表每页最多100项；点击段落查看它的完整原文（长段落每次加载200行），点击行查看前后文，也可以直接跳到任意有效行号。“会话摘要”显示与`summary`命令相同的内容，其中的行号可点击定位到主Journal。分类包含启动、系统数据、错误、API错误、操作内容、警告、API活动、其他记录和对话框。
 
 首次索引逐文件进行，已经就绪的文件可先浏览。索引缓存位于缓存目录的`viewer.sqlite3`，再次启动会复用未变化文件的索引。存储方式与`browse`相同（默认`--store offsets`，见上文），不受CLI的500条明细限制，默认不进入Git。文件内容、编码或索引规则变化后会重建相关索引。
 
-Web界面的段落、折叠、阶段与会话摘要直接调用CLI使用的同一组索引查询和摘要渲染，不另写一套逻辑；交互式折叠展开、Add-in名称前缀筛选等仍只在CLI中提供。Web用法见[docs/viewer.md](docs/viewer.md)。
+页面支持中文/English切换（会话摘要与错误提示同样切换；命令行与工单报告仍为中文）和浅色/深色主题，左侧工作区、段落列表与原文三栏之间可拖动调整宽度；左侧按Revit版本分组（可折叠），版本下按会话时间排序（最新或最早在前），每个会话列出其文件；Add-in只占一个分类，选中后再按Autodesk/第三方/来源待定筛选；打开文件后自动显示第一个段落；列表中用上下键逐项查看，Ctrl+F搜索，Ctrl+G跳至行；原文区可复制原文或“路径:行号”。Web界面的段落、折叠、阶段与会话摘要直接调用CLI使用的同一组索引查询和摘要渲染，不另写一套逻辑；交互式折叠展开、Add-in名称前缀筛选等仍只在CLI中提供。Web用法见[docs/viewer.md](docs/viewer.md)。
 
 ## 支持工单报告
 
@@ -215,9 +237,11 @@ src/revit_journal_tools/
   blocks.py              流式段落边界、跨行错误与操作分组
   loading.py             同一Add-in加载事件的厂商依据与来源筛选
   terminal.py            CLI颜色、折叠展开、文件切换与原文分页
-  viewer_index.py        全量磁盘索引、全文检索、分页与上下文查询
+  viewer_index.py        全量磁盘索引、全文检索（查询解析、命中行、全部文件搜索）、分页与上下文查询
   viewer_server.py       仅监听本机的查看器服务
-  web/                   本地界面，无外部前端依赖
+  desktop.py             桌面窗口：pywebview内嵌WebView2，打开文件/文件夹并替换工作区
+  i18n.py                查看器页面的英文文本（?lang=en）与错误提示翻译；默认中文
+  web/                   本地界面（view与gui共用），无外部前端依赖
 cases/                   案例说明、登记模板与接收目录
 examples/                明确标注的人工样例
 tests/                   读取、匹配、证据与命令行回归测试
@@ -251,8 +275,8 @@ py -3 scripts/windows_console_probe.py <journal.txt> [--host wt] [--ctrl-c]
 
 本机实测（Windows 10、Python 3.12，2026-10-10）：6.47MB/85,387行真实Journal扫描约0.4s（约17MB/s），建索引约2.5s（约3.4万行/秒，索引为源文件的2.2倍；`--store text`约2.4s、3.6倍）；Revit 2024目录22个文件约11MB的`browse --print`约2.8s。
 
-安装包后，Windows也可使用`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`运行同一套测试。
+安装包后，Windows也可使用`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`运行同一套测试。桌面窗口的测试用替身代替pywebview，不打开窗口，没有安装pywebview时同样运行。
 
-单文件分发：`py -3 scripts/build_zipapp.py`生成`dist/revit-journal.pyz`（约90KB，只含本包代码、内置规则和Web文件），目标机器只需Python 3.10+。当前版本未实现浏览器拖放导入、带Python运行时的安装包、AI分析、Journal回放或模型修复。
+单文件分发：`py -3 scripts/build_zipapp.py`生成`dist/revit-journal.pyz`（约90KB，只含本包代码、内置规则和Web文件），目标机器只需Python 3.10+；其中的`gui`命令还需要该Python安装pywebview（`py -m pip install pywebview`）。当前版本未实现浏览器拖放导入、带Python运行时的安装包、AI分析、Journal回放或模型修复。
 
 案例提交方式见[cases/README.md](cases/README.md)，规则扩展见[docs/rules.md](docs/rules.md)。Autodesk的[Journal阅读指导](https://www.autodesk.com/support/technical/article/How-to-read-the-journal-file-Revit/)建议结合具体操作、实际现象和近似时间排查；本项目按此保留上下文，其他参考见[docs/sources.md](docs/sources.md)。

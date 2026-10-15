@@ -10,14 +10,21 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+# The desktop window (revit-journal gui): an embedded WebView2 (Edge) on Windows.
+desktop = ["pywebview>=5.0"]
+
 [project.scripts]
 revit-journal = "revit_journal_tools.cli:main"
+
+[project.gui-scripts]
+revit-journal-gui = "revit_journal_tools.desktop:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-revit_journal_tools = ["data/*.json", "web/*.html", "web/*.css", "web/*.js"]
+revit_journal_tools = ["data/*.json", "web/*.html", "web/*.css", "web/*.js", "web/*.png", "web/*.ico"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

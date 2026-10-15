@@ -1,43 +1,104 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Journal / 本地查看器</title><link rel="icon" href="data:,"><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>revit-journal-tool</title>
+<link rel="icon" href="/icon.png">
+<link rel="stylesheet" href="/style.css">
+<script defer src="/app.js"></script>
+</head>
 <body>
+<div class="app" id="app">
   <aside class="sidebar">
-    <div class="brand"><span class="brand-mark">J/</span><div><strong>Journal</strong><small>REVIT LOG VIEWER</small></div></div>
-    <div class="workspace-label">工作区 <span id="file-count">0个文件</span></div>
-    <label class="file-search"><span>⌕</span><input id="file-search" placeholder="查找日志文件" aria-label="查找日志文件"></label>
-    <div id="files" class="files" aria-label="日志文件列表"></div>
-    <div class="sidebar-foot"><span class="local-dot"></span> 本地读取 · 原文件保留</div>
+    <div class="brand">
+      <img class="brand-mark" src="/icon.png" alt="">
+      <div><strong>revit-journal-tool</strong><small data-i18n="brand.sub">本地日志查看器</small></div>
+    </div>
+    <div id="desktop-actions" class="desktop-actions" hidden>
+      <button id="open-files" class="button primary" type="button" disabled data-i18n="open.files">打开文件…</button>
+      <div class="action-row">
+        <button id="open-folder" class="button" type="button" disabled data-i18n="open.folder">打开文件夹…</button>
+        <button id="open-local" class="button" type="button" disabled data-i18n="open.local" data-i18n-title="open.local.title">本机Journals</button>
+      </div>
+      <label class="check"><input id="recursive" type="checkbox" checked><span data-i18n="open.recursive">文件夹包含子文件夹</span></label>
+    </div>
+    <div class="section-label">
+      <span><span data-i18n="workspace">工作区</span> · <span id="file-count"></span></span>
+      <span class="section-tools">
+        <button id="sort" class="text-button" type="button"></button>
+        <button id="toggle-groups" class="text-button" type="button"></button>
+      </span>
+    </div>
+    <label class="field file-search">
+      <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3.5 3.5"/></svg>
+      <input id="file-search" data-i18n-placeholder="files.filter" data-i18n-aria-label="files.filter">
+    </label>
+    <div id="files" class="files" data-i18n-aria-label="files.list"></div>
+    <div class="sidebar-foot"><span class="local-dot"></span><span data-i18n="foot">本机读取 · 原文件只读</span></div>
   </aside>
-  <main>
-    <header class="topbar"><span>工作区 <span class="slash">/</span> Journal查看器</span><div class="status-pill"><span class="local-dot"></span><span id="index-status">正在连接本地工作区</span></div></header>
+  <div class="splitter splitter-sidebar" id="split-sidebar" role="separator" aria-orientation="vertical" tabindex="0" data-i18n-aria-label="split.sidebar" data-i18n-title="split.hint"></div>
+  <main class="main">
+    <header class="topbar">
+      <div class="crumbs"><span data-i18n="workspace">工作区</span><span class="slash">/</span><span id="crumb-file"></span></div>
+      <div class="topbar-right">
+        <div class="status-pill"><span class="local-dot"></span><span id="index-status"></span></div>
+        <div class="segmented lang" role="group" aria-label="语言 / Language">
+          <button id="lang-zh" type="button" aria-pressed="true">中文</button><button id="lang-en" type="button" aria-pressed="false">EN</button>
+        </div>
+        <button id="theme" class="icon-button" type="button" data-i18n-aria-label="theme.switch">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/><path d="M8 2.5v11a5.5 5.5 0 0 0 0-11z" class="fill"/></svg>
+        </button>
+      </div>
+    </header>
     <section class="overview">
-      <div class="eyebrow">日志工作台</div><h1 id="file-title">选择一个Journal</h1><div id="file-path" class="file-path">在左侧选择文件，按记录类型快速定位。</div>
-      <div class="session-bar"><span id="session-label" class="session-label"></span><button id="show-session" type="button" disabled>会话摘要</button></div>
-      <div class="metrics"><div><span>记录行数</span><strong id="metric-lines">—</strong></div><div><span>错误相关记录</span><strong id="metric-errors" class="red">—</strong></div><div><span>API错误记录</span><strong id="metric-api" class="orange">—</strong></div><div><span>操作记录</span><strong id="metric-operations">—</strong></div></div>
+      <div class="overview-main">
+        <h1 id="file-title"></h1>
+        <div id="file-path" class="file-path"></div>
+        <div class="session-bar"><span id="session-label" class="session-label"></span><button id="show-session" class="button small" type="button" disabled data-i18n="session.show">会话摘要</button></div>
+      </div>
+      <div class="metrics">
+        <div><span data-i18n="metric.lines">记录行数</span><strong id="metric-lines">—</strong></div>
+        <div><span data-i18n="metric.errors">错误相关</span><strong id="metric-errors" class="red">—</strong></div>
+        <div><span data-i18n="metric.api">API错误</span><strong id="metric-api" class="orange">—</strong></div>
+        <div><span data-i18n="metric.operations">操作记录</span><strong id="metric-operations">—</strong></div>
+      </div>
     </section>
-    <nav id="categories" class="categories" aria-label="记录分类"></nav>
+    <nav id="categories" class="categories" data-i18n-aria-label="categories"></nav>
     <section class="tools">
-      <div class="view-switch" role="group" aria-label="显示方式"><button id="view-blocks" type="button" aria-pressed="true">段落</button><button id="view-lines" type="button" aria-pressed="false">逐行</button></div>
-      <form id="search-form" class="search"><span>⌕</span><input id="search" placeholder="搜索关键词，如ExceptionCode、GeomStepList" aria-label="搜索当前分类"><button type="submit">搜索</button></form>
-      <label id="phase-wrap" class="phase-filter">阶段<select id="phase" aria-label="按会话阶段筛选段落"><option value="all">全部阶段</option></select></label>
-      <label id="fold-wrap" class="fold-toggle"><input id="fold" type="checkbox" checked>折叠重复段落</label>
-      <form id="jump-form" class="jump"><label for="jump">跳至行</label><input id="jump" type="number" min="1" placeholder="行号"><button type="submit">定位 ↗</button></form>
+      <div class="segmented" role="group" data-i18n-aria-label="view.mode"><button id="view-blocks" type="button" aria-pressed="true" data-i18n="view.blocks">段落</button><button id="view-lines" type="button" aria-pressed="false" data-i18n="view.lines">逐行</button></div>
+      <form id="search-form" class="field search">
+        <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3.5 3.5"/></svg>
+        <input id="search" data-i18n-aria-label="search.label" data-i18n-title="search.syntax">
+        <button type="submit" class="button small" data-i18n="search">搜索</button>
+      </form>
+      <div class="segmented scope" role="group" data-i18n-aria-label="scope.label"><button id="scope-file" type="button" aria-pressed="true" data-i18n="scope.file">当前文件</button><button id="scope-all" type="button" aria-pressed="false" data-i18n="scope.all">全部文件</button></div>
+      <label id="phase-wrap" class="inline"><span data-i18n="phase">阶段</span><select id="phase" data-i18n-aria-label="phase.filter"><option value="all" data-i18n="phase.all">全部阶段</option></select></label>
+      <label id="fold-wrap" class="switch"><input id="fold" type="checkbox" checked><span class="track" aria-hidden="true"></span><span data-i18n="fold">折叠重复段落</span></label>
+      <form id="jump-form" class="field jump">
+        <input id="jump" type="number" min="1" data-i18n-placeholder="jump.placeholder" data-i18n-aria-label="jump.label">
+        <button type="submit" class="button small" data-i18n="jump">跳至行</button>
+      </form>
     </section>
     <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
-    <section class="panels">
-      <div class="records">
-        <div class="panel-heading"><strong id="record-heading">全部记录</strong><span id="query-time"></span></div>
-        <div class="column-head"><span id="col-line">行号</span><span>分类</span><span id="col-text">原文记录</span></div>
-        <div id="rows" class="rows" aria-label="分页日志记录"><div class="empty">正在读取文件列表…</div></div>
-        <div class="pagination"><span id="page-info">每页最多100条记录</span><div><button id="previous" disabled>← 上一页</button><button id="next" disabled>下一页 →</button></div></div>
+    <section class="panels" id="panels">
+      <div class="records card">
+        <div class="panel-heading"><strong id="record-heading"></strong><span id="query-time"></span></div>
+        <div class="column-head"><span id="col-line"></span><span id="col-category"></span><span id="col-text"></span></div>
+        <div id="rows" class="rows"><div class="empty" data-i18n="files.loading">正在读取文件列表…</div></div>
+        <div class="pagination"><span id="page-info"></span><div><button id="previous" class="button small" type="button" disabled data-i18n="page.previous">← 上一页</button><button id="next" class="button small" type="button" disabled data-i18n="page.next">下一页 →</button></div></div>
       </div>
-      <aside class="inspector">
-        <div class="panel-heading"><strong id="inspector-title">原文上下文</strong><button id="copy-position" disabled>复制位置</button></div>
-        <div id="detail-meta" class="detail-meta">点击一条记录，查看它前后发生了什么。</div>
-        <div id="context" class="context"><div class="empty"><span class="empty-icon">⌘</span><strong>从记录回到现场</strong><p>选择错误、API事件或操作记录，<br>查看连续原文和命中依据。</p></div></div>
-        <div id="source-meta" class="source-meta">记录分类用于定位；错误候选仍需结合上下文复核。</div>
+      <div class="splitter splitter-panels" id="split-panels" role="separator" aria-orientation="vertical" tabindex="0" data-i18n-aria-label="split.panels" data-i18n-title="split.hint"></div>
+      <aside class="inspector card">
+        <div class="panel-heading"><strong id="inspector-title"></strong><div class="heading-actions"><button id="copy-text" class="button small" type="button" disabled data-i18n="copy.text">复制原文</button><button id="copy-position" class="button small" type="button" disabled data-i18n="copy.position">复制位置</button></div></div>
+        <div id="detail-meta" class="detail-meta"></div>
+        <div id="context" class="context"></div>
+        <div id="source-meta" class="source-meta"></div>
       </aside>
     </section>
   </main>
-</body></html>
+</div>
+<div id="toast" class="toast" role="alert" hidden></div>
+</body>
+</html>

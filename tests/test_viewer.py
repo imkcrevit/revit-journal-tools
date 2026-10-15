@@ -4,14 +4,17 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
 from revit_journal_tools import viewer_index
 from revit_journal_tools.categories import Categorizer
+from revit_journal_tools.i18n import error_text
 from revit_journal_tools.rules import load_rules
-from revit_journal_tools.viewer_index import ViewerIndex, fts_table
+from revit_journal_tools.viewer_index import (CJK_HINT, EMPTY_QUERY, NO_SEARCH_TOKENS, SearchQuery, ViewerIndex, fts_table,
+                                              parse_query)
 from revit_journal_tools.viewer_server import make_server
 
 
@@ -162,6 +165,66 @@ class IndexTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as raised:
                     opener.open(request)
                 raised.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_http_search_across_files_hit_lines_and_query_errors(self):
+        other = self.root / "other.txt"
+        other.write_text("normal\nDBG_ERROR: GeomStepList again\nGeomStepList twice\n", encoding="utf-8")
+        self.index.build(self.index.register([self.path, other], "auto"), "auto")
+        server = make_server(self.index, 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback, no system proxy
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def get(path, **params):
+            with opener.open(base + path + "?" + urllib.parse.urlencode(params)) as response:
+                return json.load(response)
+
+        def error(path, **params):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                opener.open(base + path + "?" + urllib.parse.urlencode(params))
+            with raised.exception:
+                return raised.exception.code, json.load(raised.exception)["error"]
+
+        try:
+            found = get("/api/search", q="GeomStepList", per_file=1)
+            self.assertEqual((found["terms"], found["total_lines"], found["file_count"], found["skipped"]),
+                             (["GeomStepList"], 3, 2, 0))
+            self.assertIn("elapsed_ms", found)
+            by_name = {file["name"]: file for file in found["files"]}
+            self.assertEqual(set(by_name), {self.path.name, other.name})
+            self.assertEqual((by_name[other.name]["hit_lines"], [item["line_number"] for item in by_name[other.name]["items"]]),
+                             (2, [2]))
+            self.assertEqual(by_name[self.path.name]["items"][0]["text"], "DBG_ERROR: GeomStepList unique_marker")
+            # Every word, in any order; a line category applies to every file.
+            self.assertEqual(get("/api/search", q="unique_marker DBG_ERROR")["total_lines"], 1)
+            self.assertEqual(get("/api/search", q="GeomStepList", category="error")["total_lines"], 2)
+
+            blocks = get("/api/blocks", file=self.file_id, q="GeomStep")
+            block = blocks["items"][0]
+            self.assertEqual((block["hit_line"], blocks["hit_lines"], blocks["terms"]), (6, 1, ["GeomStep"]))
+            self.assertTrue(block["start_line"] <= block["hit_line"] <= block["end_line"])
+            self.assertIn("label", block)  # _labelled keeps hit_line next to the list text
+            self.assertEqual(get("/api/events", file=self.file_id, q="GeomStep")["hit_lines"], 1)
+
+            # Only punctuation: an error, not an empty list; Chinese by default, English with lang=en.
+            for path, params in (("/api/search", {}), ("/api/blocks", {"file": self.file_id}),
+                                 ("/api/events", {"file": self.file_id})):
+                with self.subTest(path=path):
+                    self.assertEqual(error(path, q="}", **params), (400, NO_SEARCH_TOKENS))
+                    self.assertEqual(error(path, q="} ;", lang="en", **params), (400, error_text(NO_SEARCH_TOKENS, "en")))
+            self.assertEqual(error("/api/search", q=" "), (400, EMPTY_QUERY))
+            self.assertEqual(error("/api/search", q=" ", lang="en"), (400, "Enter a search term"))
+            self.assertEqual(error("/api/search", q="x", per_file=21)[0], 400)
+            self.assertEqual(error("/api/search", q="x", category="addin", lang="en"), (400, "Unknown category"))
+            # The CJK hint in the page's language.
+            self.assertEqual(get("/api/search", q="错误")["hint"], CJK_HINT)
+            self.assertEqual(get("/api/blocks", file=self.file_id, q="错误", lang="en")["hint"], error_text(CJK_HINT, "en"))
+            self.assertNotIn("hint", get("/api/events", file=self.file_id, q="GeomStep", lang="en"))
         finally:
             server.shutdown()
             server.server_close()
@@ -431,6 +494,188 @@ class MixedEncodingIndexTests(unittest.TestCase):
         self.index.build(self.index.register(self.paths[:1], "auto"), "auto")
         with patch("revit_journal_tools.reader.system_fallback_encoding", return_value="cp1251"):
             self.assertEqual(len(self.index.register(self.paths[:1], "auto")), 1)
+
+
+SEARCH_SAMPLE = [
+    "' Build: synthetic",                                   # 1
+    "Jrn.Command \"Ribbon\" , \"Open project , ID_OPEN\"",  # 2
+    "alpha beta together",                                  # 3  block 3-4
+    "alpha then later beta",                                # 4
+    "API_ERROR { gamma first",                              # 5  api_error block 5-7
+    "'gamma second inside",                                 # 6
+    "'gamma third }",                                       # 7
+    "DBG_ERROR: alphabet soup",                             # 8  error block 8-9
+    "  at Gamma.Run()",                                     # 9  (line category: other)
+    "normal",                                               # 10
+    "' 1:< 错误: 不满足约束",                               # 11
+    "API_SUCCESS { Starting External Application: Demo Tool, Class: Demo.Tool, Vendor: DEMO(), gamma }",  # 12
+]
+
+
+class SearchTests(unittest.TestCase):
+    """Keyword queries: AND of words, quoted phrases, last-word prefix, hit lines
+    and the workspace search. Synthetic lines only; no Revit behaviour implied."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.path = self.root / "journal.0001.txt"
+        self.path.write_text("\n".join(SEARCH_SAMPLE) + "\n", encoding="utf-8")
+        self.index = ViewerIndex(self.root / "viewer.sqlite3", workers=1)
+        self.index.build(self.index.register([self.path], "auto"), "auto")
+        self.file_id = self.index.catalog()[0]["id"]
+
+    def lines(self, query, category="all"):
+        return [item["line_number"] for item in self.index.events(self.file_id, category, query)["items"]]
+
+    def test_parse_query_joins_quoted_terms_with_and_and_prefixes_the_last_word(self):
+        self.assertEqual(parse_query("Command Jrn"), SearchQuery('"Command" AND "Jrn"*', ["Command", "Jrn"], False))
+        self.assertEqual(parse_query('foo "bar , baz" qux').match, '"foo" AND "bar , baz" AND "qux"*')
+        self.assertEqual(parse_query('foo "bar baz"').match, '"foo"* AND "bar baz"')
+        self.assertEqual(parse_query('"only phrase"').match, '"only phrase"')
+        self.assertEqual(parse_query('Jrn.Command "open pro').terms, ["Jrn.Command", "open pro"])  # unterminated quote
+        self.assertEqual(parse_query("foo } ;"), SearchQuery('"foo"*', ["foo"], False))
+        self.assertEqual(parse_query(" \t "), SearchQuery("", [], False))
+        self.assertTrue(parse_query("错误 x").cjk)
+        for query in ("}", "} ; ==", '""', '" , "'):
+            with self.subTest(query=query), self.assertRaisesRegex(ValueError, "^" + NO_SEARCH_TOKENS + "$"):
+                parse_query(query)
+
+    def test_words_match_in_any_order_and_quoted_phrases_only_when_adjacent(self):
+        self.assertEqual(self.lines("alpha beta"), [3, 4])
+        self.assertEqual(self.lines("beta alpha"), [3, 4])
+        self.assertEqual(self.lines('"alpha beta"'), [3])
+        self.assertEqual(self.lines('"beta alpha"'), [])
+        self.assertEqual(self.lines("Command Jrn"), [2])
+        self.assertEqual(self.lines("Jrn.Command"), [2])
+        self.assertEqual(self.lines('"Command Jrn"'), [])
+        self.assertEqual(self.lines("second third"), [])  # every word in the same line, not the same block
+
+    def test_only_the_last_unquoted_word_is_a_prefix(self):
+        self.assertEqual(self.lines("alph"), [3, 4, 8])
+        self.assertEqual(self.lines("beta alph"), [3, 4])
+        self.assertEqual(self.lines("alph beta"), [])
+        self.assertEqual(self.lines('"alph"'), [])
+        self.assertEqual(self.lines('"alpha"'), [3, 4])  # quoted: the word itself, not "alphabet"
+
+    def test_punctuation_only_query_is_an_error_not_an_empty_result(self):
+        for call in (lambda: self.index.events(self.file_id, query="}"),
+                     lambda: self.index.blocks(self.file_id, query="} ;"),
+                     lambda: self.index.block_hits(self.file_id, 1, 3, "=="),
+                     lambda: self.index.search_workspace("()")):
+            with self.assertRaisesRegex(ValueError, "^搜索词不含可检索的字母或数字；标点和符号不参与分词$"):
+                call()
+        blank = self.index.events(self.file_id, query="  ")
+        self.assertEqual((len(blank["items"]), "terms" in blank, "hit_lines" in blank), (12, False, False))
+        self.assertNotIn("hit_lines", self.index.blocks(self.file_id))
+        self.assertIn("no letters or digits", error_text(NO_SEARCH_TOKENS, "en"))
+
+    def test_blocks_carry_their_first_matching_line(self):
+        result = self.index.blocks(self.file_id, query="gamma")
+        self.assertEqual([(b["start_line"], b["end_line"], b["hit_line"]) for b in result["items"]],
+                         [(5, 7, 5), (8, 9, 9), (12, 12, 12)])
+        self.assertEqual([(b["start_line"], b["hit_line"]) for b in self.index.blocks(self.file_id, query="inside")["items"]],
+                         [(5, 6)])
+        self.assertEqual([(b["start_line"], b["hit_line"]) for b in self.index.blocks(self.file_id, "error", "gamma")["items"]],
+                         [(8, 9)])
+        # Selected by the add-in prefix (EXISTS test), then looked up.
+        addin = self.index.blocks(self.file_id, "addin", "gamma", addin_prefix="Demo")
+        self.assertEqual([(b["start_line"], b["hit_line"]) for b in addin["items"]], [(12, 12)])
+        self.assertNotIn("hit_line", self.index.blocks(self.file_id)["items"][0])
+
+    def test_hit_line_of_blocks_selected_by_the_small_category_path(self):
+        # 512+ hits before the only error block: blocks() tests the few error blocks instead.
+        self.path.write_text("common detail\n" * 600 + "\nDBG_ERROR: start\n  at Common.Run()\n", encoding="utf-8")
+        self.index.build(self.index.register([self.path], "auto"), "auto")
+        result = self.index.blocks(self.file_id, "error", query="common")
+        self.assertEqual([(b["start_line"], b["end_line"], b["hit_line"]) for b in result["items"]], [(602, 603, 603)])
+        self.assertEqual(self.index.blocks(self.file_id, query="common", limit=1)["items"][0]["hit_line"], 1)
+
+    def test_hit_lines_count_matching_lines_of_the_whole_file(self):
+        numbers, after = [], 0
+        while True:
+            page = self.index.events(self.file_id, query="gamma", after=after, limit=2)
+            self.assertEqual((page["terms"], page["hit_lines"]), (["gamma"], 5))
+            numbers += [item["line_number"] for item in page["items"]]
+            if not page["has_more"]:
+                break
+            after = page["next_after"]
+        self.assertEqual(numbers, [5, 6, 7, 9, 12])
+        self.assertEqual(self.index.blocks(self.file_id, query="gamma", limit=1)["hit_lines"], len(numbers))
+        self.assertEqual(self.index.events(self.file_id, "api_error", "gamma")["hit_lines"], 3)
+        self.assertEqual(self.index.blocks(self.file_id, "api_error", "gamma")["hit_lines"], 3)
+        self.assertEqual(self.index.events(self.file_id, "warning", "gamma")["hit_lines"], 0)
+        self.assertEqual(self.index.blocks(self.file_id, "addin", "gamma")["hit_lines"], 5)  # every matching line
+        self.assertEqual(self.index.events(self.file_id, query="absent_word")["hit_lines"], 0)
+
+    def test_block_hits_lists_matching_lines_inside_a_range(self):
+        self.assertEqual(self.index.block_hits(self.file_id, 5, 7, "gamma"), [5, 6, 7])
+        self.assertEqual(self.index.block_hits(self.file_id, 5, 12, "gamma", limit=2), [5, 6])
+        self.assertEqual(self.index.block_hits(self.file_id, 1, 4, "gamma"), [])
+        for start, end, limit in ((0, 3, 200), (7, 5, 200), (5, 13, 200), (1, 3, 0), (1, 3, 201)):
+            with self.subTest(start=start, end=end, limit=limit), self.assertRaises(ValueError):
+                self.index.block_hits(self.file_id, start, end, "gamma", limit)
+        with self.assertRaises(KeyError):
+            self.index.block_hits(999999, 1, 3, "gamma")
+
+    def test_cjk_query_gets_the_hint(self):
+        result = self.index.events(self.file_id, query="不满足")
+        self.assertEqual(([item["line_number"] for item in result["items"]], result["hint"]), ([11], CJK_HINT))
+        self.assertEqual(self.index.events(self.file_id, query="满足")["items"], [])  # only from the start of a run
+        self.assertEqual(self.index.blocks(self.file_id, query="错误")["hint"], CJK_HINT)
+        self.assertNotIn("hint", self.index.events(self.file_id, query="gamma"))
+        self.assertIn("start of the run", error_text(CJK_HINT, "en"))
+
+    def test_workspace_search_lists_files_with_hits_and_counts_skipped_files(self):
+        other = self.root / "journal.0002.txt"
+        other.write_text("normal\ngamma elsewhere\nGamma again\n", encoding="utf-8")
+        quiet = self.root / "journal.0003.txt"
+        quiet.write_text("nothing to see\n", encoding="utf-8")
+        broken = self.root / "journal.0004.txt"
+        broken.write_bytes(b"gamma\n\xff\n")
+        pending = self.root / "journal.0005.txt"
+        pending.write_text("gamma pending\n", encoding="utf-8")
+        self.index.register([self.path, other, quiet, broken, pending], "utf-8")
+        ids = {item["name"]: item["id"] for item in self.index.catalog()}
+        self.index.build([file_id for name, file_id in ids.items() if name != pending.name], "utf-8")
+        statuses = {item["name"]: item["status"] for item in self.index.catalog()}
+        self.assertEqual((statuses[broken.name], statuses[pending.name]), ("error", "queued"))
+
+        result = self.index.search_workspace("gamma", per_file=2)
+        self.assertEqual((result["terms"], result["total_lines"], result["file_count"], result["skipped"]),
+                         (["gamma"], 7, 2, 2))
+        self.assertNotIn("hint", result)
+        order = [item["name"] for item in self.index.catalog() if item["name"] in (self.path.name, other.name)]
+        self.assertEqual([file["name"] for file in result["files"]], order)
+        by_name = {file["name"]: file for file in result["files"]}
+        self.assertEqual(set(by_name[other.name]),
+                         {"id", "name", "path", "role", "session", "session_label", "hit_lines", "items"})
+        self.assertEqual((by_name[self.path.name]["hit_lines"],
+                          [item["line_number"] for item in by_name[self.path.name]["items"]]), (5, [5, 6]))
+        self.assertEqual(by_name[other.name]["hit_lines"], 2)
+        # The same rows as a search in that file.
+        self.assertEqual(by_name[other.name]["items"],
+                         self.index.events(ids[other.name], query="gamma", limit=2)["items"])
+        self.assertEqual(by_name[other.name]["items"][0]["text"], "gamma elsewhere")
+
+        filtered = self.index.search_workspace("gamma", "api_error")
+        self.assertEqual([(file["name"], file["hit_lines"]) for file in filtered["files"]], [(self.path.name, 3)])
+        self.assertEqual(self.index.search_workspace("错误")["hint"], CJK_HINT)
+        # Not searchable now: changed source (store="offsets"), indexed by an earlier version.
+        quiet.write_text("gamma changed\n", encoding="utf-8")
+        self.assertEqual(self.index.search_workspace("gamma")["skipped"], 3)
+        with self.index.connect() as connection:
+            connection.execute("UPDATE files SET store='' WHERE id=?", (ids[other.name],))
+        older = self.index.search_workspace("gamma")
+        self.assertEqual(([file["name"] for file in older["files"]], older["total_lines"], older["skipped"]),
+                         ([self.path.name], 5, 4))
+
+        for arguments in ({"per_file": 0}, {"per_file": 21}, {"category": "addin"}, {"query": "x" * 257}):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                self.index.search_workspace(**{"query": "gamma", **arguments})
+        with self.assertRaisesRegex(ValueError, "请输入搜索词"):
+            self.index.search_workspace("  ")
 
 
 if __name__ == "__main__":

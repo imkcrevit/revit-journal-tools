@@ -41,7 +41,7 @@ def parse_years(values: list[str] | None) -> list[int]:
 
 
 CACHE_ENV = "REVIT_JOURNAL_CACHE"
-CACHE_FILES = ("terminal.sqlite3", "viewer.sqlite3")
+CACHE_FILES = ("terminal.sqlite3", "viewer.sqlite3", "desktop.sqlite3")
 
 
 def cache_dir(environ=None, os_name: str | None = None) -> Path:

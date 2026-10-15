@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from revit_journal_tools.cli import main
 from revit_journal_tools.terminal import Browser, cell_width, crop, safe_text
-from revit_journal_tools.viewer_index import ViewerIndex
+from revit_journal_tools.viewer_index import NO_SEARCH_TOKENS, ViewerIndex
 
 
 class TerminalTests(unittest.TestCase):
@@ -33,6 +33,11 @@ class TerminalTests(unittest.TestCase):
         with redirect_stdout(output), redirect_stderr(errors):
             code = main([str(arg) for arg in args])
         return code, output.getvalue(), errors.getvalue()
+
+    @staticmethod
+    def type(browser, text, clear=0):
+        for key in ["\b"] * clear + list(text) + ["\r"]:
+            browser.handle(key)
 
     def test_paragraph_index_has_complete_ranges_and_counts(self):
         blocks = self.index.blocks(self.file_id)["items"]
@@ -116,6 +121,89 @@ class TerminalTests(unittest.TestCase):
         browser.handle("\r")
         self.assertEqual(browser.mode, "blocks")
         self.assertFalse(browser.handle("q"))
+
+    def test_punctuation_only_search_keeps_previous_query_and_list(self):
+        browser = Browser(self.index)
+        browser.handle("/")
+        self.type(browser, "private")
+        items = browser.items
+        self.assertEqual([b["start_line"] for b in items], [5])
+        # The count is of matching lines, not blocks.
+        self.assertIn("搜索: private 命中1行", browser.frame(100, 25, False))
+        browser.handle("/")
+        self.type(browser, "}", clear=len("private"))
+        self.assertEqual((browser.query, browser.items, browser.message), ("private", items, NO_SEARCH_TOKENS))
+        self.assertIn(NO_SEARCH_TOKENS, browser.frame(100, 25, False))
+        # A query given at start-up that cannot be searched is not applied either.
+        browser = Browser(self.index, query="}")
+        self.assertEqual((browser.query, browser.message), ("", NO_SEARCH_TOKENS))
+        browser.refresh()
+        self.assertEqual(len(browser.items), 4)
+
+    def test_hit_keys_move_between_hits_inside_a_block(self):
+        self.path.write_text("API_ERROR { first marker\n" + "'filler\n" * 5 + "'second marker\n'filler\n"
+                             "'third marker }\n", encoding="utf-8")
+        self.index.build(self.index.register([self.path], "auto"), "auto")
+        browser = Browser(self.index)
+        browser.handle("h")
+        self.assertIn("先按/搜索", browser.message)
+        browser.handle("/")
+        self.type(browser, "second")
+        self.assertEqual(browser.block["hit_line"], 7)
+        browser.handle("\r")  # Opens at the first hit, three lines of context above it.
+        self.assertEqual((browser.expanded, browser.detail_offset), (True, 3))
+        browser.handle("/")
+        self.type(browser, "marker", clear=len("second"))
+        browser.handle("\r")
+        self.assertEqual(browser.detail_offset, 0)
+        offsets = []
+        for key in "hhhH":
+            browser.handle(key)
+            offsets.append(browser.detail_offset)
+        self.assertEqual(offsets, [3, 5, 5, 3])  # Lines 7, 9, (no later hit), back to 7.
+        frame = browser.frame(100, 25, False)
+        self.assertIn("       7> 'second marker", frame)
+        self.assertIn("       9* 'third marker }", frame)
+        self.assertIn("       8  'filler", frame)
+
+    def test_workspace_search_opens_a_hit_in_another_file(self):
+        second = self.root / "second.txt"
+        second.write_text("normal start\n\nJrn.Command _\n \"Ribbon\", \"Second\"\n", encoding="utf-8")
+        self.index.build(self.index.register([self.path, second], "auto"), "auto")
+        browser = Browser(self.index)
+        browser.handle("?")
+        self.type(browser, "}")
+        self.assertEqual((browser.view, browser.message), ("blocks", NO_SEARCH_TOKENS))
+        browser.handle("?")
+        self.type(browser, "Ribbon", clear=1)
+        self.assertEqual(browser.view, "workspace")
+        frame = browser.frame(100, 25, False)
+        self.assertIn("全部文件搜索: Ribbon", frame)
+        self.assertIn("全部文件命中2行 / 2个文件", frame)
+        self.assertIn('  L11   "Ribbon", "Next"', frame)
+        for width, height in ((50, 14), (25, 5)):
+            frame = browser.frame(width, height, False)
+            self.assertLessEqual(len(frame.splitlines()), height)
+            self.assertTrue(all(cell_width(line) < width for line in frame.splitlines()))
+        browser.handle("\x1b")
+        self.assertEqual(browser.view, "blocks")
+        browser.handle("?")
+        browser.handle("\r")
+        current = browser.file["id"]
+        hits = browser.workspace_hits()
+        target = next(number for number, (file_id, _) in enumerate(hits) if file_id != current)
+        for _ in range(target):
+            browser.handle("DOWN")
+        browser.handle("n")  # One result page: paging keys do nothing here.
+        self.assertEqual((browser.view, browser.workspace_cursor), ("workspace", target))
+        file_id, line = hits[target]
+        browser.handle("\r")
+        self.assertEqual((browser.file["id"], browser.view, browser.query), (file_id, "blocks", "Ribbon"))
+        self.assertTrue(browser.expanded)
+        self.assertLessEqual(browser.block["start_line"], line)
+        self.assertLessEqual(line, browser.block["end_line"])
+        self.assertEqual(browser.detail_offset, line - browser.block["start_line"])
+        self.assertIn(f"{line:>8}> ", browser.frame(100, 25, False))
 
     def test_frame_fits_resized_terminal_and_cjk_width(self):
         browser = Browser(self.index)
