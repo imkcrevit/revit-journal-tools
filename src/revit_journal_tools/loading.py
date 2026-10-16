@@ -1,28 +1,34 @@
-"""Bounded, event-local Add-in vendor evidence; never infer from DLL paths."""
+"""Add-in records: their kind, name and bounded, event-local vendor evidence,
+read from the record itself; never inferred from DLL paths."""
 
 import re
 from urllib.parse import urlsplit
 
-from .categories import CATEGORIES
+# The loading-record regexes live in categories (the Categorizer classifies
+# loading starts as "addin"); loading_payload and is_addin_start are re-exported.
+from .categories import (_ADDIN_GATE, _PREFIX, _START, CATEGORIES, START_GATE,  # noqa: F401
+                         is_addin_start, loading_payload)
 from .rules import fold
 
+# Origins of add-in records (loads, failed loads, services, manifests, ...);
+# the add-in records themselves are the "addin" category of CATEGORIES.
 ADDIN_FILTERS = {
-    "addin": "Add-in列表",
-    "addin_autodesk": "Autodesk加载",
-    "addin_third_party": "第三方加载",
-    "addin_unknown": "来源待定加载",
+    "addin_autodesk": "Autodesk来源",
+    "addin_third_party": "第三方来源",
+    "addin_unknown": "来源待定",
+}
+ADDIN_ORIGINS = {"autodesk": "Autodesk", "third_party": "第三方", "unknown": "来源待定"}
+# Kinds of add-in records (blocks.addin_kind); see ADDIN_RECORDS.
+ADDIN_KINDS = {
+    "load": "加载", "service": "服务", "server": "服务器", "manifest": "清单", "event": "外部事件",
+    "updater": "更新器", "server_run": "服务器执行", "resource": "外部资源", "folder": "目录注册",
+    "assembly": "程序集", "not_loaded": "未加载", "ui": "窗口操作", "control": "日志控件",
+    "unregister": "注销全部服务",
 }
 BLOCK_FILTERS = {**CATEGORIES, **ADDIN_FILTERS}
 ADDIN_KEYS = {"i": "addin", "a": "addin_autodesk", "t": "addin_third_party", "u": "addin_unknown"}
-_START = re.compile(
-    r"^(?:Starting|Creating|Created|Loading|Loaded)\s+(?:an?\s+)?"
-    r"(?:External\s+(?:DB\s+)?Application|Add-?in)\s*:", re.I,
-)
 _VENDOR = re.compile(r"\bVendor\s*:\s*(.*)", re.I)
 _FIELD = re.compile(r",?\s*\b(?:Assembly(?:\s+Version)?|Class)\s*:", re.I)
-_PREFIX = re.compile(r"^\s*'\s*(?:\d+:<\s*)?")
-_TIMESTAMP = re.compile(r"^\s*'[A-Z]\s+\d{1,2}-[A-Za-z]+-\d{4}\s+[\d:.]+;\s*(?:\d+:<\s*)?")
-_API_PREFIX = re.compile(r"^API_(?:SUCCESS|ERROR|INFO)\s*[:{]\s*", re.I)
 _IDENTITY_FIELDS = re.compile(r"(?:^|,\s*)(Class|Vendor|Assembly(?:\s+Version)?)\s*:\s*", re.I)
 _URL = re.compile(
     r"https?://[^\s,){}]+|(?<![\w@/.-])(?:[a-z0-9-]+\.)+[a-z]{2,}"
@@ -32,21 +38,6 @@ _UNKNOWN = {"", "none", "<none>", "unknown", "<unknown>", "n/a", "null", "?"}
 _MAX_VENDOR = 4096
 _MAX_EVIDENCE = 8
 _MAX_IDENTITY = 512
-
-
-# Every _START match contains one of these (checked against rules.fold(text)).
-START_GATE = ("application", "addin", "add-in")
-
-
-def loading_payload(text: str) -> str:
-    text = _TIMESTAMP.sub("", text, count=1)
-    return _API_PREFIX.sub("", _PREFIX.sub("", text, count=1).strip(), count=1)
-
-
-def is_addin_start(text: str, folded: str | None = None) -> bool:
-    if not any(map((fold(text) if folded is None else folded).__contains__, START_GATE)):
-        return False
-    return bool(_START.match(loading_payload(text)))
 
 
 def vendor_origin(value: str) -> tuple[str, str]:
@@ -71,6 +62,16 @@ def vendor_origin(value: str) -> tuple[str, str]:
     if other_site or vendor_id not in _UNKNOWN:
         return "third_party", "other_vendor"
     return "unknown", "vendor_missing"
+
+
+def vendor_id_origin(value: str) -> tuple[str, str]:
+    """Origin of a declared vendor ID (VendorId(...), Rvt.Attr.VendorId): as
+    vendor_origin, and Revit's own API records declare "Autodesk" or
+    "Autodesk <product>" (VendorId(Autodesk Navisworks))."""
+    declared = value.split("(", 1)[0].strip()
+    if declared == "Autodesk" or declared.startswith("Autodesk "):
+        return "autodesk", "vendor_id_autodesk"
+    return vendor_origin(value)
 
 
 class LoadingEvidence:
@@ -179,9 +180,112 @@ class LoadingEvidence:
         return origin, self.evidence
 
 
+def _attr(field: str, group: str) -> str:
+    """An optional Rvt.Attr.<field> value, wherever it is on the line: up to
+    the next Rvt.Attr. field (not always preceded by a space) or the end."""
+    return rf"(?:(?=.*?Rvt\.Attr\.{field}:[ \t]*(?P<{group}>.*?)[ \t]*(?:Rvt\.Attr\.|$))|)"
+
+
+# Add-in records other than loads (LoadingEvidence reads those across lines):
+# (kind, literal gate, regex). The first record whose gate has a term in
+# rules.fold(text) and whose regex matches describes the line; every match
+# contains its gate (tests/test_categories_gates.py). Named groups: name, path
+# (the name is its last segment), class, vendor and description (the vendor
+# becomes "vendor(description)", like the Vendor field of a loading record).
+# Names come from the record itself, never from a DLL path.
+_NAMED = r"(?:.*?\bName\((?P<name>.*?)\)(?=\s*(?:;|\}|$)))?(?:.*?\bVendorId\((?P<vendor>[^)]*)\))?"
+ADDIN_RECORDS = (
+    # Before not_loaded: manifest lines also name the add-in type ExternalDBApplication.
+    ("manifest", ("jrn.addinmanifest",), re.compile(
+        r"\[Jrn\.AddInManifest\]" + _attr("AddInName", "name") + _attr("CommandClassName", "class")
+        + _attr("CommandVendorId", "vendor") + _attr("CommandVendorDescription", "description"), re.I)),
+    ("service", ("registered an external service",), re.compile(r"\bRegistered an external service\b" + _NAMED, re.I)),
+    ("server", ("registered an external server",), re.compile(r"\bRegistered an external server\b" + _NAMED, re.I)),
+    # Revit's journal record of a server registration, mostly right after its API record.
+    ("server", ("jrn.registerexternalserver",), re.compile(r"\[Jrn\.RegisterExternalServer\]", re.I)),
+    ("event", ("jrn.externaleventexecution",), re.compile(
+        r"\[Jrn\.ExternalEventExecution\]" + _attr("AddInName", "name") + _attr("VendorId", "vendor")
+        + _attr("VendorDescription", "description"), re.I)),
+    ("updater", ("jrn.addindynamicupdate",), re.compile(
+        r"\[Jrn\.AddInDynamicUpdate\]" + _attr("AddInName", "name") + _attr("VendorId", "vendor")
+        + _attr("VendorDescription", "description"), re.I)),
+    ("updater", ("third party updater",), re.compile(r"\bThird Party Updater\b(?:\s*'(?P<name>[^']*)')?", re.I)),
+    ("updater", ("forcibly unregistering updater", "forcibly removing all update triggers"), re.compile(
+        r"\bForcibly (?:unregistering Updater|removing all update triggers)\b", re.I)),
+    ("server_run", ("jrn.externalserverexecution",), re.compile(r"\[Jrn\.ExternalServerExecution\]", re.I)),
+    ("resource", ("jrn.externalresourceload",), re.compile(r"\[Jrn\.ExternalResourceLoad\]", re.I)),
+    ("folder", ("the add-in folder",), re.compile(r"\bThe add-in folder\b(?:\s*'(?P<path>[^']*)')?", re.I)),
+    ("assembly", ("the requested assembly",), re.compile(
+        r"\bThe requested assembly\b(?:\s*'(?P<name>[^,']*))?.*?\bwas loaded to the context\b", re.I)),
+    ("not_loaded", ("externaldbapplication",), re.compile(
+        r"\bExternalDBApplication\s+(?P<class>[^\s(]+)(?:\s*\(.*?\))?\s*(?:was not|wasn't|could not be) loaded\b",
+        re.I)),
+    ("not_loaded", ("add-in manifest file",), re.compile(
+        r"\bAdd-in manifest file\b(?:\s+from)?\s*:?\s*(?P<path>.+?)\s*,?\s*"
+        r"(?:won't be|will not be|was not|wasn't|could not be) loaded\b", re.I)),
+    ("ui", ("jrn.addinevent",), re.compile(r"\bJrn\.AddInEvent\b(?:.*?\bWpfWindow\((?P<name>[^,)]*))?", re.I)),
+    ("control", ("addinjournalclient",), re.compile(
+        r"\bAddInJournalClient\b(?:.*?\bcontrol\s*:\s*(?P<name>[^=]*?)\s*=)?", re.I)),
+    ("unregister", ("unregistering all external services",), re.compile(
+        r"\bUnregistering all external services\b", re.I)),
+)
+# A record names itself near its start; longer lines are read up to here, which
+# also bounds the lazy scans of the regexes above on pathological lines.
+_MAX_RECORD = 4096
+_SERVER_ID = re.compile(r"\bServerId\(\s*([^)\s]*)\s*\)", re.I)
+_REGISTERED_SERVER = re.compile(r"\[Jrn\.RegisterExternalServer\](?:.*?\bRvt\.Attr\.ExternalServer:\s*(\S*))?", re.I)
+
+
+def _last_segment(path: str) -> str:
+    return re.split(r"[\\/]+", path.strip().strip("'\"").rstrip("\\/"))[-1]
+
+
+def addin_record(text: str, folded: str | None = None) -> tuple[str, str, str, str] | None:
+    """(kind, name, vendor, class) of an add-in record other than a load, or None."""
+    folded = fold(text) if folded is None else folded
+    if not any(map(folded.__contains__, _ADDIN_GATE)):
+        return None
+    text = text[:_MAX_RECORD]
+    for kind, gate, regex in ADDIN_RECORDS:
+        match = any(map(folded.__contains__, gate)) and regex.search(text)
+        if match:
+            groups = match.groupdict()
+            name = (groups.get("name") or "").strip()
+            if not name and groups.get("path"):
+                name = _last_segment(groups["path"])
+            vendor = (groups.get("vendor") or "").strip()
+            description = (groups.get("description") or "").strip()
+            if description:
+                vendor += "(" + description + ")"
+            return kind, name, vendor, (groups.get("class") or "").strip()
+    return None
+
+
+def describe_addin(text: str) -> tuple[str, str, str, str] | None:
+    """(kind, name, vendor, class) of the add-in record on the line (kinds:
+    ADDIN_KINDS), or None. A load's later lines are read by LoadingEvidence."""
+    if is_addin_start(text):
+        evidence = LoadingEvidence()
+        evidence.feed(1, text)
+        _, found = evidence.finish()
+        return "load", evidence.name, found[0]["value"], evidence.class_name
+    return addin_record(text)
+
+
+def server_id(text: str) -> str:
+    """ServerId(...) of a "Registered an external server" record, or ""."""
+    match = _SERVER_ID.search(text) if "serverid" in text.lower() else None
+    return match.group(1) if match else ""
+
+
+def registered_server(text: str) -> str | None:
+    """None unless the line is a [Jrn.RegisterExternalServer] record, else its
+    Rvt.Attr.ExternalServer ID ("" when it has none)."""
+    match = _REGISTERED_SERVER.search(text) if "registerexternalserver" in text.lower() else None
+    return None if match is None else match.group(1) or ""
+
+
 def block_filter(category: str, alias: str = "b") -> tuple[str, str]:
-    if category == "addin":
-        return f"{alias}.addin_origin<>?", ""
     if category in ADDIN_FILTERS:
         return f"{alias}.addin_origin=?", category.removeprefix("addin_")
     return f"{alias}.category=?", category
@@ -190,8 +294,6 @@ def block_filter(category: str, alias: str = "b") -> tuple[str, str]:
 def matches_filter(block, category: str) -> bool:
     if category == "all":
         return True
-    if category == "addin":
-        return bool(block["addin_origin"])
     if category in ADDIN_FILTERS:
         return block["addin_origin"] == category.removeprefix("addin_")
     return block["category"] == category
@@ -205,13 +307,18 @@ def block_label(block: dict) -> str:
 
 
 def block_summary(block: dict) -> str:
-    """Names first; original loading records are fetched only on expansion."""
+    """Names first, "name [kind] [origin]"; the original records are fetched
+    only on expansion. An unnamed record other than a load keeps its title."""
     if not block.get("addin_origin"):
         return f"[{block_label(block)}] {block['title']}"
-    name = block.get("addin_name") or block.get("addin_class") or "未提供名称的Add-in"
-    summary = name + " [" + ADDIN_FILTERS["addin_" + block["addin_origin"]] + "]"
+    kind = block.get("addin_kind") or "load"
+    name = block.get("addin_name") or block.get("addin_class") or ""
+    tags = "[" + ADDIN_KINDS.get(kind, kind) + "] [" + ADDIN_ORIGINS[block["addin_origin"]] + "]"
+    summary = name + " " + tags if name else tags
     if block.get("severity") or block["category"] in {"error", "api_error", "warning"}:
         summary += " [" + CATEGORIES[block["category"]] + "]"
     if block.get("addin_identity_truncated"):
         summary += " [名称/Class摘要截断]"
+    if not name and kind != "load" and block.get("title"):
+        summary += " " + block["title"]
     return summary

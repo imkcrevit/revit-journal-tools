@@ -16,7 +16,9 @@ ROOT = Path(__file__).resolve().parent.parent
 REGEX_GATES = [
     (categories._JOURNAL, categories._JOURNAL_GATE, "text", "search"),
     (categories._STARTUP, categories._STARTUP_GATE, "text", "search"),
-    (categories._SYSTEM, categories._SYSTEM_GATE, "text", "search"),
+    (categories._ADDIN, categories._ADDIN_GATE, "text", "search"),
+    (categories._EXIT, categories._EXIT_GATE, "text", "search"),
+    (categories._COMMAND, categories._JOURNAL_GATE, "text", "match"),
     (blocks._API, blocks._API_GATE, "text", "search"),
     (blocks._METRIC, blocks._METRIC_GATE, "content", "search"),
     (blocks._SECTION, blocks._SECTION_GATE, "content", "search"),
@@ -27,13 +29,19 @@ REGEX_GATES = [
     (loading._START, loading.START_GATE, "loading", "match"),
     (categories._TASK_DIALOG, categories._DIALOG_GATE, "text", "search"),
     (categories._DIALOG_RESULT, categories._DIALOG_GATE, "text", "search"),
+    # Add-in records: each regex within its own gate, and every gate within _ADDIN_GATE
+    # (test_addin_record_gates_are_within_the_addin_gate).
+    *((regex, gate, "text", "search") for _, gate, regex in loading.ADDIN_RECORDS),
 ]
 UNGATED = {
-    "revit_journal_tools.categories": ["_JOURNAL_GATE", "_STARTUP_GATE", "_SYSTEM_GATE", "_DIALOG_GATE"],
+    "revit_journal_tools.categories": ["_JOURNAL_GATE", "_STARTUP_GATE", "_ADDIN_GATE", "_EXIT_GATE", "_DIALOG_GATE",
+                                       "START_GATE", "_MARKER_GATE"],
     "revit_journal_tools.blocks": ["_API_GATE", "_METRIC_GATE", "_SECTION_GATE", "_STRONG_GATE", "_NATIVE_GATE",
                                    "_NATIVE_CODE_GATE", "_EXCEPTION_GATE", "START_GATE", "_SHAPE_GATE"],
-    "revit_journal_tools.loading": ["START_GATE"],
+    "revit_journal_tools.loading": ["START_GATE", "_ADDIN_GATE"],
 }
+# The per-record gates of loading.ADDIN_RECORDS, disabled like UNGATED.
+UNGATED_RECORDS = tuple((kind, ("",), regex) for kind, _, regex in loading.ADDIN_RECORDS)
 STRUCTURE = [
     "'H 01-Oct-2026 10:00:00.001; 0:<", "'E 01-Oct-2026 10:00:00.002; 0:< ", "'C 01-Oct-2026 10:00:01.001; ",
     "' 0:< ", "' ", "  ", "", "API_ERROR { ", "API_SUCCESS { ", "API_INFO: ", "}", "{", "Jrn.Command _",
@@ -51,6 +59,18 @@ STRUCTURE = [
     "finished recording journal file", "InitApplication", "InitNativeInstance", "Starting Revit",
     "ApplicationInitialized", "Set Jrn = CrsJournalScript", "Assembly version conflict", "normal text",
     "x", "_", ": ", "= ", "123", 'TaskDialog "', '"TaskDialogResult"', "taskdialog", ' , "Close" _',
+    "[Jrn.AddInManifest] Rvt.Attr.AddInType: ExternalDBApplication", "[Jrn.RegisterExternalServer] ",
+    "[Jrn.ExternalEventExecution] ", "Jrn.AddInEvent \"AddInJournaling\"", "Registered an external server: ",
+    "The add-in folder 'X' was registered", "The requested assembly 'X' was loaded to the context 'Y'",
+    "AddInJournalClient load", "Third Party Updater 'X' registered", "Forcibly unregistering Updater with id:1",
+    "->desktop ExitManagedInstance", "License shutdown starting", "1 journal(s) aged out.", "Journal Exit",
+    "Total session time spent reclaiming memory: 0", "CefSharp has been shutdown successfully!",
+    "openFromModelPath [x.rvt]", 'Jrn.Command "Internal" , "Open , ID_REVIT_FILE_OPEN"',
+    "Registered an external service: Name(X); VendorId(ADSK)", "Name(Y (Z)); VendorId(Autodesk); ServerId(1)",
+    "[Jrn.ExternalServerExecution] ", "[Jrn.ExternalResourceLoad] ", "Rvt.Attr.AddInName: X ",
+    "Rvt.Attr.ExternalServer: 1 ", "Rvt.Attr.VendorId: ADSK", "Unregistering all external services.",
+    "Add-in manifest file from: C:\\x.addin, won't be loaded", "ExternalDBApplication X.App (C:\\x.dll) was not loaded",
+    "Forcibly removing all update triggers", "WpfWindow(Dlg,Title)", "load journal control: V = C:\\x.dll",
 ]
 LOOKALIKES = {"i": ["ı", "İ"], "s": ["ſ"], "k": ["K"]}
 
@@ -98,7 +118,7 @@ def run(lines):
     result.extend(builder.finish())
     blocks_ = [(b.start_line, b.end_line, b.category, b.severity, sorted(b.rules), b.title, b.title_line,
                 b.boundary, b.complete, b.addin_origin, b.addin_evidence, b.addin_name, b.addin_class,
-                b.addin_identity_truncated, b.phase, b.fingerprint) for b in result]
+                b.addin_identity_truncated, b.phase, b.fingerprint, b.addin_kind) for b in result]
     return classes, blocks_
 
 
@@ -125,12 +145,25 @@ class ShapeGateTests(unittest.TestCase):
             for term in gate:
                 self.assertTrue(any(shape in fold(term) for shape in blocks._SHAPE_GATE), term)
 
+    def test_addin_record_gates_are_within_the_addin_gate(self):
+        # A line without any _ADDIN_GATE term skips every add-in record regex at once.
+        for _, gate, _ in loading.ADDIN_RECORDS:
+            for term in gate:
+                self.assertTrue(any(addin in term for addin in categories._ADDIN_GATE), term)
+
+    def test_marker_gate_covers_the_addin_startup_and_exit_gates(self):
+        # A line without any _MARKER_GATE term skips the loading-start, add-in, start-up and exit tests.
+        for gate in (categories.START_GATE, categories._ADDIN_GATE, categories._STARTUP_GATE, categories._EXIT_GATE):
+            for term in gate:
+                self.assertTrue(any(marker in term for marker in categories._MARKER_GATE), term)
+
     def test_gated_and_ungated_classification_and_blocks_are_identical(self):
         for number, lines in enumerate(sample_journals()):
             with self.subTest(journal=number):
                 gated = run(lines)
                 patches = [patch.multiple(module, **{name: ("",) for name in names})
                            for module, names in UNGATED.items()]
+                patches.append(patch.object(loading, "ADDIN_RECORDS", UNGATED_RECORDS))
                 for item in patches:
                     item.start()
                 try:

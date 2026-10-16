@@ -19,7 +19,7 @@ from .categories import CATEGORIES
 from .discovery import cache_dir, cache_files, journal_folders, parse_years
 from .live import SNAPSHOT_MODES
 from .models import SEVERITY_RANK
-from .loading import BLOCK_FILTERS
+from .loading import ADDIN_KINDS, BLOCK_FILTERS
 from .reader import resolve_encoding
 from .reporting import write_reports
 from .rules import load_rules
@@ -79,11 +79,17 @@ def _parser() -> argparse.ArgumentParser:
     rules.add_argument("--rules", type=Path, help="追加自定义JSON规则")
     browse = commands.add_parser("browse", help="打开CLI终端段落查看器（颜色、折叠、搜索）")
     _workspace_options(browse, index=True)
-    browse.add_argument("--category", choices=("all", *BLOCK_FILTERS), default="all")
+    browse.add_argument("--category", choices=("all", *BLOCK_FILTERS), default="all",
+                        help="段落分类，如addin（Add-in记录）、exit（退出）；addin_autodesk、addin_third_party、"
+                             "addin_unknown按来源列出Add-in记录（加载、服务、清单等，含加载失败）")
     browse.add_argument("--phase", choices=("all", *PHASES), default="all", help="只看某个会话阶段的段落")
     browse.add_argument("--query", default="",
                         help="搜索段落内任意行：各词都须出现（顺序不限），\"引号\"内为相邻短语，末词兼作前缀")
-    browse.add_argument("--addin-prefix", default="", help="按Add-in名称或Class前缀筛选，如ATFTranslationServer")
+    browse.add_argument("--addin-prefix", default="",
+                        help="只列名称或Class以此开头的Add-in记录（含加载失败），如ATFTranslationServer；可与--category同时使用")
+    browse.add_argument("--kind", dest="kinds", action="append", choices=tuple(ADDIN_KINDS), metavar="KIND",
+                        help="只列这些种类的Add-in记录，可重复，如--kind service --kind server；只在addin分类、"
+                             "来源筛选或--addin-prefix下生效。种类：" + "、".join(ADDIN_KINDS))
     browse.add_argument("--no-fold", dest="fold", action="store_false", help="不折叠内容相同的段落")
     browse.add_argument("--color", choices=("auto", "always", "never"), default="auto")
     browse.add_argument("--print", dest="print_only", action="store_true", help="输出一页段落摘要，不进入交互界面")
@@ -95,7 +101,8 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("query", help="关键词：各词都须出现在同一行（顺序不限），\"引号\"内为相邻短语，末词兼作前缀；"
                                       "纯标点不能搜索")
     _workspace_options(search, index=True)
-    search.add_argument("--category", choices=("all", *CATEGORIES), default="all", help="只看某个行分类的命中")
+    search.add_argument("--category", choices=("all", *CATEGORIES), default="all",
+                        help="只看某个行分类的命中，如addin、exit；Add-in来源筛选只用于browse段落")
     search.add_argument("--per-file", type=int, default=3, metavar="N", help="每个文件最多列出N条命中行，1到20")
     search.add_argument("--format", choices=("text", "json"), default="text")
     search.set_defaults(rules=None)
@@ -333,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
                     return run(planned, args.database, args.encoding, format_name=args.format, print_only=True,
                                jobs=args.jobs, snapshot=args.snapshot, summary_tail=args.tail, store=args.store)
                 return run(planned, args.database, args.encoding, category=args.category, query=args.query,
-                           addin_prefix=args.addin_prefix,
+                           addin_prefix=args.addin_prefix, kinds=tuple(args.kinds or ()),
                            color=args.color, print_only=args.print_only, format_name=args.format,
                            after=args.after, page_size=args.page_size, jobs=args.jobs, snapshot=args.snapshot,
                            phase=args.phase, fold=args.fold, store=args.store)

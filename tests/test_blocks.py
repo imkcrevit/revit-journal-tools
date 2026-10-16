@@ -22,12 +22,12 @@ class BlockTests(unittest.TestCase):
         self.assertEqual([(b.start_line, b.end_line) for b in blocks], [(1, 2), (3, 5), (6, 8)])
         self.assertEqual([n for b in blocks for n in range(b.start_line, b.end_line + 1)], list(range(1, 9)))
 
-    def test_system_properties_and_resource_sample_are_whole(self):
+    def test_settings_section_and_resource_sample_are_whole(self):
         blocks = grouped(["' 0:< SystemSettings:", "' 0:<   12=cores", "' 0:<   true=installed",
                           "' 0:< Delta VM: Avail 100", "' 0:< GUI Resource Usage GDI: 5",
                           "' 0:< License mode: User", "' 0:< Status: synthetic", "' 0:< Type: USER"])
         self.assertEqual([(b.start_line, b.end_line, b.category) for b in blocks],
-                         [(1, 3, "system"), (4, 5, "system"), (6, 8, "system")])
+                         [(1, 3, "startup"), (4, 5, "startup"), (6, 8, "startup")])
 
     def test_timestamp_command_and_all_continuations_form_one_operation(self):
         blocks = grouped(["'H 01-Oct-2026 10:00:00.001; 0:<", "Jrn.Command _",
@@ -46,13 +46,13 @@ class BlockTests(unittest.TestCase):
 
     def test_multi_line_success_and_nested_braces(self):
         blocks = grouped(["API_SUCCESS { Register {synthetic-id}", "'command name", "'event }", "normal"])
-        self.assertEqual([(b.start_line, b.end_line, b.category) for b in blocks], [(1, 3, "api"), (4, 4, "other")])
+        self.assertEqual([(b.start_line, b.end_line, b.category) for b in blocks], [(1, 3, "api"), (4, 4, "startup")])
 
     def test_error_message_exception_and_stack_remain_together(self):
         blocks = grouped(["DBG_ERROR: first operation failed", "System.InvalidOperationException: synthetic",
                           "  at Synthetic.Run()", "  at Synthetic.Main()", "DBG_ERROR: independent failure", "normal message"])
         self.assertEqual([(b.start_line, b.end_line, b.category) for b in blocks],
-                         [(1, 4, "error"), (5, 5, "error"), (6, 6, "other")])
+                         [(1, 4, "error"), (5, 5, "error"), (6, 6, "startup")])
         self.assertIn("generic.exception", blocks[0].rules)
 
     def test_independent_exceptions_split_but_inner_exception_is_a_continuation(self):

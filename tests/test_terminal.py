@@ -7,8 +7,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from revit_journal_tools.categories import CATEGORIES
 from revit_journal_tools.cli import main
-from revit_journal_tools.terminal import Browser, cell_width, crop, safe_text
+from revit_journal_tools.terminal import COLORS, Browser, cell_width, crop, safe_text
 from revit_journal_tools.viewer_index import NO_SEARCH_TOKENS, ViewerIndex
 
 
@@ -56,7 +57,7 @@ class TerminalTests(unittest.TestCase):
     def test_search_inside_continuation_selects_entire_block_once(self):
         result = self.index.blocks(self.file_id, query="private_module_key")
         self.assertEqual([(b["start_line"], b["end_line"]) for b in result["items"]], [(5, 7)])
-        self.assertEqual(self.index.blocks(self.file_id, "system", query="private_module_key")["items"], [])
+        self.assertEqual(self.index.blocks(self.file_id, "startup", query="private_module_key")["items"], [])
         self.assertEqual(len(self.index.blocks(self.file_id, query="synthetic")["items"]), 2)
 
     def test_block_pagination_and_detail_pagination_keep_every_line(self):
@@ -101,7 +102,7 @@ class TerminalTests(unittest.TestCase):
 
     def test_browser_expand_filter_goto_search_and_file_switch(self):
         browser = Browser(self.index)
-        browser.handle("4")
+        browser.handle("5")
         self.assertEqual(len(browser.items), 1)
         browser.handle("\r")
         self.assertTrue(browser.expanded)
@@ -121,6 +122,34 @@ class TerminalTests(unittest.TestCase):
         browser.handle("\r")
         self.assertEqual(browser.mode, "blocks")
         self.assertFalse(browser.handle("q"))
+
+    def test_digit_keys_follow_the_category_order_and_other_is_reached_by_c(self):
+        order = ["startup", "addin", "exit", "error", "api_error", "operation", "warning", "api", "dialog"]
+        self.assertEqual(list(CATEGORIES), [*order, "other"])
+        browser = Browser(self.index)
+        for key, category in zip("123456789", order):
+            with self.subTest(key=key):
+                browser.handle(key)
+                self.assertEqual(browser.category, category)
+        browser.handle("c")
+        self.assertEqual(browser.category, "other")
+        browser.handle("i")
+        self.assertEqual(browser.category, "addin")
+        frame = browser.frame(120, 25, False)
+        self.assertIn("分类: Add-in", frame)
+        self.assertIn("1启动 2Add-in 3退出 4错误", frame)
+        # The Add-in category shows the add-in summary even without loading records.
+        self.assertIn("当前日志Add-in: 0块 | 来源: Autodesk 0 / 第三方0 / 来源待定0", frame)
+
+    def test_every_category_has_a_color_and_headers_use_their_own_style(self):
+        self.assertLessEqual(set(CATEGORIES), set(COLORS))
+        self.assertNotIn("system", COLORS)
+        self.assertEqual(len({COLORS[key] for key in CATEGORIES}), len(CATEGORIES) - 1)  # API shares the start-up blue
+        browser = Browser(self.index)
+        browser.handle("f")
+        # Session headers of the file list: bold, not the color of a category.
+        self.assertIn(f"\x1b[{COLORS['heading']}m", browser.frame(120, 25, True))
+        self.assertNotIn(COLORS["heading"], [COLORS[key] for key in CATEGORIES])
 
     def test_punctuation_only_search_keeps_previous_query_and_list(self):
         browser = Browser(self.index)

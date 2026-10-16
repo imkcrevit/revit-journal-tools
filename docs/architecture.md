@@ -20,7 +20,7 @@ Journal文件 → 严格解码与逐行读取 → 规则匹配 → 候选、上�
 
 `Rule`是声明式JSON规则。每条规则在每行最多产生一次命中，所有匹配位置均使用解码后的字符索引，不是原始字节偏移。规则不执行Journal内容、不运行Python代码，不访问网络。规则正则应由项目维护者审核，当前没有正则执行超时隔离；加载时`regex_safety.py`拒绝可重复组内与后续字符重叠的无界量词（如`(a+)+`），多项式级回溯不检查。规则可声明字面量门控`gate`：`match_rules`每行只折叠一次（`rules.fold`：小写，并把正则忽略大小写时等同于i/s的`İ ı ſ`先换掉），门控子串都不在行内时跳过该规则的正则。门控是必要条件，不改变命中；内置规则全部声明了门控，测试与`scripts/verify_equivalence.py gates`逐行证明有无门控命中相同。
 
-分类与分段沿用同一思路：`Categorizer`、`BlockBuilder`、`LoadingEvidence`中每个忽略大小写的正则前都有按`fold`检查的字面量门控（模块级`*_GATE`元组），每行的形状判断（时间戳、API头、资源采样、强错误、加载前缀、原生异常）只计算一次；`LoadingEvidence`未激活时只检查加载前缀门控。`tests/test_categories_gates.py`把全部门控替换为空串（即总是运行正则）后比对分类与块，结果必须完全相同。约一半的Journal行与前面某行文字相同：`Categorizer`在API_ERROR花括号外按（文字，两个续行状态）缓存结果与下一状态，`BlockBuilder`按文字缓存`_shape`算出的全部纯文字特征，两者各有16,384条上限；测试比对缓存、极小上限和不缓存三种结果。
+分类与分段沿用同一思路：`Categorizer`、`BlockBuilder`、`LoadingEvidence`中每个忽略大小写的正则前都有按`fold`检查的字面量门控（模块级`*_GATE`元组），每行的形状判断（时间戳、API头、资源采样、强错误、加载前缀、原生异常）只计算一次；`LoadingEvidence`未激活时只检查加载前缀门控。`tests/test_categories_gates.py`把全部门控替换为空串（即总是运行正则）后比对分类与块，结果必须完全相同。行分类与段落阶段共用`categories.phase_marker`：第一次用户操作（非Revit自动写入的`Jrn.*`命令或打开文档）之前未被其他分类命中的行归“启动”，`ExitManagedInstance`等退出标记之后归“退出”，其间归“其他记录”；`BlockBuilder`把这三个位置性分类视为弱分类，段落取段内第一个其他分类。约一半的Journal行与前面某行文字相同：`Categorizer`在API_ERROR与Add-in加载花括号外按（文字，两个续行状态，阶段）缓存结果与下一状态，`BlockBuilder`按文字缓存`_shape`算出的全部纯文字特征，两者各有16,384条上限；测试比对缓存、极小上限和不缓存三种结果。
 
 `analyze`只持有当前行、有限长度的前文、正在补齐后文的候选，以及有容量上限的明细和重复组。总计数不受明细上限影响。同一行多个规则合为一个候选，级别取最大值；分组只对完全相同的行内容和命中规则集合生效。
 
@@ -36,7 +36,7 @@ CLI在扫描前发现文件，对单个文件失败进行隔离。输出先写�
 
 `LoadingEvidence`在明确的Add-in加载事件中累计Vendor依据，直到整个块结束才确定来源。跨行字段缓冲最多4096字符，依据最多8条、每条400字符；不根据DLL路径推断厂商，不继承上一个事件的Vendor。`blocks.addin_origin/addin_evidence`保存独立来源属性，原有错误分类与级别保持有效。CLI用`BLOCK_FILTERS`将来源筛选映射到独立索引字段，FTS仍先找命中行，再映射为完整块。分类统计包含可重叠的来源计数，总块数只累计原有互斥类别。旧数据库自动补充字段，`BLOCK_VERSION`变化触发已选文件重建。
 
-加载事件正文先剥离时间戳、Journal层级和API包装，再检查正文开头的固定加载前缀。`addin_name/addin_class`各保留最多512字符，超限由`addin_identity_truncated`标记；字段可跨行，但不跨事件继承。名称/Class前缀通过带转义的SQL前缀查询筛选，支持与来源及FTS组合，并保留原始起始行分页游标。CLI折叠列表只使用这些元数据；Add-in条目忽略普通段落预览级别，仅在展开时调用`block_lines`读取原文。
+加载事件正文先剥离时间戳、Journal层级和API包装，再检查正文开头的固定加载前缀。`addin_name/addin_class`各保留最多512字符，超限由`addin_identity_truncated`标记；字段可跨行，但不跨事件继承。加载以外的Add-in记录（服务、服务器、清单、程序集等）由`loading.ADDIN_RECORDS`声明式表识别：每项是种类、字面门控和带命名分组（`name`、`path`、`class`、`vendor`、`description`）的正则，`BlockBuilder`在段落的第一条记录行写入`addin_kind`、名称、Class、来源与依据，每条记录自成段落；`Registered an external server`的API记录闭合后暂不结束，紧随的空`'E`/`'H`时间戳行先暂存，下一行是同一ServerId（或不带ID）的`[Jrn.RegisterExternalServer]`时并入，否则按原逻辑以时间戳行开新段落。名称/Class前缀通过带转义的SQL前缀查询筛选，支持与来源及FTS组合，并保留原始起始行分页游标。CLI折叠列表只使用这些元数据；Add-in条目忽略普通段落预览级别，仅在展开时调用`block_lines`读取原文。
 
 `ViewerIndex`写入：每个文件一个事务。先在短事务中删除旧行与该文件的全文表并标记`indexing`；随后`parse_into`按2万行一批`executemany`写`lines`与`blocks`，文件读完后在同一事务内用一条`INSERT ... SELECT`建立该文件自己的不存内容的FTS5表`line_search_<id>`（rowid即行号），再写统计并置`ready`。失败或停止时整个事务回滚，不会留下半个文件；重建时直接删表，不需要旧文字。旧版本共用的`line_search`表只在重建旧文件时按旧文字删除其条目，逐行维护FTS的触发器在打开数据库时删除。
 

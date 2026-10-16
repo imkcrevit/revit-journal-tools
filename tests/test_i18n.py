@@ -2,6 +2,7 @@
 the Revit version each journal is grouped under. Synthetic journals only."""
 
 import json
+import re
 import shutil
 import tempfile
 import threading
@@ -13,6 +14,7 @@ from pathlib import Path
 
 from revit_journal_tools import i18n
 from revit_journal_tools.cli import plan_workspace
+from revit_journal_tools.loading import ADDIN_KINDS
 from revit_journal_tools.session_view import line_ref, summary_lines
 from revit_journal_tools.sidecars import revit_version
 from revit_journal_tools.summary import session_findings
@@ -20,6 +22,7 @@ from revit_journal_tools.viewer_index import ViewerIndex
 from revit_journal_tools.viewer_server import make_server, session_view
 
 EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "paragraphs.journal.txt"
+APP = Path(__file__).resolve().parent.parent / "src" / "revit_journal_tools" / "web" / "app.js"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback, no system proxy
 
 
@@ -53,6 +56,33 @@ class TextTests(unittest.TestCase):
         self.assertEqual(revit_version(copy, {"branch": "RELEASE_2025.5", "release": "2025.5"}), 2025)
         self.assertEqual(revit_version(copy, {"branch": "", "release": "2023.1.9"}), 2023)
         self.assertIsNone(revit_version(copy, {}))
+
+
+class PageTextTests(unittest.TestCase):
+    """The page's own tables (web/app.js) against the Python ones: read as text, never run."""
+
+    def setUp(self):
+        self.source = APP.read_text(encoding="utf-8")
+
+    def block(self, start, end):
+        return self.source[self.source.index(start):self.source.index(end)]
+
+    def test_every_page_text_has_both_languages(self):
+        keys = {lang: set(re.findall(r'^\s+"([\w.]+)":|, "([\w.]+)":', self.block(start, end), re.M))
+                for lang, start, end in (("zh", "  zh: {\n", "  en: {\n"), ("en", "  en: {\n", "const LABELS"))}
+        zh, en = ({next(filter(None, pair)) for pair in found} for found in (keys["zh"], keys["en"]))
+        self.assertEqual(zh, en)
+        self.assertLessEqual({"col.kinds", "col.menu", "menu.all", "menu.none", "menu.apply"}, zh)
+
+    def test_kind_labels_follow_addin_kinds(self):
+        # The column menu lists the kinds in this order, with block_counts["kind_" + key].
+        labels = self.block("const LABELS", "// Line and paragraph categories")
+        tables = [dict(re.findall(r'(\w+): "([^"]*)"', table)) for table in re.findall(r"kind: \{([^}]*)\}", labels)]
+        self.assertEqual(len(tables), 2)
+        zh, en = tables
+        self.assertEqual(list(zh), list(ADDIN_KINDS))
+        self.assertEqual(zh, ADDIN_KINDS)
+        self.assertEqual(en, i18n.EN["addin_kind"])
 
 
 class SessionTextTests(unittest.TestCase):

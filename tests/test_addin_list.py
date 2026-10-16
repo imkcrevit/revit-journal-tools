@@ -87,8 +87,11 @@ class AddinListTests(unittest.TestCase):
         self.file_id = queued[0]
 
     def test_list_and_prefix_filters_use_name_or_class_start(self):
-        self.assertEqual([b["start_line"] for b in self.index.blocks(self.file_id, "addin")["items"]], [1, 5, 6])
-        self.assertEqual(self.index.catalog()[0]["block_counts"]["addin"], 3)
+        # The "addin" category; the failed load (API_ERROR) stays an API error with its origin.
+        self.assertEqual([b["start_line"] for b in self.index.blocks(self.file_id, "addin")["items"]], [1, 6])
+        self.assertEqual([b["start_line"] for b in self.index.blocks(self.file_id, "api_error")["items"]], [5])
+        counts = self.index.catalog()[0]["block_counts"]
+        self.assertEqual((counts["addin"], counts["addin_autodesk"], counts["addin_third_party"]), (2, 1, 2))
         for prefix, expected in [("ATFTranslationServer", [1]), ("ATF ", [1, 5]),
                                  ("atftranslationserver", [1]), ("Translation", []), ("Synthetic.ATF", [6])]:
             with self.subTest(prefix=prefix):
@@ -99,9 +102,9 @@ class AddinListTests(unittest.TestCase):
         result = self.index.blocks(self.file_id, "addin", query="ADSK", addin_prefix="ATFTranslationServer")
         self.assertEqual([(b["start_line"], b["end_line"]) for b in result["items"]], [(1, 4)])
         self.assertEqual(self.index.blocks(self.file_id, "addin_third_party", addin_prefix="ATFTranslationServer")["items"], [])
-        first = self.index.blocks(self.file_id, "addin", query="Application", addin_prefix="ATF", limit=1)
+        first = self.index.blocks(self.file_id, query="Application", addin_prefix="ATF", limit=1)
         self.assertTrue(first["has_more"])
-        second = self.index.blocks(self.file_id, "addin", query="Application", addin_prefix="ATF", after=first["next_after"], limit=1)
+        second = self.index.blocks(self.file_id, query="Application", addin_prefix="ATF", after=first["next_after"], limit=1)
         self.assertEqual([b["start_line"] for b in second["items"]], [5])
         self.assertFalse(second["has_more"])
 
@@ -116,10 +119,32 @@ class AddinListTests(unittest.TestCase):
                              + "API_SUCCESS { Starting External Application: ATF First, Class: ATF.First, Vendor: ADSK(), common }\n"
                              + "API_ERROR { Starting External Application: ATF Second, Class: ATF.Second, Vendor: DEMO(), common }\n", encoding="utf-8")
         self.index.build(self.index.register([self.path], "auto"), "auto")
-        for prefix in ("", "ATF"):
-            with self.subTest(prefix=prefix):
-                result = self.index.blocks(self.file_id, "addin", query="common", addin_prefix=prefix)
-                self.assertEqual([b["start_line"] for b in result["items"]], [521, 522])
+        for category, prefix, expected in (("addin", "", [521]), ("addin", "ATF", [521]),
+                                           ("all", "ATF", [521, 522]), ("api_error", "", [522])):
+            with self.subTest(category=category, prefix=prefix):
+                result = self.index.blocks(self.file_id, category, query="common", addin_prefix=prefix)
+                self.assertEqual([b["start_line"] for b in result["items"]], expected)
+
+    def test_prefix_keeps_the_category_and_lists_failed_loads(self):
+        # The prefix lists loading records only; forcing the addin category
+        # would hide the failed load, which is an API error.
+        browser = Browser(self.index, addin_prefix="ATF ")
+        self.assertEqual(browser.category, "all")
+        self.assertEqual([b["start_line"] for b in browser.items], [1, 5])
+        frame = browser.frame(120, 25, False)
+        self.assertIn("当前日志Add-in: 2块 | 来源: Autodesk 1 / 第三方2 / 来源待定0", frame)
+        self.assertIn("名称/Class前缀: ATF（只列Add-in记录）", frame)
+        self.assertIn("ATF Helper [加载] [第三方] [API错误] | L5–5", frame)
+        browser.handle("2")
+        self.assertEqual((browser.category, [b["start_line"] for b in browser.items]), ("addin", [1]))
+        browser.handle("5")
+        self.assertEqual((browser.category, [b["start_line"] for b in browser.items]), ("api_error", [5]))
+        browser.handle("0")
+        browser.handle("v")
+        for key in ["\b"] * len("ATF ") + list("Synthetic") + ["\r"]:
+            browser.handle(key)
+        self.assertEqual((browser.category, browser.addin_prefix), ("all", "Synthetic"))
+        self.assertEqual([b["start_line"] for b in browser.items], [6])
 
     def test_collapsed_list_never_reads_or_displays_raw_records(self):
         browser = Browser(self.index, category="addin")
@@ -128,7 +153,6 @@ class AddinListTests(unittest.TestCase):
                 browser.density = density
                 frame = browser.frame(100, 25, False)
                 self.assertIn("ATF Translation Server", frame)
-                self.assertIn("3条加载记录", frame)
                 self.assertNotIn("Starting External", frame)
                 self.assertNotIn("Vendor:", frame)
                 self.assertNotIn("Assembly:", frame)
@@ -176,14 +200,25 @@ class AddinListTests(unittest.TestCase):
                 self.assertEqual(code, 0)
                 if "json" in format_args:
                     file = json.loads(output.getvalue())["files"][0]
-                    self.assertEqual(file["addin_count"], 3)
+                    self.assertEqual(file["addin_count"], 2)  # blocks of the "addin" category
+                    # Origins of every loading record, the failed one included.
+                    self.assertEqual(file["addin_origin_counts"], {"autodesk": 1, "third_party": 2, "unknown": 0})
                     self.assertEqual(len(file["items"]), 1)
                     self.assertEqual(file["items"][0]["addin_name"], "ATF Translation Server")
                     self.assertEqual(file["items"][0]["addin_class"], "ATFTranslationServer.ATFTranslationServerRegister")
                 else:
                     self.assertIn("ATF Translation Server", output.getvalue())
+                    self.assertIn("当前日志Add-in: 2块 | 来源: Autodesk 1 / 第三方2 / 来源待定0 | "
+                                  "名称/Class前缀: ATFTranslationServer", output.getvalue())
                     self.assertNotIn("Starting External", output.getvalue())
                     self.assertNotIn("Vendor:", output.getvalue())
+        # Without a category the prefix also lists the failed load (an API error).
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = main(["browse", str(self.path), "--database", str(self.database),
+                         "--addin-prefix", "ATF ", "--format", "json"])
+        self.assertEqual(code, 0)
+        self.assertEqual([b["start_line"] for b in json.loads(output.getvalue())["files"][0]["items"]], [1, 5])
 
 
 if __name__ == "__main__":

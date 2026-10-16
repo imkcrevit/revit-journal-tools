@@ -7,7 +7,8 @@ const BLOCK_PAGE = 200;
 // detail: what the right panel shows, redrawn when the language changes.
 // scope: search in the current "file" or in "all" files (not remembered); terms: the search terms of
 // the last answer (null before the first one); shown: which list the rows show (see listKey).
-const state = {files: [], file: null, view: "blocks", category: "all", phase: "all", fold: true, query: "", cursors: [0], next: 0, hasMore: false, selected: null, autoSelect: false, sequence: 0, detailSequence: 0, readyCount: -1, loaded: false, detail: null, scope: "file", terms: null, shown: null};
+// kinds: add-in record kinds the Add-in views keep ([] = all); cleared with another file or category.
+const state = {files: [], file: null, view: "blocks", category: "all", phase: "all", fold: true, query: "", cursors: [0], next: 0, hasMore: false, selected: null, autoSelect: false, sequence: 0, detailSequence: 0, readyCount: -1, loaded: false, detail: null, scope: "file", terms: null, shown: null, kinds: []};
 let listController, detailController, sessionController, pollTimer, toastTimer;
 
 // Per-viewer preferences (language, layout, theme, collapsed versions); the page works without storage.
@@ -47,6 +48,9 @@ const I18N = {
     "heading.blocks": "全部段落", "heading.lines": "全部记录",
     "col.line": "行号", "col.first": "起始行", "col.category": "分类", "col.origin": "来源",
     "col.text": "原文记录", "col.block": "段落（同一事件的连续记录）", "col.addin": "Add-in名称",
+    "col.kinds": "{count}种", "col.menu": "点击列出该列的取值并筛选",
+    "menu.category": "按分类筛选", "menu.origin": "按来源筛选", "menu.kinds": "按Add-in种类筛选（可多选）",
+    "menu.all": "全选", "menu.none": "清空", "menu.apply": "确定",
     "page.previous": "← 上一页", "page.next": "下一页 →", "page.info": "第{page}页 · {count}{unit}",
     "unit.blocks": "段", "unit.lines": "条", "page.search": " · 搜索结果", "page.folded": " · 相同段落已折叠",
     "list.indexing": "正在建立磁盘索引。可先查看左侧已经就绪的文件。", "list.failed": "读取失败：{error}",
@@ -111,6 +115,9 @@ const I18N = {
     "heading.blocks": "All paragraphs", "heading.lines": "All records",
     "col.line": "Line", "col.first": "First line", "col.category": "Category", "col.origin": "Origin",
     "col.text": "Source text", "col.block": "Paragraph (consecutive records of one event)", "col.addin": "Add-in name",
+    "col.kinds": "{count} kind{s}", "col.menu": "Click to list this column's values and filter",
+    "menu.category": "Filter by category", "menu.origin": "Filter by origin", "menu.kinds": "Filter by add-in record kind (several allowed)",
+    "menu.all": "Select all", "menu.none": "Clear", "menu.apply": "Apply",
     "page.previous": "← Previous", "page.next": "Next →", "page.info": "Page {page} · {count} {unit}",
     "unit.blocks": "paragraph{s}", "unit.lines": "line{s}", "page.search": " · search results", "page.folded": " · repeats folded",
     "list.indexing": "Building the index. Files already ready on the left can be viewed now.", "list.failed": "Could not read: {error}",
@@ -149,22 +156,29 @@ const I18N = {
 };
 const LABELS = {
   zh: {
-    category: {startup: "启动", system: "系统数据", error: "错误", api_error: "API错误", operation: "操作内容", warning: "警告", api: "API活动", other: "其他记录", dialog: "对话框"},
+    category: {startup: "启动", addin: "Add-in", exit: "退出", error: "错误", api_error: "API错误", operation: "操作内容", warning: "警告", api: "API活动", dialog: "对话框", other: "其他记录"},
     origin: {autodesk: "Autodesk", third_party: "第三方", unknown: "来源待定"},
+    kind: {load: "加载", service: "服务", server: "服务器", manifest: "清单", event: "外部事件", updater: "更新器", server_run: "服务器执行", resource: "外部资源", folder: "目录注册", assembly: "程序集", not_loaded: "未加载", ui: "窗口操作", control: "日志控件", unregister: "注销全部服务"},
     phase: {startup: "启动", licensing: "许可", addin_loading: "Add-in加载", document_open: "打开文档", interactive: "交互操作", shutdown: "退出"},
     role: {main: "主Journal", abbrev: "精简Journal", worker: "Worker日志", steel_log: "钢连接错误日志", copy: "副本", dump: "崩溃转储"},
     basis: {explicit: "按指定编码", bom: "按BOM", "utf-8": "严格UTF-8", language_code: "按Journal声明的界面语言{code}", chinese_text: "内容为常用中文字符", not_chinese: "gb18030可以解码但内容不像中文，改用后续候选", candidate: "前面的候选无法严格解码", unlikely_chinese: "只有gb18030能严格解码，但内容不像中文，可能是乱码", degraded: "所有候选都无法完整解码"},
   },
   en: {
-    category: {startup: "Startup", system: "System data", error: "Error", api_error: "API error", operation: "Operation", warning: "Warning", api: "API activity", other: "Other", dialog: "Dialog"},
+    category: {startup: "Startup", addin: "Add-in", exit: "Exit", error: "Error", api_error: "API error", operation: "Operation", warning: "Warning", api: "API activity", dialog: "Dialog", other: "Other"},
     origin: {autodesk: "Autodesk", third_party: "Third-party", unknown: "Unknown origin"},
+    kind: {load: "Load", service: "Service", server: "Server", manifest: "Manifest", event: "External event", updater: "Updater", server_run: "Server run", resource: "External resource", folder: "Add-in folder", assembly: "Assembly", not_loaded: "Not loaded", ui: "Window action", control: "Journal control", unregister: "Unregister all services"},
     phase: {startup: "Startup", licensing: "Licensing", addin_loading: "Add-in loading", document_open: "Opening documents", interactive: "Interactive", shutdown: "Shutdown"},
     role: {main: "Main journal", abbrev: "Abbreviated journal", worker: "Worker log", steel_log: "Steel connection log", copy: "Copy", dump: "Crash dump"},
     basis: {explicit: "as specified", bom: "by BOM", "utf-8": "strict UTF-8", language_code: "by the UI language {code} declared in the journal", chinese_text: "common Chinese characters", not_chinese: "gb18030 decodes it but it does not look like Chinese; a later candidate is used", candidate: "earlier candidates could not decode it strictly", unlikely_chinese: "only gb18030 decodes it strictly, but it does not look like Chinese: possibly garbled", degraded: "no candidate decodes it completely"},
   },
 };
+// Line and paragraph categories, in the order of CATEGORIES (and the terminal's digit keys).
 const CATEGORY_KEYS = Object.keys(LABELS.zh.category);
+// Paragraph-only filters: origins of add-in records (failed loads included), coloured like their row badges.
 const ORIGINS = ["addin_autodesk", "addin_third_party", "addin_unknown"];
+const ORIGIN_COLORS = {addin: "var(--c-addin)", addin_autodesk: "var(--c-operation)", addin_third_party: "var(--c-api)", addin_unknown: "var(--c-warning)"};
+// Kinds of add-in records, in the order of loading.ADDIN_KINDS; block_counts["kind_" + kind] per file.
+const KIND_KEYS = Object.keys(LABELS.zh.kind);
 const ROLE_ORDER = {main: 0, abbrev: 1, worker: 2, steel_log: 3, unrecognized: 4, copy: 5};
 let lang = I18N[prefs.get("lang")] ? prefs.get("lang") : (navigator.language || "zh").toLowerCase().startsWith("zh") ? "zh" : "en";
 
@@ -179,7 +193,6 @@ function label(kind, key) { return LABELS[lang][kind]?.[key] ?? LABELS.zh[kind]?
 function number(value) { return Number(value || 0).toLocaleString(lang === "zh" ? "zh-CN" : "en-US"); }
 function filterLabel(key) {
   if (key === "all") return t("all");
-  if (key === "addin") return t("addin");
   return key.startsWith("addin_") ? label("origin", key.slice(6)) : label("category", key);
 }
 function rangeText(start, end) {
@@ -229,6 +242,7 @@ async function api(path, params = {}, signal) {
 function empty(target, message, error = false) {
   $(target).replaceChildren(element("div", "empty" + (error ? " error-text" : ""), message));
 }
+// The Add-in category or one of its origins (paragraph view only).
 function isAddin(category) { return category === "addin" || category.startsWith("addin_"); }
 
 // ---- Workspace: Revit versions > sessions > files --------------------------
@@ -330,7 +344,12 @@ function renderStatus() {
     : (ready === state.files.length ? t("status.ready", {count: ready}) : t("status.indexing", {ready, total: state.files.length})) + (failed ? t("status.failed", {count: failed}) : "");
 }
 
-// ---- Categories, with add-in origins under one Add-in filter -----------------
+// ---- Categories, with add-in origins under the Add-in category ---------------
+// A chip, a pill or a column menu entry: the list of that category (or add-in origin).
+function chooseCategory(key) {
+  if (!isAddin(key)) state.kinds = [];  // leaving the Add-in views drops the kinds filter
+  state.category = key; state.cursors = [0]; renderCategories(); renderView(); loadList();
+}
 function renderCategories() {
   const file = currentFile(), blocks = state.view === "blocks";
   const counts = (blocks ? file?.block_counts : file?.counts) || {};
@@ -338,43 +357,45 @@ function renderCategories() {
   const chip = (key, count, active, onClick, className = "category") => {
     const button = element("button", className + (active ? " active" : ""));
     button.type = "button"; button.dataset.key = key; button.id = "cat-" + key;
-    button.style.setProperty("--dot", `var(--c-${isAddin(key) ? "api" : key})`);
+    button.style.setProperty("--dot", `var(--c-${isAddin(key) ? "addin" : key})`);
     button.setAttribute("aria-pressed", String(active));
     button.append(document.createTextNode(filterLabel(key)), element("span", "count", number(count)));
     button.addEventListener("click", onClick);
     return button;
   };
-  const choose = key => () => {state.category = key; state.cursors = [0]; renderCategories(); renderView(); loadList();};
+  const choose = key => () => chooseCategory(key);
   fragment.append(chip("all", blocks ? file?.block_count : file?.line_count, state.category === "all", choose("all")));
-  for (const key of CATEGORY_KEYS) fragment.append(chip(key, counts[key], state.category === key, choose(key)));
-  if (blocks && (counts.addin || isAddin(state.category))) {
-    fragment.append(chip("addin", counts.addin, isAddin(state.category), choose("addin")));
-    if (isAddin(state.category)) {
-      // Origins of the add-in list: one filter, not three more categories.
-      const origins = element("span", "origin-filter");
-      origins.append(element("span", "origin-label", t("origin")));
-      for (const key of ["addin", ...ORIGINS]) {
-        if (key !== "addin" && !counts[key] && state.category !== key) continue;
-        const pill = chip(key, counts[key], state.category === key, choose(key), "origin-pill");
-        if (key === "addin") pill.firstChild.textContent = t("all");
-        origins.append(pill);
-      }
-      fragment.append(origins);
+  // An origin is a sub-filter of the Add-in category: that chip stays active.
+  for (const key of CATEGORY_KEYS) fragment.append(chip(key, counts[key], key === "addin" ? isAddin(state.category) : state.category === key, choose(key)));
+  if (blocks && isAddin(state.category)) {
+    // Origins of add-in loading records (failed loads, i.e. API errors, included): one filter, not three more categories.
+    const origins = element("span", "origin-filter");
+    origins.append(element("span", "origin-label", t("origin")));
+    for (const key of ["addin", ...ORIGINS]) {
+      if (key !== "addin" && !counts[key] && state.category !== key) continue;
+      const pill = chip(key, counts[key], state.category === key, choose(key), "origin-pill");
+      if (key === "addin") pill.firstChild.textContent = t("all");
+      origins.append(pill);
     }
+    fragment.append(origins);
   }
   $("categories").replaceChildren(fragment);
 }
 function renderView() {
   // All-files hits are lines, whatever the view: phase and folding do not apply to them.
+  // Add-in paragraphs are records with an origin, a kind and a name (failed loads included under an origin).
   const all = state.scope === "all", blocks = state.view === "blocks", lines = all || !blocks, addins = !lines && isAddin(state.category);
   $("view-blocks").setAttribute("aria-pressed", String(blocks));
   $("view-lines").setAttribute("aria-pressed", String(!blocks));
   $("scope-file").setAttribute("aria-pressed", String(!all));
   $("scope-all").setAttribute("aria-pressed", String(all));
   $("phase-wrap").hidden = lines; $("fold-wrap").hidden = lines;
+  closeMenu();
   $("col-line").textContent = lines ? t("col.line") : t("col.first");
-  $("col-category").textContent = addins ? t("col.origin") : t("col.category");
-  $("col-text").textContent = addins ? t("col.addin") : lines ? t("col.text") : t("col.block");
+  columnButton($("col-category"), addins ? t("col.origin") : t("col.category"), addins ? originMenu : categoryMenu,
+    addins ? state.category !== "addin" : !all && state.category !== "all");
+  columnButton($("col-text"), addins ? t("col.addin") + (state.kinds.length ? " · " + t("col.kinds", {count: state.kinds.length}) : "")
+    : lines ? t("col.text") : t("col.block"), addins ? kindMenu : null, state.kinds.length > 0);
   $("search").placeholder = all ? t("search.all") : blocks ? t("search.blocks") : t("search.lines");
   $("search").setAttribute("aria-label", all ? t("search.all") : t("search.label"));
 }
@@ -387,6 +408,7 @@ function setScope(scope) {
 function setView(view) {
   if (state.view === view) return;
   state.view = view; state.cursors = [0];
+  if (view === "lines") state.kinds = [];  // no Add-in rows in the line view
   if (view === "lines" && !CATEGORY_KEYS.includes(state.category)) state.category = "all";
   renderView(); renderCategories(); resetInspector(); loadList();
 }
@@ -409,17 +431,18 @@ function resetInspector() {
 }
 function selectFile(id) {
   // A file picked on the left, or a hit opened from all files, is listed on its own (same search).
-  if (state.scope !== "file") {state.scope = "file"; renderView();}
+  if (id !== state.file) state.kinds = [];  // kinds and their counts belong to one file
+  state.scope = "file"; renderView();
   state.file = id; state.cursors = [0]; state.autoSelect = true;
   resetInspector(); renderFiles(); renderOverview(); loadList(); loadSession();
 }
 function resetWorkspace() {
   // Another set of inputs replaced the workspace: forget the previous files.
   state.files = []; state.file = null; state.readyCount = -1; state.cursors = [0]; state.loaded = false;
-  state.scope = "file"; state.shown = null; renderView();
+  state.scope = "file"; state.shown = null; state.kinds = []; renderView();
   listController?.abort(); sessionController?.abort();
   $("file-title").textContent = t("select.title"); $("file-path").textContent = t("select.hint");
-  $("crumb-file").textContent = t("file.none"); $("session-label").textContent = "";
+  $("crumb-file").textContent = t("file.none"); $("session-label").textContent = ""; $("show-session").title = "";
   for (const id of ["metric-lines", "metric-errors", "metric-api", "metric-operations"]) $(id).textContent = "—";
   $("show-session").disabled = true; $("categories").replaceChildren(); $("page-info").textContent = "";
   resetInspector(); empty("rows", t("files.loading")); renderFiles(); notice();
@@ -429,9 +452,10 @@ async function loadSession() {
   try {
     const data = await api("/api/session", {file: id}, sessionController.signal);
     if (id !== state.file) return;
-    $("session-label").textContent = data.label; $("session-label").title = data.label;
+    // The button repeats the label: a low window shows the overview without it.
+    $("session-label").textContent = data.label; $("session-label").title = data.label; $("show-session").title = data.label;
     $("show-session").disabled = false;
-  } catch (error) { if (error.name !== "AbortError" && id === state.file) {$("session-label").textContent = ""; $("show-session").disabled = true;} }
+  } catch (error) { if (error.name !== "AbortError" && id === state.file) {$("session-label").textContent = ""; $("show-session").title = ""; $("show-session").disabled = true;} }
 }
 function fillPhases(phases) {
   if ($("phase").options.length > 1) return;
@@ -522,7 +546,8 @@ function hitGroup(file) {
   return head;
 }
 function blockLabel(item) {
-  return item.addin_origin ? `${t("addin")} · ${label("origin", item.addin_origin)}` : label("category", item.category);
+  return item.addin_origin ? `${t("addin")} · ${label("kind", item.addin_kind || "load")} · ${label("origin", item.addin_origin)}`
+    : label("category", item.category);
 }
 function blockRow(item) {
   const row = element("button", "log-row" + (item.start_line === state.selected ? " selected" : ""));
@@ -530,9 +555,12 @@ function blockRow(item) {
   row.append(element("span", "line-no", number(item.start_line)));
   const tag = element("span"), text = element("span", "log-text"), body = element("span");
   if (item.addin_origin) {
-    // An add-in load: origin and name; the record kind only when it is an error.
+    // An add-in record: origin, kind and name; the category only when it is an error.
+    // Unnamed records other than loads show their title instead.
+    const kind = item.addin_kind || "load", name = item.addin_name || item.addin_class;
     tag.append(element("span", "badge origin-" + item.addin_origin, label("origin", item.addin_origin)));
-    highlight(body, item.addin_name || item.addin_class || t("addin.unnamed")); text.append(body);
+    text.append(element("span", "badge kind", label("kind", kind)));
+    highlight(body, name || (kind !== "load" && item.title) || t("addin.unnamed")); text.append(body);
     if (["error", "api_error", "warning"].includes(item.category)) text.append(badge(item.category));
     if (item.addin_identity_truncated) text.append(element("span", "phase-tag", t("addin.truncated")));
   } else {
@@ -551,7 +579,7 @@ function blockRow(item) {
 }
 // Which list the rows show: a query the server rejects keeps the rows of the same list.
 function listKey() {
-  return state.scope === "all" ? "all|" + state.category : [state.file, state.view, state.category, state.phase, state.fold].join("|");
+  return state.scope === "all" ? "all|" + state.category : [state.file, state.view, state.category, state.phase, state.fold, state.kinds].join("|");
 }
 function listFailed(error) {
   notice(error.message);
@@ -577,7 +605,9 @@ async function loadList() {
   $("rows").classList.add("loading");
   try {
     const params = {file: state.file, category: state.category, q: state.query, after: state.cursors.at(-1), limit: 100};
-    const data = blocks ? await api("/api/blocks", {...params, phase: state.phase, fold: state.fold ? 1 : 0}, listController.signal)
+    const paragraphs = {phase: state.phase, fold: state.fold ? 1 : 0};
+    if (isAddin(state.category) && state.kinds.length) paragraphs.kinds = state.kinds.join(",");  // Add-in views only
+    const data = blocks ? await api("/api/blocks", {...params, ...paragraphs}, listController.signal)
                         : await api("/api/events", params, listController.signal);
     if (sequence !== state.sequence) return;
     state.hasMore = data.has_more; state.next = data.next_after; state.terms = data.terms || [];
@@ -604,7 +634,7 @@ async function loadList() {
 // All files: one search over every ready file (/api/search), up to 3 hits per file.
 async function loadWorkspace() {
   const sequence = ++state.sequence; listController?.abort(); listController = new AbortController();
-  // Hits are lines: a paragraph-only filter (Add-in) searches every category.
+  // Hits are lines: a paragraph-only filter (an add-in origin) searches every category.
   const category = CATEGORY_KEYS.includes(state.category) ? state.category : "all";
   $("record-heading").textContent = t("heading.all") + (category === "all" ? "" : " · " + filterLabel(category));
   $("previous").disabled = true; $("next").disabled = true; state.hasMore = false; $("page-info").title = "";
@@ -629,6 +659,123 @@ async function loadWorkspace() {
     state.shown = listKey();
   } catch (error) { if (error.name !== "AbortError" && sequence === state.sequence) listFailed(error); }
   finally { if (sequence === state.sequence) $("rows").classList.remove("loading"); }
+}
+
+// ---- Column menus: the values of a column under its header --------------------
+// Category column: the categories as on the chips, or in the Add-in views the origins as on
+// the pills (one choice); text column in the Add-in views: the kinds of add-in records (several).
+const columnMenus = {};
+const menu = {anchor: null, node: null};
+function columnButton(button, text, build, filtered) {
+  columnMenus[button.id] = build;
+  button.textContent = text; button.disabled = !build;
+  button.classList.toggle("filtered", Boolean(build && filtered));
+  if (build) {button.setAttribute("aria-haspopup", "menu"); button.title = t("col.menu");}
+  else {button.removeAttribute("aria-haspopup"); button.removeAttribute("title");}
+}
+function closeMenu(focus = false) {
+  if (!menu.node) return;
+  const {anchor, node} = menu;
+  menu.anchor = menu.node = null;
+  node.remove(); anchor.setAttribute("aria-expanded", "false"); anchor.removeAttribute("aria-controls");
+  if (focus && !anchor.disabled) anchor.focus();
+}
+function toggleMenu(anchor) {
+  const open = menu.anchor === anchor, build = columnMenus[anchor.id];
+  closeMenu();
+  if (open || !build) return;  // a second click on the header closes its menu
+  const node = element("div", "col-menu"), list = element("div", "menu-list");
+  node.id = anchor.id + "-menu"; node.tabIndex = -1; node.setAttribute("role", "menu");
+  list.setAttribute("role", "group"); node.append(list);
+  build(node, list);
+  document.body.append(node);
+  // Under the header, inside the window; a long list scrolls inside the menu.
+  const box = anchor.getBoundingClientRect();
+  node.style.top = Math.round(box.bottom + 4) + "px";
+  node.style.maxHeight = Math.max(160, innerHeight - box.bottom - 14) + "px";
+  node.style.left = Math.round(Math.max(8, Math.min(box.left - 4, innerWidth - node.offsetWidth - 8))) + "px";
+  anchor.setAttribute("aria-expanded", "true"); anchor.setAttribute("aria-controls", node.id);
+  menu.anchor = anchor; menu.node = node;
+  node.addEventListener("keydown", menuKeys);
+  // Tabbing out of the menu closes it, as a click outside does.
+  node.addEventListener("focusout", event => {
+    if (menu.node === node && !node.contains(event.relatedTarget) && event.relatedTarget !== anchor) closeMenu();
+  });
+  (list.querySelector('[aria-checked="true"]') || list.firstChild)?.focus();
+}
+function menuKeys(event) {
+  // Tab leaves the menu from its header, so focus moves on to the header's neighbours.
+  if (event.key === "Tab") {closeMenu(true); return;}
+  const items = [...menu.node.querySelectorAll('[role^="menuitem"]:not(:disabled)')];
+  const at = items.indexOf(document.activeElement);
+  const next = {ArrowDown: items[(at + 1) % items.length], ArrowUp: at > 0 ? items[at - 1] : items.at(-1), Home: items[0], End: items.at(-1)}[event.key];
+  if (next) {event.preventDefault(); next.focus();}
+}
+function menuItem(role, text, count, checked, dot) {
+  const item = element("button", "menu-item" + (count === 0 ? " zero" : ""));
+  item.type = "button"; item.setAttribute("role", role); item.setAttribute("aria-checked", String(checked));
+  const mark = element("span", "menu-mark"); mark.setAttribute("aria-hidden", "true");
+  item.append(mark);
+  if (dot) {const swatch = element("span", "menu-dot"); swatch.style.setProperty("--dot", dot); item.append(swatch);}
+  item.append(element("span", "menu-label", text));
+  if (count !== undefined) item.append(element("span", "count", number(count)));
+  return item;
+}
+// One choice, as on the chips and pills: choosing closes the menu and lists that category.
+function choiceItem(key, text, count, current, dot) {
+  const item = menuItem("menuitemradio", text, count, key === current, dot);
+  item.addEventListener("click", () => {closeMenu(true); chooseCategory(key);});
+  return item;
+}
+function categoryMenu(node, list) {
+  // Counts of this file as on the chips; all-files hits are counted by the search itself.
+  const file = currentFile(), blocks = state.view === "blocks", all = state.scope === "all";
+  const counts = (blocks ? file?.block_counts : file?.counts) || {};
+  const current = all && !CATEGORY_KEYS.includes(state.category) ? "all" : state.category;
+  node.setAttribute("aria-label", t("menu.category"));
+  list.append(choiceItem("all", t("all"), all ? undefined : (blocks ? file?.block_count : file?.line_count) || 0, current));
+  for (const key of CATEGORY_KEYS) list.append(choiceItem(key, label("category", key), all ? undefined : counts[key] || 0, current, `var(--c-${key})`));
+}
+function originMenu(node, list) {
+  const counts = currentFile()?.block_counts || {};
+  node.setAttribute("aria-label", t("menu.origin"));
+  for (const key of ["addin", ...ORIGINS]) {
+    list.append(choiceItem(key, key === "addin" ? t("all") : filterLabel(key), counts[key] || 0, state.category, ORIGIN_COLORS[key]));
+  }
+}
+function kindMenu(node, list) {
+  // Several kinds at once; nothing filtered shows every kind checked. Applied by the apply button only.
+  const counts = currentFile()?.block_counts || {}, chosen = new Set(state.kinds.length ? state.kinds : KIND_KEYS);
+  node.setAttribute("aria-label", t("menu.kinds"));
+  const items = KIND_KEYS.map(kind => {
+    const item = menuItem("menuitemcheckbox", label("kind", kind), counts["kind_" + kind] || 0, chosen.has(kind));
+    item.dataset.kind = kind;
+    item.addEventListener("click", () => {item.setAttribute("aria-checked", String(item.getAttribute("aria-checked") !== "true")); update();});
+    return item;
+  });
+  list.append(...items);
+  const foot = element("div", "menu-foot");
+  foot.setAttribute("role", "group");
+  const action = (key, className = "") => {
+    const button = element("button", "button small" + className, t(key));
+    button.type = "button"; button.setAttribute("role", "menuitem"); foot.append(button);
+    return button;
+  };
+  const every = action("menu.all"), none = action("menu.none"), apply = action("menu.apply", " primary");
+  const checked = () => items.filter(item => item.getAttribute("aria-checked") === "true").map(item => item.dataset.kind);
+  const update = () => {apply.disabled = !checked().length;};
+  every.addEventListener("click", () => {for (const item of items) item.setAttribute("aria-checked", "true"); update();});
+  none.addEventListener("click", () => {for (const item of items) item.setAttribute("aria-checked", "false"); update();});
+  apply.addEventListener("click", () => {
+    const kinds = checked();
+    closeMenu(true);
+    setKinds(kinds.length === KIND_KEYS.length ? [] : kinds);  // every kind checked: no filter
+  });
+  node.append(foot); update();
+}
+function setKinds(kinds) {
+  if (kinds.join(",") === state.kinds.join(",")) return;
+  state.kinds = kinds; state.cursors = [0]; renderView(); loadList();
 }
 
 // ---- Detail ------------------------------------------------------------------
@@ -881,6 +1028,13 @@ $("scope-all").addEventListener("click", () => setScope("all"));
 $("phase").addEventListener("change", () => {state.phase = $("phase").value; state.cursors = [0]; loadList();});
 $("fold").addEventListener("change", () => {state.fold = $("fold").checked; state.cursors = [0]; loadList();});
 $("show-session").addEventListener("click", showSession);
+for (const id of ["col-category", "col-text"]) $(id).addEventListener("click", () => toggleMenu($(id)));
+// A column menu closes on a click outside it, Escape (focus back on its header) or a resize.
+document.addEventListener("pointerdown", event => {
+  if (menu.node && !menu.node.contains(event.target) && !menu.anchor.contains(event.target)) closeMenu();
+}, true);
+document.addEventListener("keydown", event => {if (event.key === "Escape" && menu.node) {event.preventDefault(); closeMenu(true);}});
+window.addEventListener("resize", () => closeMenu());
 $("copy-position").addEventListener("click", () => copy(`${currentFile().path}:${state.selected}`, $("copy-position"), "copy.position"));
 $("copy-text").addEventListener("click", () => {
   const rows = [...$("context").querySelectorAll(".context-line")];

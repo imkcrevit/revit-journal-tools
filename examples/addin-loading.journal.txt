@@ -12,4 +12,7 @@
 'Synthetic initialization failure }
 ' 0:< API_SUCCESS { Starting External Application: Synthetic Unknown Addin,
 'Assembly: Autodesk.Synthetic.Unknown.dll }
-' 0:< API_SUCCESS { Registered an external service: Synthetic, VendorId(ADSK) }
+' 0:< API_SUCCESS { Registered an external service: Name(Synthetic Service); VendorId(ADSK); ServiceId(00000000-0000-0000-0000-00000000000a) }
+' 0:< API_SUCCESS { Registered an external server: Name(Synthetic Server); VendorId(USERADDIN); ServerId(00000000-0000-0000-0000-00000000000b); ServiceId(00000000-0000-0000-0000-00000000000a) }
+ 'E 01-Oct-2026 10:00:00.002;   0:<
+ ' [Jrn.RegisterExternalServer] Rvt.Attr.ExternalServer: 00000000-0000-0000-0000-00000000000b Rvt.Attr.ExternalService: 00000000-0000-0000-0000-00000000000a

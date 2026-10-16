@@ -59,6 +59,11 @@ def _labelled(block: dict) -> dict:
     return {**block, "label": block_label(block), "summary": block_summary(block)}
 
 
+def _kinds(text: str) -> tuple[str, ...]:
+    """kinds=service,server: add-in record kinds (ViewerIndex.blocks checks them); empty: every kind."""
+    return tuple(item.strip() for item in text.split(",") if item.strip())
+
+
 def _flag(text: str) -> bool:
     if text not in ("0", "1"):
         raise ValueError("fold必须为0或1")
@@ -117,7 +122,8 @@ def make_server(index: ViewerIndex, port: int = 8765) -> ThreadingHTTPServer:
                 elif route.path == "/api/blocks":
                     result = index.blocks(file_id, value("category", "all"), value("q", ""),
                                           int(value("after", "0")), int(value("limit", "100")),
-                                          phase=value("phase", "all"), fold=_flag(value("fold", "1")))
+                                          phase=value("phase", "all"), fold=_flag(value("fold", "1")),
+                                          kinds=_kinds(value("kinds", "")))
                     result["items"] = [_labelled(item) for item in result["items"]]
                 elif route.path == "/api/block":
                     result = index.block_lines(file_id, int(value("start", "1")), int(value("offset", "0")),

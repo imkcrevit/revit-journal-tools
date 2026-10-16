@@ -32,8 +32,8 @@ class CategoryTests(unittest.TestCase):
         samples = [
             ("'C 04-Oct-2026 21:56:04; started recording journal file", "startup"),
             ("' Build: synthetic", "startup"),
-            ("' 0:< Initial VM: Avail 100 MB", "system"),
-            ("' 0:< OSLanguage : 1033", "system"),
+            ("' 0:< Initial VM: Avail 100 MB", "startup"),  # no user action yet: start-up
+            ("' 0:< OSLanguage : 1033", "startup"),
             ("DBG_ERROR: Synthetic error", "error"),
             ("Access violation", "error"),
             ("E_OUTOFMEMORY", "error"),
@@ -41,7 +41,7 @@ class CategoryTests(unittest.TestCase):
             ("Jrn.Command \"Synthetic open\"", "operation"),
             ("DBG_WARN: Synthetic warning", "warning"),
             ("API_SUCCESS { Registered synthetic event }", "api"),
-            ("ordinary message", "other"),
+            ("ordinary message", "startup"),
         ]
         for text, category in samples:
             with self.subTest(text=text):
@@ -50,7 +50,7 @@ class CategoryTests(unittest.TestCase):
     def test_api_error_and_operation_continuations(self):
         parser = Categorizer(load_rules())
         lines = ["API_ERROR { : conflict", "'Addin's module Example conflicts", "'Last module }", "normal", "Jrn.Data _", ' "File Name", "Example.rvt"', "normal"]
-        self.assertEqual([parser.classify(line)[0] for line in lines], ["api_error", "api_error", "api_error", "other", "operation", "operation", "other"])
+        self.assertEqual([parser.classify(line)[0] for line in lines], ["api_error", "api_error", "api_error", "startup", "operation", "operation", "startup"])
 
     def test_unclosed_api_block_stops_at_next_api_event(self):
         parser = Categorizer(load_rules())
@@ -220,7 +220,7 @@ class IndexTests(unittest.TestCase):
             self.assertEqual(error("/api/search", q=" "), (400, EMPTY_QUERY))
             self.assertEqual(error("/api/search", q=" ", lang="en"), (400, "Enter a search term"))
             self.assertEqual(error("/api/search", q="x", per_file=21)[0], 400)
-            self.assertEqual(error("/api/search", q="x", category="addin", lang="en"), (400, "Unknown category"))
+            self.assertEqual(error("/api/search", q="x", category="addin_autodesk", lang="en"), (400, "Unknown category"))
             # The CJK hint in the page's language.
             self.assertEqual(get("/api/search", q="错误")["hint"], CJK_HINT)
             self.assertEqual(get("/api/blocks", file=self.file_id, q="错误", lang="en")["hint"], error_text(CJK_HINT, "en"))
@@ -229,6 +229,171 @@ class IndexTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+# Synthetic: start-up, two add-in loads (one failed), an add-in record, one
+# user action, a memory sample in the session and the shutdown records.
+STAGED_JOURNAL = [
+    "'C 01-Oct-2026 10:00:00.000; started recording journal file",
+    "' Build: synthetic",
+    "' 0:< Initial VM: Avail 100 MB, Used 10 MB",
+    "' 0:< API_SUCCESS { Starting External Application: Synthetic Tool, Class: Synthetic.Tool, Vendor: ADSK() }",
+    "' 0:< API_ERROR { Starting External Application: Broken Tool, Class: Broken.Tool, Vendor: DEMO() }",
+    "' 0:< [Jrn.AddInManifest] Rvt.Attr.AddInType: ExternalDBApplication",
+    'Jrn.Command "Ribbon" , "Synthetic command , ID_SYNTHETIC"',
+    "' 0:< Delta VM: Avail 90 MB, Used 20 MB",
+    "'C 01-Oct-2026 10:05:00.000; ->desktop ExitManagedInstance",
+    "' 0:< Delta VM: Avail 80 MB, Used 30 MB",
+    "'C 01-Oct-2026 10:05:01.000; finished recording journal file",
+]
+
+
+class ServedJournal(unittest.TestCase):
+    """One synthetic journal (JOURNAL) indexed and served on a free loopback port."""
+
+    JOURNAL: list[str] = []
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        path = root / "journal.0001.txt"
+        path.write_text("\n".join(self.JOURNAL) + "\n", encoding="utf-8")
+        self.index = ViewerIndex(root / "viewer.sqlite3")
+        queued = self.index.register([path], "auto")
+        self.index.build(queued, "auto")
+        self.file_id = queued[0]
+        server = make_server(self.index, 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback, no system proxy
+        self.base = f"http://127.0.0.1:{server.server_port}"
+
+    def get(self, path, **params):
+        with self.opener.open(self.base + path + "?" + urllib.parse.urlencode(params)) as response:
+            return json.load(response)
+
+    def status(self, path, **params):
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.opener.open(self.base + path + "?" + urllib.parse.urlencode(params))
+        with raised.exception:
+            return raised.exception.code
+
+    def lines(self, path, **params):
+        return [item["line_number"] for item in self.get(path, file=self.file_id, **params)["items"]]
+
+
+class CategoryHttpTests(ServedJournal):
+    """The Add-in and exit categories through /api/files, /api/events, /api/blocks and /api/search."""
+
+    JOURNAL = STAGED_JOURNAL
+
+    def test_files_list_the_new_categories_and_only_origins_as_extra_filters(self):
+        files = self.get("/api/files")
+        order = ["startup", "addin", "exit", "error", "api_error", "operation", "warning", "api", "dialog", "other"]
+        self.assertEqual(list(files["categories"]), order)
+        self.assertEqual(files["categories"]["addin"], "Add-in")
+        # Add-in is a category; the origins are the only paragraph-only filters.
+        self.assertEqual(list(files["block_filters"]),
+                         [*order, "addin_autodesk", "addin_third_party", "addin_unknown"])
+        self.assertEqual(files["block_filters"]["addin"], "Add-in")
+        self.assertEqual(files["block_filters"]["exit"], "退出")
+        file = files["files"][0]
+        self.assertNotIn("system", file["counts"])
+        self.assertEqual((file["counts"]["addin"], file["counts"]["exit"]), (2, 3))
+        # The failed load is an API error with its origin: the origins overlap the categories.
+        self.assertEqual((file["block_counts"]["addin_autodesk"], file["block_counts"]["addin_third_party"]), (1, 1))
+
+    def test_events_blocks_and_search_accept_addin_and_exit(self):
+        self.assertEqual(self.lines("/api/events", category="addin"), [4, 6])
+        self.assertEqual(self.lines("/api/events", category="exit"), [9, 10, 11])
+        self.assertEqual(self.lines("/api/events", category="startup"), [1, 2, 3])
+        self.assertEqual(self.lines("/api/events", category="other"), [8])
+        blocks = self.get("/api/blocks", file=self.file_id, category="addin")["items"]
+        self.assertEqual([item["start_line"] for item in blocks], [4, 6])
+        self.assertEqual(blocks[0]["addin_origin"], "autodesk")
+        self.assertEqual([item["start_line"] for item in self.get("/api/blocks", file=self.file_id,
+                                                                     category="addin_third_party")["items"]], [5])
+        # One memory sample per stage: before the first action, in the session, after shutdown.
+        for category, line in (("startup", 3), ("other", 8), ("exit", 10)):
+            with self.subTest(category=category):
+                found = self.get("/api/search", q="VM", category=category)
+                self.assertEqual([item["line_number"] for item in found["files"][0]["items"]], [line])
+        self.assertEqual(self.get("/api/search", q="Synthetic", category="addin")["total_lines"], 1)
+        self.assertEqual(self.get("/api/search", q="Delta", category="exit", lang="en")["total_lines"], 1)
+        # Origins are paragraph filters: not line categories.
+        self.assertEqual(self.status("/api/events", file=self.file_id, category="addin_autodesk"), 400)
+        self.assertEqual(self.status("/api/search", q="VM", category="addin_unknown"), 400)
+        self.assertEqual(self.status("/api/events", file=self.file_id, category="system"), 400)
+
+
+class KindFilterTests(ServedJournal):
+    """The kinds of add-in records: block_counts["kind_*"] and /api/blocks?kinds=
+    (the column menu of the web page) only in the Add-in views."""
+
+    # Synthetic: a load and a failed load, a service, a server registration, a
+    # third-party manifest, a server run, then an ordinary command.
+    JOURNAL = [
+        "' 0:< API_SUCCESS { Starting External Application: Synthetic Tool, Class: Synthetic.App, Vendor : ADSK() }",
+        "' 0:< API_ERROR { Starting External Application: Broken Tool, Class: Broken.App, Vendor : DEMO() }",
+        "' 0:< API_SUCCESS { Registered an external service: Name(Synthetic Helper Service); VendorId(ADSK) }",
+        "' 0:< API_SUCCESS { Registered an external server: Name(Synthetic Server); VendorId(ADSK); ServerId(1) }",
+        "' [Jrn.AddInManifest] Rvt.Attr.AddInName: Synthetic Partner Rvt.Attr.CommandVendorId: DEMO ",
+        "' [Jrn.ExternalServerExecution] Rvt.Attr.ExternalServerName: Synthetic Server ",
+        'Jrn.Command "Ribbon" , "Synthetic command , ID_SYNTHETIC"',
+    ]
+
+    def kinds(self, **params):
+        items = self.get("/api/blocks", **{"file": self.file_id, "fold": 0, **params})["items"]
+        return [(item["start_line"], item["addin_kind"]) for item in items]
+
+    def test_block_counts_count_every_kind_of_add_in_record(self):
+        file = self.get("/api/files")["files"][0]
+        counts = file["block_counts"]
+        # The failed load (an API error) has its kind too, as it has its origin.
+        self.assertEqual({key: value for key, value in counts.items() if key.startswith("kind_")},
+                         {"kind_load": 2, "kind_service": 1, "kind_server": 1, "kind_manifest": 1, "kind_server_run": 1})
+        self.assertEqual((counts["addin"], counts["api_error"], file["block_count"]), (5, 1, 7))
+
+    def test_kinds_keep_only_those_records_in_the_add_in_views(self):
+        self.assertEqual(self.kinds(category="addin", kinds="service,server"), [(3, "service"), (4, "server")])
+        self.assertEqual(self.kinds(category="addin", kinds="server,service"), [(3, "service"), (4, "server")])
+        self.assertEqual(self.kinds(category="addin", kinds=""),
+                         [(1, "load"), (3, "service"), (4, "server"), (5, "manifest"), (6, "server_run")])
+        # Origins combine with kinds; the failed load is listed under its origin.
+        self.assertEqual(self.kinds(category="addin_third_party", kinds="load"), [(2, "load")])
+        self.assertEqual(self.kinds(category="addin_third_party", kinds="manifest,service"), [(5, "manifest")])
+        self.assertEqual(self.kinds(category="addin_autodesk", kinds="load", fold=1), [(1, "load")])
+
+    def test_kinds_with_a_search_or_a_prefix(self):
+        found = self.get("/api/blocks", file=self.file_id, category="addin", kinds="server", q="Synthetic Server")
+        self.assertEqual([(item["start_line"], item["hit_line"]) for item in found["items"]], [(4, 4)])
+        self.assertEqual(found["hit_lines"], 2)  # matching lines of the file, as without kinds
+        listed = self.index.blocks(self.file_id, addin_prefix="Synthetic", kinds=("service", "manifest"))["items"]
+        self.assertEqual([item["start_line"] for item in listed], [3, 5])
+
+    def test_kinds_are_ignored_outside_the_add_in_views(self):
+        every = self.kinds(category="all")
+        self.assertEqual(len(every), 7)
+        self.assertEqual(self.kinds(category="all", kinds="service"), every)
+        self.assertEqual(self.kinds(category="api_error", kinds="service"), [(2, "load")])
+
+    def test_unknown_kinds_are_rejected(self):
+        for kinds in ("bogus", "service,bogus", "Service"):
+            with self.subTest(kinds=kinds):
+                self.assertEqual(self.status("/api/blocks", file=self.file_id, category="addin", kinds=kinds), 400)
+        # Checked in every view, not only where kinds apply.
+        self.assertEqual(self.status("/api/blocks", file=self.file_id, category="all", kinds="bogus"), 400)
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.opener.open(self.base + "/api/blocks?" + urllib.parse.urlencode(
+                {"file": self.file_id, "category": "addin", "kinds": "bogus", "lang": "en"}))
+        with raised.exception:
+            self.assertEqual(json.load(raised.exception)["error"], "Unknown add-in record kind")
+        with self.assertRaisesRegex(ValueError, "未知种类"):
+            self.index.blocks(self.file_id, "addin", kinds=("bogus",))
 
 
 @patch.object(viewer_index, "PARALLEL_MIN_BYTES", 0)
@@ -606,7 +771,8 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(self.index.events(self.file_id, "api_error", "gamma")["hit_lines"], 3)
         self.assertEqual(self.index.blocks(self.file_id, "api_error", "gamma")["hit_lines"], 3)
         self.assertEqual(self.index.events(self.file_id, "warning", "gamma")["hit_lines"], 0)
-        self.assertEqual(self.index.blocks(self.file_id, "addin", "gamma")["hit_lines"], 5)  # every matching line
+        self.assertEqual(self.index.blocks(self.file_id, "addin_third_party", "gamma")["hit_lines"], 5)  # every matching line
+        self.assertEqual(self.index.blocks(self.file_id, "addin", "gamma")["hit_lines"], 1)  # a line category
         self.assertEqual(self.index.events(self.file_id, query="absent_word")["hit_lines"], 0)
 
     def test_block_hits_lists_matching_lines_inside_a_range(self):
@@ -671,7 +837,7 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(([file["name"] for file in older["files"]], older["total_lines"], older["skipped"]),
                          ([self.path.name], 5, 4))
 
-        for arguments in ({"per_file": 0}, {"per_file": 21}, {"category": "addin"}, {"query": "x" * 257}):
+        for arguments in ({"per_file": 0}, {"per_file": 21}, {"category": "addin_autodesk"}, {"query": "x" * 257}):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 self.index.search_workspace(**{"query": "gamma", **arguments})
         with self.assertRaisesRegex(ValueError, "请输入搜索词"):

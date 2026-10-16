@@ -198,10 +198,10 @@ class LoadingIndexTests(unittest.TestCase):
             browser.handle(key)
             self.assertEqual(browser.block["addin_origin"], origin)
             frame = browser.frame(100, 25, False)
-            self.assertIn("来源待定加载", frame)
+            self.assertIn("u来源待定", frame)
             self.assertLessEqual(len(frame.splitlines()), 25)
             self.assertTrue(all(cell_width(line) < 100 for line in frame.splitlines()))
-        browser.handle("4")
+        browser.handle("5")
         self.assertEqual(browser.block["category"], "api_error")
 
 

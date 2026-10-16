@@ -85,7 +85,11 @@
     <section class="panels" id="panels">
       <div class="records card">
         <div class="panel-heading"><strong id="record-heading"></strong><span id="query-time"></span></div>
-        <div class="column-head"><span id="col-line"></span><span id="col-category"></span><span id="col-text"></span></div>
+        <div class="column-head">
+          <span id="col-line"></span>
+          <button id="col-category" class="col-button" type="button" aria-haspopup="menu" aria-expanded="false" disabled></button>
+          <button id="col-text" class="col-button" type="button" aria-haspopup="menu" aria-expanded="false" disabled></button>
+        </div>
         <div id="rows" class="rows"><div class="empty" data-i18n="files.loading">正在读取文件列表…</div></div>
         <div class="pagination"><span id="page-info"></span><div><button id="previous" class="button small" type="button" disabled data-i18n="page.previous">← 上一页</button><button id="next" class="button small" type="button" disabled data-i18n="page.next">下一页 →</button></div></div>
       </div>

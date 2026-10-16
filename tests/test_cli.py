@@ -198,6 +198,75 @@ class CliTests(unittest.TestCase):
         self.assertIn("跳过1个未就绪或失败的文件", stdout)
         self.assertIn(f"索引失败：{bad.resolve()}", stdout)
 
+    def test_search_accepts_the_addin_and_exit_categories(self):
+        journal = self.root / "journal.0001.txt"
+        journal.write_text("' Build: synthetic\n"
+                           "' 0:< API_SUCCESS { Starting External Application: Synthetic Tool, Class: Synthetic.Tool, "
+                           "Vendor: ADSK() }\n"
+                           'Jrn.Command "Ribbon" , "Synthetic command , ID_SYNTHETIC"\n'
+                           "'C 01-Oct-2026 10:05:00.000; ->desktop ExitManagedInstance\n"
+                           "' 0:< Synthetic shutdown note\n", encoding="utf-8")
+        database = self.root / "search.sqlite3"
+        for category, line in (("startup", 1), ("addin", 2), ("operation", 3), ("exit", 5)):
+            with self.subTest(category=category):
+                code, stdout, stderr = self.run_cli("search", "synthetic", journal, "--database", database,
+                                                    "--category", category, "--format", "json")
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual([item["line_number"] for item in json.loads(stdout)["files"][0]["items"]], [line])
+        # Add-in origins are paragraph filters of browse, not line categories.
+        for category in ("addin_autodesk", "system"):
+            with self.subTest(category=category), self.assertRaises(SystemExit):
+                self.run_cli("search", "synthetic", journal, "--database", database, "--category", category)
+
+    def test_browse_kind_lists_only_those_add_in_records(self):
+        journal = self.root / "journal.0001.txt"
+        journal.write_text(
+            "' 0:< API_SUCCESS { Registered an external service: Name(Synthetic Helper Service); VendorId(ADSK) }\n"
+            "' 0:< API_SUCCESS { Registered an external server: Name(Synthetic Server); VendorId(ADSK); ServerId(1) }\n"
+            "' [Jrn.AddInManifest] Rvt.Attr.AddInName: Synthetic Partner Rvt.Attr.CommandVendorId: DEMO \n"
+            'Jrn.Command "Ribbon" , "Synthetic command , ID_SYNTHETIC"\n', encoding="utf-8")
+        database = self.root / "kinds.sqlite3"
+        code, stdout, stderr = self.run_cli("browse", journal, "--database", database, "--category", "addin",
+                                            "--kind", "service", "--kind", "server", "--format", "json")
+        self.assertEqual(code, 0, stderr)
+        file = json.loads(stdout)["files"][0]
+        self.assertEqual(file["kinds"], ["service", "server"])
+        self.assertEqual([item["addin_kind"] for item in file["items"]], ["service", "server"])
+        self.assertEqual(file["addin_count"], 3)  # the file's counts stay unfiltered
+        code, stdout, stderr = self.run_cli("browse", journal, "--database", database, "--category", "addin_third_party",
+                                            "--kind", "manifest", "--print")
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("名称/Class前缀: 不限 | 种类: 清单", stdout)
+        self.assertIn("Synthetic Partner [清单] [第三方]", stdout)
+        self.assertNotIn("Synthetic Server", stdout)
+        # Outside the Add-in views the kinds are not applied, and the user is told so.
+        code, stdout, stderr = self.run_cli("browse", journal, "--database", database, "--kind", "service",
+                                            "--format", "json")
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("--kind只在addin分类", stderr)
+        self.assertEqual(len(json.loads(stdout)["files"][0]["items"]), 4)
+        with self.assertRaises(SystemExit):
+            self.run_cli("browse", journal, "--database", database, "--kind", "bogus")
+
+    def test_browser_keeps_the_kinds_of_browse_kind(self):
+        from revit_journal_tools.terminal import Browser
+        from revit_journal_tools.viewer_index import ViewerIndex
+
+        journal = self.root / "journal.0001.txt"
+        journal.write_text(
+            "' 0:< API_SUCCESS { Registered an external service: Name(Synthetic Helper Service); VendorId(ADSK) }\n"
+            "' 0:< API_SUCCESS { Registered an external server: Name(Synthetic Server); VendorId(ADSK); ServerId(1) }\n",
+            encoding="utf-8")
+        index = ViewerIndex(self.root / "browser.sqlite3")
+        index.build(index.register([journal], "auto"), "auto")
+        browser = Browser(index, category="addin", kinds=("server",))
+        frame = browser.frame(120, 25, False)
+        self.assertIn("名称/Class前缀: 不限 | 种类: 服务器 | v修改前缀", frame)
+        self.assertIn("Synthetic Server [服务器] [Autodesk]", frame)
+        self.assertNotIn("Synthetic Helper Service", frame)
+        browser.handle("0")  # all categories: the kinds do not apply there
+        self.assertEqual(len(browser.items), 2)
+
     def test_search_rejects_punctuation_only_query_before_indexing(self):
         database = self.root / "search.sqlite3"
         code, stdout, stderr = self.run_cli("search", "}", self.journal, "--database", database)

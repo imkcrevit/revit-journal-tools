@@ -193,7 +193,9 @@ class SessionCollector:
             elif block.category == "dialog":
                 self.dialog_blocks.append({"start_line": block.start_line, "end_line": block.end_line,
                                            "text": block.title[:_TEXT]})
-            if block.addin_origin:
+            # Loading records only (failed loads included); services, manifests
+            # and the other add-in records are not loads.
+            if block.addin_origin and block.addin_kind == "load":
                 self.addins[block.addin_origin] += 1
                 name = block.addin_name or block.addin_class or ""
                 if block.addin_origin == "third_party" and name and len(self.third_party) < 200:

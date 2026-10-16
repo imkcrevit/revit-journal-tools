@@ -13,14 +13,17 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .blocks import PHASES
-from .loading import ADDIN_FILTERS, ADDIN_KEYS, BLOCK_FILTERS, block_label, block_summary
+from .loading import ADDIN_FILTERS, ADDIN_KEYS, ADDIN_KINDS, BLOCK_FILTERS, block_label, block_summary
 from .session_view import (duration_text, file_date, main_tail, phase_label, session_label, sidecar_label,
                            state_text, summary_lines)
 from .reader import basis_label
 from .viewer_index import EMPTY_QUERY, ViewerIndex, parse_query
 
-COLORS = {"startup": 34, "system": 36, "error": 31, "api_error": 35,
-          "operation": 32, "warning": 33, "api": 34, "other": 90, "dialog": 96}
+# SGR codes per category: start-up blue (shared with API activity), exit bright
+# blue, add-in cyan. "heading" (bold, default color) marks list headers; it is
+# not a category.
+COLORS = {"startup": 34, "addin": 36, "exit": 94, "error": 31, "api_error": 35,
+          "operation": 32, "warning": 33, "api": 34, "dialog": 96, "other": 90, "heading": 1}
 PHASE_CYCLE = ["all", *PHASES]
 PROMPTS = {"search": "搜索关键词: ", "workspace": "全部文件搜索关键词: ", "goto": "跳到原始行: ",
            "prefix": "名称/Class前缀: "}
@@ -81,6 +84,18 @@ def live_label(file: dict) -> str:
     if file.get("live"):
         return " [实时快照]"
     return ""
+
+
+def addin_counts(counts: dict) -> str:
+    """Add-in blocks (the addin category) and the origins of add-in records,
+    which include failed loads (API errors) and so overlap other categories."""
+    return (f"当前日志Add-in: {counts.get('addin', 0)}块 | 来源: Autodesk {counts.get('addin_autodesk', 0)} / "
+            f"第三方{counts.get('addin_third_party', 0)} / 来源待定{counts.get('addin_unknown', 0)}")
+
+
+def kind_label(kinds) -> str:
+    """browse --kind in the add-in header line ("" without kinds)."""
+    return " | 种类: " + "、".join(ADDIN_KINDS[kind] for kind in kinds) if kinds else ""
 
 
 def colored(text: str, category: str, enabled: bool, selected: bool = False) -> str:
@@ -179,12 +194,14 @@ def keyboard():
 
 class Browser:
     def __init__(self, index: ViewerIndex, category="all", query="", page_size=100, after=0, addin_prefix="",
-                 phase="all", fold=True):
+                 phase="all", fold=True, kinds=()):
         self.index = index
         self.category, self.query, self.page_size, self.after = category, query, page_size, after
+        # A prefix lists add-in records with an origin only (ViewerIndex.blocks);
+        # the category stays, since failed loads are API errors, not the addin category.
         self.addin_prefix = addin_prefix.strip()
-        if self.addin_prefix and self.category == "all":
-            self.category = "addin"
+        # browse --kind: add-in record kinds kept in the add-in views (no key changes them).
+        self.kinds = tuple(kinds)
         self.phase, self.fold = phase, fold
         self.view = "blocks"  # blocks | summary | tail | workspace
         self.sessions: list[dict] = []
@@ -277,7 +294,7 @@ class Browser:
                 try:
                     result = self.index.blocks(self.file["id"], self.category, self.query, self.after,
                                                self.page_size, addin_prefix=self.addin_prefix, phase=self.phase,
-                                               fold=self.fold)
+                                               fold=self.fold, kinds=self.kinds)
                 except ValueError as error:
                     if not query_error(self.query):
                         raise
@@ -442,8 +459,6 @@ class Browser:
                     self.search_all(value)
                 elif mode == "prefix":
                     self.addin_prefix = value.strip()
-                    if self.addin_prefix and self.category == "all":
-                        self.category = "addin"
                     self.reset()
                 else:
                     if not value.isdecimal() or not self.file:
@@ -567,11 +582,14 @@ class Browser:
                 searched += f" 命中{self.hit_lines}行"  # Matching lines, not blocks.
             add(f"分类: {BLOCK_FILTERS.get(self.category, '全部')} | 阶段: {phase_label(self.phase)} | "
                 f"折叠: {'开' if self.fold else '关'} | 搜索: {searched} | {'展开原文' if self.expanded else '折叠段落'}")
-        addin_view = (self.category in ADDIN_FILTERS or bool(self.addin_prefix)) and self.view != "workspace"
+        # Add-in records (the category, an origin or a prefix): rows are names
+        # with kind and origin, never previews.
+        addin_view = ((self.category == "addin" or self.category in ADDIN_FILTERS or bool(self.addin_prefix))
+                      and self.view != "workspace")
         if addin_view and height >= 13:
-            counts = self.file["block_counts"]
-            add(f"当前日志Add-in: {counts.get('addin', 0)}条加载记录 | Autodesk {counts.get('addin_autodesk', 0)} / 第三方{counts.get('addin_third_party', 0)} / 待定{counts.get('addin_unknown', 0)}")
-            add(f"名称/Class前缀: {self.addin_prefix or '不限'} | v修改前缀 | Enter展开原始数据")
+            add(addin_counts(self.file["block_counts"]))
+            prefix = f"{self.addin_prefix}（只列Add-in记录）" if self.addin_prefix else "不限"
+            add(f"名称/Class前缀: {prefix}{kind_label(self.kinds)} | v修改前缀 | Enter展开原始数据")
         content_rows = max(1, height - len(rows) - 5)
         if self.mode == "files":
             listing = self.file_rows()
@@ -579,7 +597,7 @@ class Browser:
             start = max(0, cursor_row - content_rows + 1)
             for text, number in listing[start:start + content_rows]:
                 if number is None:
-                    add(text, "system")
+                    add(text, "heading")
                 else:
                     add(text, selected=number == self.file_cursor)
         elif self.view == "workspace":
@@ -599,7 +617,7 @@ class Browser:
                 names = [folders.get(file["id"], ""), file["session_label"], file["name"]]
                 names = [name for position, name in enumerate(names) if name and name not in names[position + 1:]]
                 shown = f"，列出前{len(file['items'])}行" if file["hit_lines"] > len(file["items"]) else ""
-                listing.append((" | ".join(names) + f" | 命中{file['hit_lines']}行{shown}", "system", None))
+                listing.append((" | ".join(names) + f" | 命中{file['hit_lines']}行{shown}", "heading", None))
                 for item in file["items"]:
                     prefix = f"  L{item['line_number']}  "
                     listing.append((prefix + crop(item["text"], max(1, width - len(prefix)), self.horizontal),
@@ -631,7 +649,9 @@ class Browser:
                     + "（g跳到某行可逐条查看）", block["category"])
                 extra += 1
             if block.get("addin_origin") and content_rows >= 3:
-                add("Class: " + crop(block.get("addin_class") or "未提供", width - 7, self.horizontal), block["category"])
+                kind = "种类: " + ADDIN_KINDS.get(block.get("addin_kind") or "load", block.get("addin_kind")) + " | "
+                add(kind + "Class: " + crop(block.get("addin_class") or "未提供", max(1, width - 7 - cell_width(kind)),
+                                            self.horizontal), block["category"])
                 extra += 1
             detail = self.index.block_lines(self.file["id"], block["start_line"], self.detail_offset, min(200, max(1, content_rows - 1 - extra)))
             terms = [term.casefold() for term in self.terms]
@@ -659,7 +679,7 @@ class Browser:
                 position = f" | L{block['start_line']}–{block['end_line']}"
                 title = crop(block_summary(block), max(1, width - cell_width(prefix + position)), self.horizontal)
                 add(prefix + title + position, block["category"], number == self.selected)
-                if self.density and not block.get("addin_origin"):
+                if self.density and not addin_view and not block.get("addin_origin"):
                     detail = self.index.block_lines(self.file["id"], block["start_line"], limit=self.density * 2)
                     for line in detail["items"]:
                         add(f"    {line['line_number']}: " + crop(line["text"], width - 15, self.horizontal), block["category"])
@@ -668,8 +688,9 @@ class Browser:
         while len(rows) < height - 5:
             add("")
         rows = rows[:height - 5]
-        add("0全部 1启动 2系统 3错误 4API错误 5操作 6警告 7API 8其他 9对话框 | P阶段 z折叠")
-        add("i Add-in列表 a Autodesk加载 t第三方加载 u来源待定加载 v前缀 | s摘要 e结束前")
+        # Each hint line fits 80 columns; i (= 2) is listed in docs/terminal.md.
+        add("0全部 1启动 2Add-in 3退出 4错误 5API错误 6操作 7警告 8API 9对话框 | P阶段 z折叠")
+        add("c轮换（含其他） a Autodesk来源 t第三方来源 u来源待定 v前缀 | s摘要 e结束前")
         add("↑↓选择 Enter展开 n/p翻页 /搜索 ?全部文件 h/H段内命中 g行号 f文件 +/-预览")
         if self.file.get("writing") or self.file.get("live"):
             notice = "实时Journal：显示的是建立索引时的快照，之后写入的内容需重新打开browse读取。"
@@ -726,7 +747,7 @@ def _print_summary(index, format_name, tail_limit=10):
 
 
 def _print_pages(index, category, query, after, limit, color, format_name, addin_prefix="", phase="all",
-                 fold=True):
+                 fold=True, kinds=()):
     files, failed = {}, False
     catalog = index.catalog()
     for file in catalog:
@@ -738,14 +759,17 @@ def _print_pages(index, category, query, after, limit, color, format_name, addin
                   "live": file["live"], "writing": file["writing"], "snapshot": file["snapshot"],
                   "session": file["session_label"], "role": file["role"],
                   "line_count": file["line_count"], "block_count": file["block_count"],
-                  "addin_count": file["block_counts"].get("addin", 0), "addin_prefix": addin_prefix,
+                  "addin_count": file["block_counts"].get("addin", 0),
+                  "addin_origin_counts": {origin: file["block_counts"].get("addin_" + origin, 0)
+                                          for origin in ("autodesk", "third_party", "unknown")},
+                  "addin_prefix": addin_prefix, "kinds": list(kinds),
                   "phase": phase, "fold": fold and not query.strip()}
         if file["status"] != "ready":
             result["error"] = file["error"]
             failed = True
         else:
             result.update(index.blocks(file["id"], category, query, after, limit, addin_prefix=addin_prefix,
-                                       phase=phase, fold=fold))
+                                       phase=phase, fold=fold, kinds=kinds))
         files[file["id"]] = result
     sessions = index.sessions(catalog)
     if format_name == "json":
@@ -763,8 +787,9 @@ def _print_pages(index, category, query, after, limit, color, format_name, addin
                             f"{file['block_count']}块 | {encoding_label(by_id[file_id])}"))
             if by_id[file_id]["degraded_lines"]:
                 print("  提示：其他语言系统产生的文件可指定其代码页，如 --encoding cp1252（西欧）、cp1250、cp1251")
-            if category in ADDIN_FILTERS or addin_prefix:
-                print(safe_text(f"当前日志Add-in: {file['addin_count']}条加载记录 | 名称/Class前缀: {addin_prefix or '不限'}"))
+            if category == "addin" or category in ADDIN_FILTERS or addin_prefix:
+                print(safe_text(f"{addin_counts(by_id[file_id]['block_counts'])} | "
+                                f"名称/Class前缀: {addin_prefix or '不限'}{kind_label(kinds)}"))
             if "error" in file:
                 print(safe_text(f"索引失败：{file['error']}"))
                 continue
@@ -827,16 +852,18 @@ def _print_search(index, query, category, per_file, format_name):
 
 def run(paths, database, encoding, *, category="all", query="", color="auto", print_only=False,
         format_name="text", after=0, page_size=100, addin_prefix="", jobs=None, snapshot="auto", phase="all",
-        fold=True, summary_tail=None, store="offsets", per_file=None):
+        fold=True, summary_tail=None, store="offsets", per_file=None, kinds=()):
     """browse (interactive or one page per file), with summary_tail the session
     summary, or with per_file the search subcommand (query over every file)."""
     if not 1 <= page_size <= 200 or after < 0 or len(query) > 256 or len(addin_prefix) > 256:
         raise ValueError("分页或搜索参数超出范围")
+    if any(kind not in ADDIN_KINDS for kind in kinds):
+        raise ValueError("未知种类")
     if per_file is not None:
         check_search(query, per_file)  # Before any file is read or indexed.
     addin_prefix = addin_prefix.strip()
-    if addin_prefix and category == "all":
-        category = "addin"
+    if kinds and not (category == "addin" or category in ADDIN_FILTERS or addin_prefix):
+        print("提示：--kind只在addin分类、来源筛选或--addin-prefix下生效，本次未使用。", file=sys.stderr)
     interactive = (summary_tail is None and per_file is None and not print_only and format_name == "text"
                    and sys.stdin.isatty() and sys.stdout.isatty())
     use_color = color == "always" or (color == "auto" and sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb")
@@ -864,8 +891,8 @@ def run(paths, database, encoding, *, category="all", query="", color="auto", pr
             if per_file is not None:
                 return _print_search(index, query, category, per_file, format_name)
             return _print_pages(index, category, query, after, page_size, use_color, format_name, addin_prefix,
-                                phase, fold)
-        browser = Browser(index, category, query, page_size, after, addin_prefix, phase, fold)
+                                phase, fold, kinds)
+        browser = Browser(index, category, query, page_size, after, addin_prefix, phase, fold, kinds)
         console = ExitStack()
         try:
             read_key = console.enter_context(keyboard())
@@ -877,7 +904,7 @@ def run(paths, database, encoding, *, category="all", query="", color="auto", pr
             if failures:
                 raise ValueError(failures[0])
             return _print_pages(index, category, query, after, page_size, False, format_name, addin_prefix,
-                                phase, fold)
+                                phase, fold, kinds)
         with console:
             sys.stdout.write("\x1b[?1049h\x1b[?25l")
             try:

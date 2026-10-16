@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .categories import CATEGORIES, Categorizer
 from .blocks import BLOCK_VERSION, PHASES, BlockBuilder, derive_title
-from .loading import BLOCK_FILTERS, block_filter, matches_filter
+from .loading import ADDIN_FILTERS, ADDIN_KINDS, BLOCK_FILTERS, block_filter, matches_filter
 from .live import Snapshot, held_for_writing, wants_snapshot
 from .reader import JournalReader, SourceChangedError, basis_label, decode_span, resolve_encoding
 from .rules import load_rules, ruleset_digest
@@ -27,7 +27,7 @@ from .sessions import ROLE_LABELS, InputFile, SessionName, describe, plan_inputs
 from .sidecars import (BASIS_TEXT, cer_logs, match_cer, match_steel_log, parse_steel_log, revit_version, revit_year,
                        session_window)
 
-INDEX_VERSION = "viewer-6:" + BLOCK_VERSION
+INDEX_VERSION = "viewer-9:" + BLOCK_VERSION
 # offsets (default): `lines` keeps each line's byte range in the source file and
 # the text is read back from it, which must stay where it is and unchanged.
 # text: `lines` keeps the full text (larger, independent of the source).
@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS blocks (
  addin_class TEXT NOT NULL DEFAULT '', addin_identity_truncated INTEGER NOT NULL DEFAULT 0,
  phase TEXT NOT NULL DEFAULT '', fingerprint TEXT NOT NULL DEFAULT '',
  title_from_line INTEGER NOT NULL DEFAULT 0, title_joins INTEGER NOT NULL DEFAULT 0,
+ addin_kind TEXT NOT NULL DEFAULT '',
  PRIMARY KEY(file_id,start_line)
 );
 CREATE INDEX IF NOT EXISTS blocks_category ON blocks(file_id,category,start_line);
@@ -157,7 +158,7 @@ _INSERT_LINES = ("INSERT INTO lines(file_id,line_number,body,category,severity,r
 _INSERT_BLOCKS = (
     "INSERT INTO blocks(file_id,start_line,end_line,category,severity,rules,title,title_line,boundary,complete,"
     "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated,phase,fingerprint,title_from_line,"
-    "title_joins) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    "title_joins,addin_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 
@@ -171,13 +172,15 @@ def _insert_batch(connection, file_id, lines, blocks, block_counts, texts=None, 
         block_counts[block.category] += 1
         if block.addin_origin:
             block_counts["addin_" + block.addin_origin] += 1
-            block_counts["addin"] += 1
+        if block.addin_kind:  # every kind of add-in record, failed loads (API errors) included
+            block_counts["kind_" + block.addin_kind] += 1
     connection.executemany(_INSERT_BLOCKS, [
         (file_id, b.start_line, b.end_line, b.category, b.severity, ",".join(sorted(b.rules)),
          b.title[:_TITLE_PREFIX] if texts is not None and b.title_from_line else b.title,
          b.title_line, b.boundary, int(b.complete), b.addin_origin,
          json.dumps(b.addin_evidence, ensure_ascii=False) if b.addin_evidence else "[]", b.addin_name, b.addin_class,
-         int(b.addin_identity_truncated), b.phase, b.fingerprint, int(b.title_from_line), b.title_joins)
+         int(b.addin_identity_truncated), b.phase, b.fingerprint, int(b.title_from_line), b.title_joins,
+         b.addin_kind)
         for b in blocks])
 
 
@@ -269,12 +272,13 @@ CREATE TABLE blocks (
  title TEXT NOT NULL, title_line INTEGER NOT NULL, boundary TEXT NOT NULL,
  complete INTEGER NOT NULL, addin_origin TEXT NOT NULL, addin_evidence TEXT NOT NULL,
  addin_name TEXT NOT NULL, addin_class TEXT NOT NULL, addin_identity_truncated INTEGER NOT NULL,
- phase TEXT NOT NULL, fingerprint TEXT NOT NULL, title_from_line INTEGER NOT NULL, title_joins INTEGER NOT NULL
+ phase TEXT NOT NULL, fingerprint TEXT NOT NULL, title_from_line INTEGER NOT NULL, title_joins INTEGER NOT NULL,
+ addin_kind TEXT NOT NULL
 );
 """
 _BLOCK_COLUMNS = ("start_line,end_line,category,severity,rules,title,title_line,boundary,complete,"
                   "addin_origin,addin_evidence,addin_name,addin_class,addin_identity_truncated,phase,fingerprint,"
-                  "title_from_line,title_joins")
+                  "title_from_line,title_joins,addin_kind")
 # Below this much work, starting processes costs more than it saves.
 PARALLEL_MIN_BYTES = 2 * 1024 * 1024
 _OWN_FORMAT_ROLES = {"steel_log"}
@@ -461,7 +465,7 @@ class ViewerIndex:
                 connection.execute("ALTER TABLE blocks ADD COLUMN addin_origin TEXT NOT NULL DEFAULT ''")
             if "addin_evidence" not in columns:
                 connection.execute("ALTER TABLE blocks ADD COLUMN addin_evidence TEXT NOT NULL DEFAULT '[]'")
-            for name in ("addin_name", "addin_class", "phase", "fingerprint"):
+            for name in ("addin_name", "addin_class", "phase", "fingerprint", "addin_kind"):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE blocks ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
             for name in ("addin_identity_truncated", "title_from_line", "title_joins"):
@@ -987,7 +991,7 @@ class ViewerIndex:
                 "source": file["path"], "items": _with_text(file, rows, 16384)}
 
     @staticmethod
-    def _block_conditions(file_id, category, after, addin_prefix):
+    def _block_conditions(file_id, category, after, addin_prefix, kinds=()):
         where, values = ["b.file_id=?", "b.start_line>?"], [file_id, after]
         if category != "all":
             condition, value = block_filter(category)
@@ -997,10 +1001,13 @@ class ViewerIndex:
             pattern = addin_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
             where.extend(["b.addin_origin<>''", "(b.addin_name LIKE ? ESCAPE '\\' OR b.addin_class LIKE ? ESCAPE '\\')"])
             values.extend([pattern, pattern])
+        if kinds:
+            where.append(f"b.addin_kind IN ({','.join('?' * len(kinds))})")
+            values.extend(kinds)
         return where, values
 
     def blocks(self, file_id: int, category: str = "all", query: str = "", after: int = 0, limit: int = 50, *,
-               addin_prefix: str = "", phase: str = "all", fold: bool = False) -> dict:
+               addin_prefix: str = "", phase: str = "all", fold: bool = False, kinds: tuple[str, ...] = ()) -> dict:
         """Page by entire event; FTS hits anywhere inside it select the event once.
         fold: blocks with the same fingerprint (same category and content apart
         from timestamps/counters) are listed once, at their first occurrence,
@@ -1008,16 +1015,23 @@ class ViewerIndex:
         With a query (parse_query) every block has hit_line (its first matching
         line) and the result has terms, hint (CJK) and hit_lines: matching LINES
         (not blocks) of the whole file; with a line category only lines of that
-        category, while add-in filters, the phase and addin_prefix are ignored."""
+        category, while add-in filters, the phase, addin_prefix and kinds are ignored.
+        kinds: add-in record kinds (loading.ADDIN_KINDS) to keep, () for all. They
+        apply with the addin category, an origin filter or addin_prefix (the
+        add-in views) and are ignored otherwise."""
         if category != "all" and category not in BLOCK_FILTERS:
             raise ValueError("未知分类")
+        if any(kind not in ADDIN_KINDS for kind in kinds):
+            raise ValueError("未知种类")
         if phase != "all" and phase not in PHASES:
             raise ValueError("未知阶段")
         if not 1 <= limit <= 200 or after < 0 or len(query) > 256 or len(addin_prefix) > 256:
             raise ValueError("分页或搜索参数超出范围")
         addin_prefix = addin_prefix.strip()
+        addin_view = category == "addin" or category in ADDIN_FILTERS or bool(addin_prefix)
+        kinds = tuple(kind for kind in ADDIN_KINDS if kind in kinds) if addin_view else ()
         search = parse_query(query) if query.strip() else None
-        where, values = self._block_conditions(file_id, category, after, addin_prefix)
+        where, values = self._block_conditions(file_id, category, after, addin_prefix, kinds)
         if phase != "all":
             where.append("b.phase=?")
             values.append(phase)
@@ -1026,7 +1040,7 @@ class ViewerIndex:
             found: list[tuple] = []
             if search:
                 found = self._search_blocks(connection, file_id, category, search.match, after, limit + 1,
-                                            addin_prefix, phase)
+                                            addin_prefix, phase, kinds)
                 rows = [row for row, _ in found]
             elif fold and phase == "all":
                 # Precomputed groups are exact here: category and add-in fields are
@@ -1108,15 +1122,16 @@ class ViewerIndex:
             return _with_titles(connection, file, [self._block_dict(row) for row in reversed(rows)])
 
     @staticmethod
-    def _search_blocks(connection, file_id, category, phrase, after, limit, addin_prefix="", phase="all"):
+    def _search_blocks(connection, file_id, category, phrase, after, limit, addin_prefix="", phase="all", kinds=()):
         """(block row, first matching line in it) pairs; the line is None where
-        an EXISTS test selected the block (blocks() looks it up)."""
+        an EXISTS test selected the block (blocks() looks it up). With a prefix
+        or kinds only those add-in records are tested, one by one."""
         table = fts_table(file_id)  # rowid = line number
         condition, value = block_filter(category)
         phase_sql, phase_values = (" AND b.phase=?", [phase]) if phase != "all" else ("", [])
         hit_inside = f"EXISTS (SELECT 1 FROM {table} WHERE {table} MATCH ? AND rowid BETWEEN b.start_line AND b.end_line)"
-        if addin_prefix:
-            where, values = ViewerIndex._block_conditions(file_id, category, after, addin_prefix)
+        if addin_prefix or kinds:
+            where, values = ViewerIndex._block_conditions(file_id, category, after, addin_prefix, kinds)
             return [(row, None) for row in connection.execute(
                 "SELECT b.* FROM blocks b WHERE " + " AND ".join(where) + phase_sql + " AND " + hit_inside
                 + " ORDER BY b.start_line LIMIT ?", [*values, *phase_values, phrase, limit])]

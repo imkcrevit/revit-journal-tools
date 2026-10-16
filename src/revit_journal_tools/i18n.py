@@ -11,8 +11,14 @@ LANGS = ("zh", "en")
 
 EN = {
     "category": {
-        "startup": "Startup", "system": "System data", "error": "Error", "api_error": "API error",
-        "operation": "Operation", "warning": "Warning", "api": "API activity", "other": "Other", "dialog": "Dialog",
+        "startup": "Startup", "addin": "Add-in", "exit": "Exit", "error": "Error", "api_error": "API error",
+        "operation": "Operation", "warning": "Warning", "api": "API activity", "dialog": "Dialog", "other": "Other",
+    },
+    "addin_kind": {
+        "load": "Load", "service": "Service", "server": "Server", "manifest": "Manifest", "event": "External event",
+        "updater": "Updater", "server_run": "Server run", "resource": "External resource", "folder": "Add-in folder",
+        "assembly": "Assembly", "not_loaded": "Not loaded", "ui": "Window action", "control": "Journal control",
+        "unregister": "Unregister all services",
     },
     "phase": {
         "startup": "Startup", "licensing": "Licensing", "addin_loading": "Add-in loading",
@@ -65,6 +71,7 @@ _ERRORS = [
     (r"该文件的索引来自旧版本", "The file was indexed by an earlier version; open it again to rebuild the index"),
     (r"未知分类", "Unknown category"),
     (r"未知阶段", "Unknown phase"),
+    (r"未知种类", "Unknown add-in record kind"),
     (r"段落分页参数超出范围", "Paragraph paging parameter out of range"),
     (r"分页或搜索参数超出范围", "Paging or search parameter out of range"),
     (r"搜索词不含可检索的字母或数字", "The search has no letters or digits to look for; punctuation and symbols are "
