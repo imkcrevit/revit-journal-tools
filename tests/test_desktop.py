@@ -142,6 +142,28 @@ class RunTests(DesktopTestCase):
         with self.assertRaises(OSError):  # the server stopped with the window
             OPENER.open(url, timeout=2)
 
+    def test_window_claims_its_own_taskbar_identity_before_it_exists(self):
+        module = self.fake_webview(lambda url: None)
+        order, create_window = [], module.create_window
+        module.create_window = lambda *args, **options: order.append("window") or create_window(*args, **options)
+        with patch.dict(sys.modules, {"webview": module}),                 patch.dict(os.environ, {"REVIT_JOURNAL_CACHE": str(self.root / "cache")}),                 patch("revit_journal_tools.desktop._claim_taskbar_identity",
+                      side_effect=lambda: order.append("app-id")) as claimed:
+            self.assertEqual(desktop.run([], self.root / "desktop.sqlite3", jobs=1), 0)
+        self.assertEqual(claimed.call_count, 1)
+        self.assertEqual(order, ["app-id", "window"])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows taskbar only")
+    def test_taskbar_identity_is_the_process_app_user_model_id(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self.assertEqual(desktop._claim_taskbar_identity(), desktop.APP_ID)
+        self.assertTrue(desktop.APP_ID.isascii() and " " not in desktop.APP_ID and len(desktop.APP_ID) < 128)
+        current = ctypes.c_wchar_p()
+        self.assertEqual(ctypes.windll.shell32.GetCurrentProcessExplicitAppUserModelID(ctypes.byref(current)), 0)
+        self.assertEqual(current.value, desktop.APP_ID)
+        ctypes.windll.ole32.CoTaskMemFree(ctypes.cast(current, wintypes.LPVOID))
+
     def test_taken_port_falls_back_to_a_free_one(self):
         workspace = desktop.Workspace(self.root / "desktop.sqlite3", jobs=1)
         self.addCleanup(workspace.close)

@@ -107,7 +107,7 @@ py -m venv .venv
 .\.venv\Scripts\revit-journal.exe gui cases\inbox --recursive
 ```
 
-窗口标题为`revit-journal-tool`，窗口与页面使用`web/icon.ico`、`web/icon.png`图标（取自ImagePusher的`selfpush.ico`）。窗口内嵌WebView2，显示与`view`相同的页面，另有“打开文件…”“打开文件夹…”“本机Journals”三个按钮（Ctrl+O打开文件）。新打开的文件替换当前工作区：先停止正在进行的索引，再开始新的。左侧工作区与右侧内容之间、段落列表与原文之间的分隔条都可以拖动（方向键微调，双击恢复默认），宽度和主题（浅色/深色/跟随系统）会被记住。页面只从本机`127.0.0.1`读取，原文件只读。
+窗口标题为`revit-journal-tool`，窗口、任务栏与页面使用`web/icon.ico`、`web/icon.png`图标（取自ImagePusher的`selfpush.ico`）；窗口以自己的AppUserModelID（`revit-journal-tools.gui`）出现在任务栏，不并入Python的分组。窗口内嵌WebView2，显示与`view`相同的页面，另有“打开文件…”“打开文件夹…”“本机Journals”三个按钮（Ctrl+O打开文件）。新打开的文件替换当前工作区：先停止正在进行的索引，再开始新的。左侧工作区与右侧内容之间、段落列表与原文之间的分隔条都可以拖动（方向键微调，双击恢复默认），宽度和主题（浅色/深色/跟随系统）会被记住。页面只从本机`127.0.0.1`读取，原文件只读。
 
 `revit-journal-gui.exe`没有控制台窗口，启动前的错误（如编码参数无效）以对话框显示。没有安装pywebview时，`gui`会提示安装命令，也可以改用`view`在浏览器中查看。索引缓存为缓存目录中的`desktop.sqlite3`；窗口的布局与主题保存在缓存目录的`webview`子目录（WebView2用户数据，约10MB），`cache --clear`不删除它。
 

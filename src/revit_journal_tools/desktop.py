@@ -21,6 +21,9 @@ from .viewer_index import ViewerIndex
 from .viewer_server import make_server
 
 TITLE = "revit-journal-tool"
+# The taskbar groups windows by AppUserModelID; without an explicit one a
+# python.exe process is grouped with Python's own shortcut and shows its icon.
+APP_ID = "revit-journal-tools.gui"
 # A stable origin keeps the page's layout and theme (localStorage) between
 # runs; another free port is used when it is taken.
 PORT = 8790
@@ -126,6 +129,21 @@ def _window_size() -> tuple[int, int]:
     return max(width, 960), max(height, 600)
 
 
+def _claim_taskbar_identity() -> str | None:
+    """Windows: the taskbar button carries the window's own icon only when the
+    process has an AppUserModelID of its own. Returns the id set, else None."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+
+    try:
+        if ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID) == 0:  # S_OK
+            return APP_ID
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
 def _server(index: ViewerIndex):
     try:
         return make_server(index, PORT)
@@ -148,6 +166,7 @@ def run(planned: list, database: Path, encoding: str = "auto", *, jobs: int | No
         if planned:
             workspace.open(planned)
         width, height = _window_size()
+        _claim_taskbar_identity()  # before the window exists
         api._window = webview.create_window(
             TITLE, f"http://127.0.0.1:{server.server_port}/?desktop=1", js_api=api, width=width, height=height,
             min_size=(960, 600), text_select=True, background_color="#f5f6f8")
